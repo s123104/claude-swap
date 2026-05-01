@@ -25,6 +25,14 @@ uv sync
 uv run cswap --help
 ```
 
+### Updating
+
+```bash
+uv tool upgrade claude-swap
+# or
+pipx upgrade claude-swap
+```
+
 ## Usage
 
 ### Add your first account
@@ -70,6 +78,14 @@ cswap --add-account
 
 This will update the stored credentials without creating a duplicate.
 
+### Interactive TUI
+
+If you don't want to remember flags, launch the arrow-key menu:
+
+```bash
+cswap --tui
+```
+
 ### Add an account from a raw OAuth token
 
 If you only have a long-lived setup-token (e.g., produced by `claude setup-token`)
@@ -112,7 +128,9 @@ cswap --purge                   # Remove all claude-swap data
 |----------|-------------|----------------|
 | Windows | Windows Credential Manager | `~/.claude-swap-backup/` |
 | macOS | macOS Keychain | `~/.claude-swap-backup/` |
-| Linux | File-based (`~/.claude-swap-backup/credentials/`) | `~/.claude-swap-backup/` |
+| Linux / WSL | File-based (inside the backup directory, under `credentials/`) | `${XDG_DATA_HOME:-~/.local/share}/claude-swap/` |
+
+On Linux/WSL the location follows the [XDG Base Directory Specification](https://specifications.freedesktop.org/basedir-spec/basedir-spec-latest.html). Set `XDG_DATA_HOME` to override; otherwise it defaults to `~/.local/share/claude-swap/`. Existing installs with data under `~/.claude-swap-backup/` are migrated automatically on the first run. If both the legacy and new paths exist, `cswap` refuses to start and asks you to remove the stale one manually.
 
 ## Backup and migration
 

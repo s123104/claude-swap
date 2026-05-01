@@ -32,6 +32,8 @@ Examples:
   %(prog)s --purge
   %(prog)s --export backup.cswap
   %(prog)s --import backup.cswap
+  %(prog)s --tui                              # interactive arrow-key menu
+  %(prog)s --upgrade                          # self-upgrade to latest version
         """,
     )
 
@@ -126,6 +128,16 @@ Examples:
         help="Import accounts from file (use '-' for stdin)",
     )
     group.add_argument(
+        "--tui",
+        action="store_true",
+        help="Launch interactive arrow-key menu (single-level)",
+    )
+    group.add_argument(
+        "--upgrade",
+        action="store_true",
+        help="Upgrade claude-swap to the latest version on PyPI",
+    )
+    group.add_argument(
         "--add-token",
         metavar="TOKEN|-",
         nargs="?",
@@ -157,16 +169,30 @@ Examples:
     if args.full and not args.export:
         parser.error("--full can only be used with --export")
 
-    # Initialize switcher with debug mode
-    switcher = ClaudeAccountSwitcher(debug=args.debug)
+    # Self-upgrade runs before switcher init so we don't touch config/keychain
+    # just to upgrade the tool itself.
+    if args.upgrade:
+        from claude_swap.update_check import run_self_upgrade
 
-    # Check for root (unless in container) - POSIX only
-    if sys.platform != "win32":
-        if os.geteuid() == 0 and not switcher._is_running_in_container():
-            error("Error: Do not run this script as root (unless running in a container)")
-            sys.exit(1)
+        try:
+            sys.exit(run_self_upgrade())
+        except KeyboardInterrupt:
+            print(f"\n{dimmed('Upgrade cancelled')}")
+            sys.exit(130)
 
+    # Initialize switcher and dispatch under a single error handler so
+    # init-time failures (e.g. MigrationError on a backup-dir collision)
+    # are presented like every other ClaudeSwitchError: clean stderr line,
+    # exit 1, no traceback.
     try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+
+        # Check for root (unless in container) - POSIX only
+        if sys.platform != "win32":
+            if os.geteuid() == 0 and not switcher._is_running_in_container():
+                error("Error: Do not run this script as root (unless running in a container)")
+                sys.exit(1)
+
         if args.add_account:
             switcher.add_account(slot=args.slot)
         elif args.add_token is not None:
@@ -197,6 +223,16 @@ Examples:
             from claude_swap.transfer import import_accounts
 
             import_accounts(switcher, args.import_, force=args.force)
+        elif args.tui:
+            try:
+                from claude_swap.tui import run as tui_run
+            except ImportError as e:
+                error(
+                    "TUI mode requires the 'curses' module. "
+                    "On Windows, install with: pip install windows-curses"
+                )
+                sys.exit(1)
+            sys.exit(tui_run(switcher))
     except ClaudeSwitchError as e:
         error(f"Error: {e}")
         sys.exit(1)
@@ -204,12 +240,16 @@ Examples:
         print(f"\n{dimmed('Operation cancelled')}")
         sys.exit(130)
 
-    # Passive update notification (never fails)
-    from claude_swap.update_check import check_for_update
+    # Passive update notification (never fails). Skipped after --purge so we
+    # don't immediately recreate <backup_root>/cache/update_check.json inside
+    # the directory we just deleted. Skipped after --upgrade as a safety guard
+    # in case the dispatch is later refactored to fall through.
+    if not args.purge and not args.upgrade:
+        from claude_swap.update_check import check_for_update
 
-    msg = check_for_update(__version__)
-    if msg:
-        print(f"\n{muted(msg)}", file=sys.stderr)
+        msg = check_for_update(__version__)
+        if msg:
+            print(f"\n{muted(msg)}", file=sys.stderr)
 
 
 if __name__ == "__main__":
