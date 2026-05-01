@@ -862,8 +862,8 @@ class TestPerformSwitchPostDisplay:
             for p in patches:
                 p.stop()
 
-        assert ("None", "test@example.com") not in creds_store
-        assert ("None", "test@example.com") not in configs_store
+        assert not any(num == "None" for num, _ in creds_store)
+        assert not any(num == "None" for num, _ in configs_store)
         assert json.loads(live_state["creds"])["claudeAiOauth"]["accessToken"] == (
             "target-token"
         )
@@ -951,6 +951,153 @@ class TestPerformSwitchPostDisplay:
         assert json.loads(live_state["creds"])["claudeAiOauth"]["accessToken"] == (
             "target-token"
         )
+
+    def test_direct_activation_rolls_back_live_creds_on_sequence_write_failure(
+        self,
+        temp_home: Path,
+    ):
+        """Live creds must be restored if a write fails after they were swapped."""
+        config_path = temp_home / ".claude.json"
+        original_config_text = json.dumps({
+            "oauthAccount": {
+                "emailAddress": "untracked@example.com",
+                "accountUuid": "",
+                "organizationUuid": None,
+                "organizationName": None,
+            }
+        })
+        config_path.write_text(original_config_text)
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, {
+            "activeAccountNumber": None,
+            "lastUpdated": "2024-01-01T00:00:00Z",
+            "sequence": [1],
+            "accounts": {
+                "1": {
+                    "email": "target@example.com",
+                    "uuid": "",
+                    "organizationUuid": "",
+                    "organizationName": "",
+                    "added": "2024-01-01T00:00:00Z",
+                }
+            },
+        })
+        original_live_creds = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "live-untracked-token",
+                "refreshToken": "live-untracked-refresh",
+            }
+        })
+        creds_store = {
+            ("1", "target@example.com"): json.dumps({
+                "claudeAiOauth": {
+                    "accessToken": "target-token",
+                    "refreshToken": "target-refresh",
+                }
+            }),
+        }
+        configs_store = {
+            ("1", "target@example.com"): json.dumps({
+                "oauthAccount": {
+                    "emailAddress": "target@example.com",
+                    "accountUuid": "",
+                    "organizationUuid": None,
+                    "organizationName": None,
+                }
+            }),
+        }
+        live_state = {"creds": original_live_creds}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+
+        original_write_json = switcher._write_json
+
+        def failing_write_json(path, data):
+            if path == switcher.sequence_file and data.get(
+                "activeAccountNumber"
+            ) == 1:
+                raise OSError("disk full")
+            return original_write_json(path, data)
+
+        try:
+            with patch.object(
+                switcher, "_write_json", side_effect=failing_write_json,
+            ), pytest.raises(OSError, match="disk full"):
+                switcher._perform_switch("1")
+        finally:
+            for p in patches:
+                p.stop()
+
+        assert live_state["creds"] == original_live_creds
+        assert config_path.read_text() == original_config_text
+
+    def test_direct_activation_fails_fast_when_live_creds_unreadable(
+        self,
+        temp_home: Path,
+    ):
+        """Refuse to overwrite live creds we couldn't snapshot for rollback."""
+        config_path = temp_home / ".claude.json"
+        original_config_text = json.dumps({
+            "oauthAccount": {
+                "emailAddress": "untracked@example.com",
+                "accountUuid": "",
+                "organizationUuid": None,
+                "organizationName": None,
+            }
+        })
+        config_path.write_text(original_config_text)
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, {
+            "activeAccountNumber": None,
+            "lastUpdated": "2024-01-01T00:00:00Z",
+            "sequence": [1],
+            "accounts": {
+                "1": {
+                    "email": "target@example.com",
+                    "uuid": "",
+                    "organizationUuid": "",
+                    "organizationName": "",
+                    "added": "2024-01-01T00:00:00Z",
+                }
+            },
+        })
+        creds_store = {
+            ("1", "target@example.com"): json.dumps({
+                "claudeAiOauth": {
+                    "accessToken": "target-token",
+                    "refreshToken": "target-refresh",
+                }
+            }),
+        }
+        configs_store = {
+            ("1", "target@example.com"): json.dumps({
+                "oauthAccount": {
+                    "emailAddress": "target@example.com",
+                    "accountUuid": "",
+                    "organizationUuid": None,
+                    "organizationName": None,
+                }
+            }),
+        }
+        live_state = {"creds": "live-creds-that-we-cannot-read"}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+
+        try:
+            with patch.object(
+                switcher, "_read_credentials", return_value=None,
+            ), pytest.raises(CredentialReadError, match="snapshot"):
+                switcher._perform_switch("1")
+        finally:
+            for p in patches:
+                p.stop()
+
+        assert live_state["creds"] == "live-creds-that-we-cannot-read"
+        assert config_path.read_text() == original_config_text
 
 
 # ── Task 1: AccountInfo org fields ───────────────────────────────────────────

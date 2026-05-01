@@ -1311,22 +1311,72 @@ class ClaudeAccountSwitcher:
                 if not target_oauth:
                     raise SwitchError("Invalid oauthAccount in backup")
 
-                self._write_credentials(target_creds)
+                # Snapshot live state so a mid-operation failure can be undone.
+                # When a live session exists, fail fast if the snapshot is
+                # unreadable rather than proceeding to overwrite without a
+                # safety net. The fresh-machine case has nothing to restore.
+                rollback_creds: str | None = None
+                rollback_config_text: str | None = None
+                if current_identity is not None:
+                    rollback_creds = self._read_credentials()
+                    if rollback_creds is None:
+                        raise CredentialReadError(
+                            "Cannot snapshot live credentials before activation"
+                        )
+                    if config_path.exists():
+                        try:
+                            rollback_config_text = config_path.read_text(
+                                encoding="utf-8"
+                            )
+                        except OSError as e:
+                            raise ConfigError(
+                                f"Cannot snapshot live config before activation: {e}"
+                            )
 
-                # Mirror the normal switch path: preserve existing local
-                # settings/projects when ~/.claude.json already exists, only
-                # swapping in oauthAccount. Fall back to the full imported
-                # config when no usable local config exists.
-                existing_config = self._read_json(config_path) if config_path.exists() else None
-                if existing_config:
-                    existing_config["oauthAccount"] = target_oauth
-                    self._write_json(config_path, existing_config)
-                else:
-                    self._write_json(config_path, target_config_data)
+                creds_written = False
+                config_written = False
+                try:
+                    self._write_credentials(target_creds)
+                    creds_written = True
 
-                data["activeAccountNumber"] = int(target_account)
-                data["lastUpdated"] = get_timestamp()
-                self._write_json(self.sequence_file, data)
+                    # Mirror the normal switch path: preserve existing local
+                    # settings/projects when ~/.claude.json already exists, only
+                    # swapping in oauthAccount. Fall back to the full imported
+                    # config when no usable local config exists.
+                    existing_config = (
+                        self._read_json(config_path) if config_path.exists() else None
+                    )
+                    if existing_config:
+                        existing_config["oauthAccount"] = target_oauth
+                        self._write_json(config_path, existing_config)
+                    else:
+                        self._write_json(config_path, target_config_data)
+                    config_written = True
+
+                    data["activeAccountNumber"] = int(target_account)
+                    data["lastUpdated"] = get_timestamp()
+                    self._write_json(self.sequence_file, data)
+                except Exception:
+                    if config_written and rollback_config_text is not None:
+                        try:
+                            config_path.write_text(
+                                rollback_config_text, encoding="utf-8"
+                            )
+                            if sys.platform != "win32":
+                                os.chmod(config_path, 0o600)
+                        except Exception as e:
+                            self._logger.error(
+                                f"Failed to rollback config: {e}"
+                            )
+                    if creds_written and rollback_creds is not None:
+                        try:
+                            self._write_credentials(rollback_creds)
+                        except Exception as e:
+                            self._logger.error(
+                                f"Failed to rollback credentials: {e}"
+                            )
+                    raise
+
                 self._logger.info(
                     f"Activated account {target_account} (no prior live account)"
                 )
