@@ -67,16 +67,7 @@ cswap --switch-to 2
 cswap --switch-to user@example.com
 ```
 
-### Switch by remaining usage
-
-Let claude-swap pick the account for you based on how much quota is left, instead of rotating blindly:
-
-```bash
-cswap --switch --strategy best             # jump to the account with the most 5h/7d quota left
-cswap --switch --strategy next-available   # rotate to the next account, skipping any at their limit
-```
-
-These use the same 5-hour and 7-day usage windows shown by `--list` (pay-as-you-go spend is ignored). They never move you onto an account that's worse than the one you're on: if you already hold the most quota, or every other account is at its limit, claude-swap stays put and tells you. If usage can't be fetched at all, it falls back to plain rotation. They apply when you have an active Claude login; right after a fresh `--import` (no login yet) they're ignored.
+Or let claude-swap auto-pick by remaining quota — `cswap --switch --strategy best` (most quota left) or `--strategy next-available` (skip rate-limited accounts).
 
 **Note:** You usually don't need to restart — on Linux/Windows the new account is picked up automatically, and on macOS after the Keychain cache expires. To apply it instantly, restart Claude Code or reopen the VS Code extension tab. See [Tips](#tips) for the per-platform details.
 
