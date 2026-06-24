@@ -130,6 +130,27 @@ Run `cswap` on its own (or `cswap tui`) for the full-screen dashboard: live usag
 <img src="assets/tui-watch.png" width="760" alt="cswap watch — live 5h/7d usage bars for every account, with reset times and the active account marked">
 
 
+### Use a specific account per directory (auto-select)
+
+Map an account to a repo/project directory, then launch with no account argument
+and claude-swap picks the mapped account automatically — in session mode, so
+different repos can run different accounts at the same time.
+
+~~~bash
+cswap map 2 ~/work/client-app        # map a path to account 2 (work)
+cswap map user@example.com           # map the CURRENT directory to an account
+cswap map                            # list all mappings
+cswap unmap ~/work/client-app        # remove a mapping (defaults to cwd)
+
+cd ~/work/client-app/src
+cswap run                            # no account → launches account 2 [session mode]
+~~~
+
+The nearest mapped ancestor directory wins, so subfolders inherit their parent's
+mapping. In an unmapped directory, `cswap run` (with no account) just launches
+Claude Code with your current default login. Mappings are stored locally per
+machine and are not included in `--export` / `--import`.
+
 ### Refresh expired tokens
 
 If an account's token expires, log back into Claude Code with that account and re-run:
@@ -144,6 +165,10 @@ This will update the stored credentials without creating a duplicate.
 
 ```bash
 cswap run 2                     # Run an account in this terminal only (session mode)
+cswap run                       # Run the current dir's mapped account (or default login if unmapped)
+cswap map 2 ~/work/app          # Map a directory to an account
+cswap map                       # List directory→account mappings
+cswap unmap ~/work/app          # Remove a directory mapping
 cswap auto                      # Auto-switch when nearing rate limits (see above)
 cswap config                    # Show or edit settings (see Configuration below)
 cswap list                      # Show all accounts with 5h/7d usage and reset times
