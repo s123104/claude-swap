@@ -1,0 +1,131 @@
+# Contributing
+
+Thanks for helping improve this fork. Keep changes focused, tested, and aligned with upstream where possible.
+
+## Fork relationship
+
+This repo is a **fork of [realiti4/claude-swap](https://github.com/realiti4/claude-swap)** maintained at [haotool/claude-swap](https://github.com/haotool/claude-swap). It adds auto-switch at usage limit and cross-platform background service supervision on top of upstream.
+
+**Test policy:** the fork test suite must stay a **superset** of upstream coverage. Do not drop upstream tests when merging or syncing; add fork-specific tests alongside them.
+
+## Versioning and PyPI
+
+This fork uses a **PEP 440 local version** in `pyproject.toml` (e.g. `0.15.0b2+haotool.1`). The `+haotool.*` suffix is the local version label defined by [PEP 440](https://peps.python.org/pep-0440/#local-version-identifiers).
+
+- **Single source of truth:** `[project].version` in `pyproject.toml` only. Do not duplicate the version string elsewhere.
+- **Not on PyPI:** local versions are rejected by PyPI upload tooling; install this fork from git or an editable/source install (see README).
+- **Upstream:** [realiti4/claude-swap](https://github.com/realiti4/claude-swap) publishes semver releases to PyPI as `claude-swap` without the `+haotool.*` suffix.
+
+When cutting a fork release, bump `[project].version` and add an entry under `[Unreleased]` / a new section in `CHANGELOG.md`.
+
+## Development setup
+
+Requires Python 3.12+ and [uv](https://docs.astral.sh/uv/).
+
+```bash
+git clone https://github.com/haotool/claude-swap.git
+cd claude-swap
+uv sync --all-groups
+```
+
+`--all-groups` installs `[dependency-groups].dev` from `pyproject.toml` (pytest, pytest-cov, ruff, mypy, pre-commit) per [PEP 735](https://peps.python.org/pep-0735/) and [uv dependency groups](https://docs.astral.sh/uv/concepts/projects/dependencies/#development-dependencies).
+
+Run the CLI locally:
+
+```bash
+uv run cswap --help
+```
+
+### Pre-commit
+
+Install hooks once after syncing dev dependencies ([pre-commit docs](https://pre-commit.com/#installation)):
+
+```bash
+uv run pre-commit install
+```
+
+Hooks run **ruff** (lint + format) and **mypy** on commit. Ruff hook versions match CI (`v0.15.20` via `astral-sh/ruff-pre-commit`). Run manually:
+
+```bash
+uv run pre-commit run --all-files
+```
+
+## Background service backends
+
+`cswap service install|uninstall|status|logs` is a thin facade in `service.py`. Platform wiring lives under `src/claude_swap/service_backends/`:
+
+- `select_backend()` in `service_backends/__init__.py` dispatches on `Platform.detect()` (macOS → launchd, Linux/WSL → systemd, Windows → Task Scheduler).
+- Shared constants, argv/env passthrough, and user messaging live in `service_spec.py`.
+- Each backend implements the `ServiceBackend` protocol in `protocols.py`.
+
+To add or change a backend: implement the protocol in a new module, register it in `select_backend()`, and add unit tests that mock the OS service manager (see `tests/test_service.py` for launchctl, `tests/service_backends/test_systemd.py` for `systemctl`/`journalctl`, `tests/service_backends/test_task_scheduler.py` for PowerShell Task Scheduler calls). Do not touch real launchd/systemd/Task Scheduler in CI.
+
+## Tests
+
+```bash
+uv run pytest
+```
+
+On macOS, Keychain contract tests run in CI; locally you can run the full suite or target a file:
+
+```bash
+uv run pytest tests/test_macos_keychain_contract.py -v
+```
+
+## Lint and format
+
+Dev tools come from `uv sync --all-groups` — no separate installs needed.
+
+```bash
+uv run ruff check src/ tests/
+uv run ruff format --check src/ tests/
+```
+
+Fix formatting with `uv run ruff format src/ tests/`. CI gates `tests/` formatting (`ruff format --check tests/`).
+
+### Type checking (mypy)
+
+```bash
+uv run mypy
+```
+
+Configuration lives in `pyproject.toml` under `[tool.mypy]`. A baseline `ignore_errors` override covers modules with legacy typing debt; tighten overrides as files are cleaned up ([mypy: existing code](https://mypy.readthedocs.io/en/stable/existing_code.html)).
+
+## Pull request contract
+
+Before opening a PR:
+
+1. **Tests pass** — `uv run pytest`
+2. **Ruff clean** — `uv run ruff check` and `uv run ruff format --check`
+3. **Pre-commit** — `uv run pre-commit run --all-files` (or rely on installed hooks)
+4. **Focused diff** — one logical change per PR; no drive-by refactors
+5. **User-facing changes documented** — update `CHANGELOG.md` under `[Unreleased]` (version header tracks `pyproject.toml`)
+6. **Fork invariants preserved** — upstream test coverage retained; fork-only behavior covered by tests where it matters
+
+Target branch is usually `main`. Describe what changed and how you verified it.
+
+## Upstream sync (maintainers)
+
+`publish/clean` is a linear history rebased on `upstream/main` with fork commits squashed into logical groups. Regenerate it with `scripts/build-clean-history.sh` (from repo root):
+
+```bash
+# default: SOURCE=improve/p1-clean-code-convergence  TARGET=publish/clean
+./scripts/build-clean-history.sh [SOURCE_BRANCH] [TARGET_BRANCH]
+```
+
+What the script does:
+
+1. `git fetch upstream`
+2. Creates a dated backup branch: `backup/pre-clean-rewrite-YYYYMMDD` from `SOURCE`
+3. Resets `TARGET` to `upstream/main`, squash-merges `SOURCE`, then commits files in grouped chunks (monitor, service, tests, docs, …)
+4. Prints `git log upstream/main..HEAD --oneline` for review
+
+After review, force-push the rewritten branch (e.g. `git push --force-with-lease haotool publish/clean`). Keep the backup branch until the push is verified.
+
+Add `upstream` if missing:
+
+```bash
+git remote add upstream https://github.com/realiti4/claude-swap.git
+```
+
+See also [docs/upstream-sync.md](docs/upstream-sync.md).
