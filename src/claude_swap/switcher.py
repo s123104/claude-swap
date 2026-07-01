@@ -74,13 +74,22 @@ from claude_swap.credentials import (
     looks_like_api_key,
 )
 from claude_swap.credential_refresh import CredentialRefresher
+# ``DEFAULT_AUTO_SWITCH_THRESHOLD`` is re-exported (``as`` alias) so
+# ``from claude_swap.switcher import DEFAULT_AUTO_SWITCH_THRESHOLD`` keeps working
+# for existing callers/tests; the SSOT lives in sequence_store.
+from claude_swap.sequence_store import (
+    DEFAULT_AUTO_SWITCH_THRESHOLD as DEFAULT_AUTO_SWITCH_THRESHOLD,
+    AccountRecord,
+    SequenceData,
+    SequenceStore,
+)
 from claude_swap.usage_cache import (
     _persist_usage_cache_entry,
     _usage_from_cache,
     _usage_slot_trusted,
     extract_retry_after,
 )
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, assert_never, cast
 
 if TYPE_CHECKING:
     from claude_swap.list_reporter import ListReporter
@@ -94,11 +103,11 @@ KEYRING_SERVICE = "claude-code"
 # on profile endpoints. Matches Claude Code's CLAUDE_CODE_OAUTH_TOKEN path.
 SETUP_TOKEN_SCOPES = ("user:inference",)
 
-# Auto-switch (Beta): when the active account's 5h/7d usage reaches this
-# percentage, automated paths pick the cooldown-aware best target.
-DEFAULT_AUTO_SWITCH_THRESHOLD = 95
+# Auto-switch (Beta) threshold default lives in ``sequence_store`` (SSOT) and is
+# re-exported above so ``from claude_swap.switcher import
+# DEFAULT_AUTO_SWITCH_THRESHOLD`` keeps working for callers/tests.
 
-def auto_switch_display(cfg: dict) -> tuple[bool, int, str, str]:
+def auto_switch_display(cfg: dict[str, Any]) -> tuple[bool, int, str, str]:
     """Normalized auto-switch fields for CLI/TUI status formatters."""
     enabled = bool(cfg["enabled"])
     threshold = int(cfg["threshold"])
@@ -158,6 +167,16 @@ class ClaudeAccountSwitcher:
         self._store = CredentialStore(self)
         # OAuth credential-freshness: verify/refresh/sync of backup tokens.
         self._refresher = CredentialRefresher(self)
+        # Typed owner of sequence.json. Lock-agnostic: this switcher wraps
+        # read-modify-write transactions in FileLock; the store never locks.
+        # Late-bind the JSON helpers so tests that monkeypatch
+        # ``switcher._read_json`` / ``_write_json`` after construction still
+        # reach the store (a captured bound method would ignore the patch).
+        self._sequence_store = SequenceStore(
+            self.sequence_file,
+            read_json=lambda p: self._read_json(p),
+            write_json=lambda p, d: self._write_json(p, d),
+        )
 
         # Run any pending one-time data migrations (e.g. relocating Windows
         # backup credentials out of Credential Manager into files). Imported
@@ -226,17 +245,17 @@ class ClaudeAccountSwitcher:
             if sys.platform != "win32":
                 os.chmod(directory, 0o700)
 
-    def _read_json(self, path: Path) -> dict | None:
+    def _read_json(self, path: Path) -> dict[str, Any] | None:
         """Read and parse JSON file."""
         if not path.exists():
             return None
         try:
-            return json.loads(path.read_text(encoding="utf-8"))
+            return cast("dict[str, Any] | None", json.loads(path.read_text(encoding="utf-8")))
         except (json.JSONDecodeError, UnicodeDecodeError):
             self._logger.warning(f"Invalid JSON in {path}")
             return None
 
-    def _write_json(self, path: Path, data: dict) -> None:
+    def _write_json(self, path: Path, data: dict[str, Any]) -> None:
         """Write JSON file with validation."""
         content = json.dumps(data, indent=2)
 
@@ -358,7 +377,7 @@ class ClaudeAccountSwitcher:
 
     @staticmethod
     def _find_account_slot(
-        data: dict, email: str, organization_uuid: str
+        data: dict[str, Any], email: str, organization_uuid: str
     ) -> str | None:
         return _slot_for_identity(data.get("accounts", {}), email, organization_uuid)
 
@@ -406,7 +425,7 @@ class ClaudeAccountSwitcher:
             return False
         return True
 
-    def _switchable_slot_ids(self, data: dict | None = None) -> list[str]:
+    def _switchable_slot_ids(self, data: dict[str, Any] | None = None) -> list[str]:
         if data is None:
             data = self._get_sequence_data() or {}
         return [
@@ -435,7 +454,7 @@ class ClaudeAccountSwitcher:
 
     def _usage_cache_fresh(
         self,
-        cached: dict,
+        cached: dict[str, Any],
         account_keys: set[str],
     ) -> bool:
         """True when every account row is within the shared per-slot TTL."""
@@ -453,7 +472,7 @@ class ClaudeAccountSwitcher:
                 return False
         return True
 
-    def _trusted_usage_snapshots(self) -> dict[str, dict]:
+    def _trusted_usage_snapshots(self) -> dict[str, dict[str, Any]]:
         """Trusted-only usage snapshots, safe for unattended planning.
 
         Returns the subset of switchable slots whose cached usage is a fresh
@@ -474,7 +493,7 @@ class ClaudeAccountSwitcher:
             return {}
 
         now = time.time()
-        snapshots: dict[str, dict] = {}
+        snapshots: dict[str, dict[str, Any]] = {}
         for slot in switchable:
             if slot not in cached:
                 continue
@@ -530,7 +549,7 @@ class ClaudeAccountSwitcher:
 
         def fetch(
             item: tuple[int, str, bool, str],
-        ) -> tuple[str, dict | oauth.UsageFetchError | None | str]:
+        ) -> tuple[str, dict[str, Any] | oauth.UsageFetchError | None | str]:
             num, email, is_active, creds = item
             num_str = str(num)
             if not creds or not oauth.extract_access_token(creds):
@@ -595,7 +614,7 @@ class ClaudeAccountSwitcher:
             active_usage_pct=active_usage_pct,
             live_active_slot=live_slot,
             sequence_active_slot=sequence_slot,
-            usage_by_slot=snapshots,
+            usage_by_slot=cast("dict[str, object]", snapshots),
         )
 
     def _pick_best_from_snapshots(
@@ -772,18 +791,16 @@ class ClaudeAccountSwitcher:
 
     def _init_sequence_file(self) -> None:
         """Initialize sequence.json if it doesn't exist."""
-        if not self.sequence_file.exists():
-            init_data = {
-                "activeAccountNumber": None,
-                "lastUpdated": get_timestamp(),
-                "sequence": [],
-                "accounts": {},
-            }
-            self._write_json(self.sequence_file, init_data)
+        self._sequence_store.init_if_missing()
 
-    def _get_sequence_data(self) -> dict | None:
-        """Get sequence data."""
-        return self._read_json(self.sequence_file)
+    def _get_sequence_data(self) -> dict[str, Any] | None:
+        """Raw sequence.json dict shim over the typed store.
+
+        Retained for external consumers (monitor/list_reporter/migrations via
+        protocols) that still read the raw dict; switcher's own logic uses the
+        typed ``self._sequence_store`` model.
+        """
+        return self._sequence_store.load_raw()
 
     def _get_next_account_number(self) -> int:
         """Get next account number."""
@@ -909,7 +926,7 @@ class ClaudeAccountSwitcher:
         if len(matches) == 0:
             return None
         if len(matches) == 1:
-            return matches[0]
+            return str(matches[0])
 
         details = ", ".join(
             f"{num} [{data['accounts'][num].get('organizationName') or 'personal'}]"
@@ -920,7 +937,7 @@ class ClaudeAccountSwitcher:
             f"Use account number instead (e.g., cswap --switch-to 1)."
         )
 
-    def _get_sequence_data_migrated(self) -> dict | None:
+    def _get_sequence_data_migrated(self) -> dict[str, Any] | None:
         """Get sequence data, ensuring org-field migration has run."""
         data = self._get_sequence_data()
         if not data:
@@ -992,6 +1009,12 @@ class ClaudeAccountSwitcher:
             updated = True
 
         if updated:
+            # Deliberately bypasses SequenceStore.save(): this migration keys off
+            # the *presence* of the "organizationUuid" dict key (see the
+            # needs_migration check in _get_sequence_data_migrated), which the
+            # typed model normalizes away. Persist the raw dict directly so the
+            # presence semantics are preserved. Any future change to save()'s
+            # stamping/validation must be mirrored here.
             data["lastUpdated"] = get_timestamp()
             self._write_json(self.sequence_file, data)
 
@@ -1061,35 +1084,26 @@ class ClaudeAccountSwitcher:
         if displace_slot:
             d_num, d_email = displace_slot
             self._delete_account_files(d_num, d_email)
-            data = self._get_sequence_data() or {}
-            if int(d_num) in data["sequence"]:
-                data["sequence"].remove(int(d_num))
-            del data["accounts"][d_num]
-            self._write_json(self.sequence_file, data)
+            self._sequence_store.save(
+                self._sequence_store.load_or_empty().remove_slot(d_num)
+            )
 
         if migrate_from:
-            data = self._get_sequence_data() or {}
-            old_email = data["accounts"][migrate_from].get("email", "")
+            data = self._sequence_store.load_or_empty()
+            existing = data.get(migrate_from)
+            old_email = existing.email if existing else ""
             self._delete_account_files(migrate_from, old_email)
-            if int(migrate_from) in data["sequence"]:
-                data["sequence"].remove(int(migrate_from))
-            del data["accounts"][migrate_from]
-            self._write_json(self.sequence_file, data)
+            self._sequence_store.save(data.remove_slot(migrate_from))
             print(f"{dimmed(f'Moved from slot {migrate_from} → {slot}')}")
 
     def _register_account_slot(
-        self, account_num: str, metadata: dict, *, set_active: bool
+        self, account_num: str, record: AccountRecord, *, set_active: bool
     ) -> None:
         """Record the new slot in sequence.json and persist it."""
-        data = self._get_sequence_data() or {}
-        data["accounts"][account_num] = metadata
-        if int(account_num) not in data["sequence"]:
-            data["sequence"].append(int(account_num))
-            data["sequence"].sort()
-        if set_active:
-            data["activeAccountNumber"] = int(account_num)
-        data["lastUpdated"] = get_timestamp()
-        self._write_json(self.sequence_file, data)
+        data = self._sequence_store.load_or_empty().register_slot(
+            account_num, record, set_active=set_active
+        )
+        self._sequence_store.save(data)
 
     def add_account(self, slot: int | None = None) -> None:
         """Add current account to managed accounts.
@@ -1130,20 +1144,18 @@ class ClaudeAccountSwitcher:
             # and sequence writes so a concurrent switch/remove can't leave us
             # writing a stale slot id — re-resolve the slot fresh inside the lock.
             with FileLock(self.lock_file):
-                seq = self._get_sequence_data() or {}
+                data = self._sequence_store.load_or_empty()
                 account_num = next(
-                    (num for num, acc in seq.get("accounts", {}).items()
-                     if acc.get("email") == current_email and
-                     acc.get("organizationUuid", "") == current_org_uuid),
+                    (num for num, rec in data.accounts.items()
+                     if rec.email == current_email
+                     and rec.organization_uuid == current_org_uuid),
                     None,
                 )
                 if account_num is None:
                     raise ConfigError(
                         f"Active account {current_email} is no longer managed"
                     )
-                matched_org_name = seq["accounts"][account_num].get(
-                    "organizationName", "",
-                )
+                matched_org_name = data.accounts[account_num].organization_name
                 current_creds = self._write_verified_live_account_credentials(
                     account_num,
                     current_email,
@@ -1151,9 +1163,7 @@ class ClaudeAccountSwitcher:
                     assume_locked=True,
                 )
                 self._write_account_config(account_num, current_email, current_config)
-                seq["activeAccountNumber"] = int(account_num)
-                seq["lastUpdated"] = get_timestamp()
-                self._write_json(self.sequence_file, seq)
+                self._sequence_store.save(data.set_active(int(account_num)))
 
             tag = self._get_display_tag(current_email, matched_org_name, current_org_uuid)
             self._logger.info(f"Updated credentials for account {account_num}: {current_email}")
@@ -1187,7 +1197,7 @@ class ClaudeAccountSwitcher:
             raise ConfigError("Permission denied reading Claude config")
 
         # Get account UUID and org fields
-        config_data = self._read_json(config_path)
+        config_data = self._read_json(config_path) or {}
         oauth_data = config_data.get("oauthAccount", {})
         account_uuid = oauth_data.get("accountUuid", "")
         organization_uuid = oauth_data.get("organizationUuid", "") or ""
@@ -1213,13 +1223,12 @@ class ClaudeAccountSwitcher:
             # Update sequence.json
             self._register_account_slot(
                 account_num,
-                {
-                    "email": current_email,
-                    "uuid": account_uuid,
-                    "organizationUuid": organization_uuid,
-                    "organizationName": organization_name,
-                    "added": get_timestamp(),
-                },
+                AccountRecord.create(
+                    email=current_email,
+                    uuid=account_uuid,
+                    organization_uuid=organization_uuid,
+                    organization_name=organization_name,
+                ),
                 set_active=True,
             )
         tag = self._get_display_tag(current_email, organization_name, organization_uuid)
@@ -1309,11 +1318,10 @@ class ClaudeAccountSwitcher:
             # switch/add can't clobber sequence.json (parity with add_account's
             # refresh path); re-read fresh inside the lock.
             with FileLock(self.lock_file):
-                seq = self._get_sequence_data() or {}
+                data = self._sequence_store.load_or_empty()
                 account_num = next(
-                    (num for num, acc in seq.get("accounts", {}).items()
-                     if acc.get("email") == email
-                     and acc.get("organizationUuid", "") == ""),
+                    (num for num, rec in data.accounts.items()
+                     if rec.email == email and rec.organization_uuid == ""),
                     None,
                 )
                 if account_num is None:
@@ -1322,8 +1330,7 @@ class ClaudeAccountSwitcher:
                     )
                 self._write_account_credentials(account_num, email, credentials)
                 self._write_account_config(account_num, email, config)
-                seq["lastUpdated"] = get_timestamp()
-                self._write_json(self.sequence_file, seq)
+                self._sequence_store.save(data)
             self._logger.info(f"Updated {kind_label} for account {account_num}: {email}")
             print(
                 f"{accent(f'Updated {kind_label}')} for Account {account_num} "
@@ -1336,15 +1343,7 @@ class ClaudeAccountSwitcher:
             return
         account_num, displace_slot, migrate_from = resolved
 
-        record = {
-            "email": email,
-            "uuid": "",
-            "organizationUuid": "",
-            "organizationName": "",
-            "added": get_timestamp(),
-        }
-        if is_api_key:
-            record["kind"] = "api_key"
+        record = AccountRecord.create(email=email, is_api_key=is_api_key)
 
         # Hold the cross-process lock across displacement + credential/config
         # writes + the sequence.json registration so a concurrent switch/add
@@ -1376,9 +1375,9 @@ class ClaudeAccountSwitcher:
                 raise ValidationError(f"Invalid email format: {identifier}")
 
             # For email identifiers, handle ambiguous matches interactively
-            data = self._get_sequence_data()
+            data = self._get_sequence_data() or {}
             matches = [
-                num for num, acc in (data or {}).get("accounts", {}).items()
+                num for num, acc in data.get("accounts", {}).items()
                 if acc.get("email") == identifier
             ]
             if len(matches) > 1:
@@ -1431,18 +1430,15 @@ class ClaudeAccountSwitcher:
         # Delete files + rewrite sequence.json under the cross-process lock,
         # re-reading fresh inside so a concurrent switch/add can't be clobbered.
         with FileLock(self.lock_file):
-            data = self._get_sequence_data() or {}
-            if account_num not in data.get("accounts", {}):
+            seq = self._sequence_store.load_or_empty()
+            if seq.get(account_num) is None:
                 raise AccountNotFoundError(f"Account-{account_num} does not exist")
 
             # Remove backup files
             self._delete_account_files(account_num, email)
 
             # Update sequence.json
-            del data["accounts"][account_num]
-            data["sequence"] = [n for n in data["sequence"] if n != int(account_num)]
-            data["lastUpdated"] = get_timestamp()
-            self._write_json(self.sequence_file, data)
+            self._sequence_store.save(seq.remove_slot(account_num))
 
         self._logger.info(f"Removed account {account_num}: {email}")
         print(f"{accent('Removed')} Account-{account_num} ({email})")
@@ -1463,7 +1459,7 @@ class ClaudeAccountSwitcher:
 
     def _build_accounts_info(
         self,
-        data: dict | None = None,
+        data: dict[str, Any] | None = None,
         active_num: str | None = None,
     ) -> list[tuple[int, str, str, str, bool, str]]:
         return self._list_reporter().build_accounts_info(data, active_num)
@@ -1479,17 +1475,17 @@ class ClaudeAccountSwitcher:
         email: str,
         *,
         creds: str | None = None,
-    ) -> tuple[dict | str | oauth.UsageFetchError | None, oauth.UsageFetchError | None]:
+    ) -> tuple[dict[str, Any] | str | oauth.UsageFetchError | None, oauth.UsageFetchError | None]:
         return self._list_reporter().resolve_active_usage_entry(
             account_num, email, creds=creds,
         )
 
     def _active_account_usage(
         self, account_num: str, current_email: str,
-    ) -> dict | str | oauth.UsageFetchError | None:
+    ) -> dict[str, Any] | str | oauth.UsageFetchError | None:
         return self._list_reporter().active_account_usage(account_num, current_email)
 
-    def _usage_by_account(self) -> dict[str, dict | str | None]:
+    def _usage_by_account(self) -> dict[str, dict[str, Any] | str | oauth.UsageFetchError | None]:
             """Map account number → usage entry (per-slot cache) for managed accounts."""
             accounts_info = self._build_accounts_info()
             usages, _ = self._resolve_usages(accounts_info)
@@ -1533,7 +1529,7 @@ class ClaudeAccountSwitcher:
             ]
             usage = self._usage_by_account()
             result = rank_slots(
-                usage,
+                cast("dict[str, object]", usage),
                 mode="headroom_best",
                 current=str(current_num) if current_num is not None else None,
                 candidates=others,
@@ -1541,8 +1537,8 @@ class ClaudeAccountSwitcher:
             return result.target, result.note or ""
 
     def _switch_result_from_op(
-            self, op: dict, strategy: str, extra_warnings: list[str] | None = None
-        ) -> dict:
+            self, op: dict[str, Any], strategy: str, extra_warnings: list[str] | None = None
+        ) -> dict[str, Any]:
             return switch_result_from_op(op, strategy, extra_warnings)
 
     def _switch_noop(
@@ -1551,10 +1547,10 @@ class ClaudeAccountSwitcher:
             strategy: str,
             reason: str,
             message: str,
-            from_ref: dict | None = None,
-            to_ref: dict | None = None,
+            from_ref: dict[str, Any] | None = None,
+            to_ref: dict[str, Any] | None = None,
             warnings: list[str] | None = None,
-        ) -> dict:
+        ) -> dict[str, Any]:
             return switch_noop(
                 strategy=strategy,
                 reason=reason,
@@ -1661,7 +1657,7 @@ class ClaudeAccountSwitcher:
     def _switch_automated_target(
         self,
         decision: AutoSwitchDecisionContext,
-        active_account,
+        active_account: str | int | None,
         *,
         quiet: bool,
     ) -> str | None:
@@ -1689,22 +1685,24 @@ class ClaudeAccountSwitcher:
                 return None
             print(dimmed(msg))
             raise SwitchError(msg)
-        if not quiet:
-            print(dimmed(msg))
-        raise SwitchError(msg)
+        # Exhaustiveness guard: if a new SwitchPlanOutcome is added, mypy fails
+        # here rather than silently falling through to "stay put".
+        assert_never(plan.outcome)
 
     def _switch_manual_rotation_target(
         self,
-        sequence: list,
-        active_account,
+        sequence: list[int],
+        active_account: str | int | None,
         *,
         quiet: bool,
     ) -> str | None:
         """Return the next switchable slot in rotation order."""
-        try:
-            current_index = sequence.index(active_account)
-        except ValueError:
-            current_index = 0
+        current_index = 0
+        if active_account is not None:
+            try:
+                current_index = sequence.index(int(active_account))
+            except (ValueError, TypeError):
+                current_index = 0
 
         for offset in range(1, len(sequence)):
             candidate = str(sequence[(current_index + offset) % len(sequence)])
@@ -1727,7 +1725,7 @@ class ClaudeAccountSwitcher:
 
     def switch_to(
             self, identifier: str, json_output: bool = False
-        ) -> dict | None:
+        ) -> dict[str, Any] | None:
             """Switch to specific account."""
             if not self.sequence_file.exists():
                 raise ConfigError("No accounts are managed yet")
@@ -1745,9 +1743,9 @@ class ClaudeAccountSwitcher:
                 # to _resolve_account_identifier, which raises a ConfigError listing
                 # the matching slots (+ org labels) → structured error envelope.
                 if not json_output:
-                    data = self._get_sequence_data()
+                    data = self._get_sequence_data() or {}
                     matches = [
-                        num for num, acc in (data or {}).get("accounts", {}).items()
+                        num for num, acc in data.get("accounts", {}).items()
                         if acc.get("email") == identifier
                     ]
                     if len(matches) > 1:
@@ -1798,14 +1796,14 @@ class ClaudeAccountSwitcher:
                         )
 
             op = self._perform_switch(target_account, emit_output=not json_output)
-            return self._switch_result_from_op(op, "direct") if json_output else None
+            return self._switch_result_from_op(op or {}, "direct") if json_output else None
 
     def list_accounts(
         self,
         show_token_status: bool = False,
         show_health: bool = False,
         json_output: bool = False,
-    ) -> dict | None:
+    ) -> dict[str, Any] | None:
         """List all managed accounts."""
         from claude_swap.list_reporter import run_list
         return run_list(
@@ -1815,32 +1813,24 @@ class ClaudeAccountSwitcher:
             json_output=json_output,
         )
 
-    def status(self, json_output: bool = False) -> dict | None:
+    def status(self, json_output: bool = False) -> dict[str, Any] | None:
         """Display current account status."""
         from claude_swap.list_reporter import run_status
         return run_status(self, json_output=json_output)
 
-    def get_auto_switch_config(self) -> dict:
+    def get_auto_switch_config(self) -> dict[str, Any]:
         """Return the persisted auto-switch (Beta) settings.
 
         Auto-switch is opt-in and stored in ``sequence.json`` under the
         ``autoSwitch`` key. Defaults to disabled at
         ``DEFAULT_AUTO_SWITCH_THRESHOLD``%.
         """
-        data = self._get_sequence_data() or {}
-        cfg = data.get("autoSwitch") or {}
-        try:
-            threshold = int(cfg.get("threshold", DEFAULT_AUTO_SWITCH_THRESHOLD))
-        except (TypeError, ValueError):
-            threshold = DEFAULT_AUTO_SWITCH_THRESHOLD
-        return {
-            "enabled": bool(cfg.get("enabled", False)),
-            "threshold": threshold,
-        }
+        cfg = self._sequence_store.load_or_empty().auto_switch
+        return {"enabled": cfg.enabled, "threshold": cfg.threshold}
 
     def set_auto_switch_config(
         self, *, enabled: bool | None = None, threshold: int | None = None
-    ) -> dict:
+    ) -> dict[str, Any]:
         """Persist auto-switch (Beta) settings, returning the merged config.
 
         Only the provided fields are updated; the rest keep their stored (or
@@ -1851,23 +1841,16 @@ class ClaudeAccountSwitcher:
         """
         self._setup_directories()
         self._init_sequence_file()
-        data = self._get_sequence_data() or {}
-        cfg = dict(data.get("autoSwitch") or {})
-        if enabled is not None:
-            cfg["enabled"] = bool(enabled)
-        if threshold is not None:
-            t = int(threshold)
-            if not 1 <= t <= 100:
-                raise ValidationError("Threshold must be between 1 and 100")
-            cfg["threshold"] = t
-        cfg.setdefault("enabled", False)
-        cfg.setdefault("threshold", DEFAULT_AUTO_SWITCH_THRESHOLD)
-        data["autoSwitch"] = cfg
-        data["lastUpdated"] = get_timestamp()
-        self._write_json(self.sequence_file, data)
-        return {"enabled": cfg["enabled"], "threshold": cfg["threshold"]}
+        if threshold is not None and not 1 <= int(threshold) <= 100:
+            raise ValidationError("Threshold must be between 1 and 100")
+        data = self._sequence_store.load_or_empty().with_auto_switch(
+            enabled=enabled, threshold=threshold
+        )
+        self._sequence_store.save(data)
+        cfg = data.auto_switch
+        return {"enabled": cfg.enabled, "threshold": cfg.threshold}
 
-    def ensure_auto_switch_enabled(self) -> dict:
+    def ensure_auto_switch_enabled(self) -> dict[str, Any]:
         """Return config, persisting ``enabled=True`` if currently disabled.
 
         Foreground monitors (CLI ``--monitor``, TUI "Start monitor now")
@@ -1930,7 +1913,7 @@ class ClaudeAccountSwitcher:
         # which extract_retry_after reads back and decays against the clock.
         return extract_retry_after(usage, time.time())
 
-    def _resolve_active_usage(self) -> dict | None:
+    def _resolve_active_usage(self) -> dict[str, Any] | None:
         """Return the active account's usage dict (cached or freshly fetched).
 
         Returns ``None`` when there is no active login, no usable credentials,
@@ -2044,7 +2027,7 @@ class ClaudeAccountSwitcher:
         *,
         strategy: str | None = None,
         json_output: bool = False,
-    ) -> dict | bool | None:
+    ) -> dict[str, Any] | bool | None:
         """Switch to another managed account.
 
         Returns ``True`` when credentials were activated on a different slot,
@@ -2085,6 +2068,7 @@ class ClaudeAccountSwitcher:
             self._perform_switch(target, intent=intent)
             return True
 
+        assert preconditions.identity is not None
         current_email, current_org_uuid = preconditions.identity
 
         # Check if current account is managed
@@ -2097,8 +2081,8 @@ class ClaudeAccountSwitcher:
             print(dimmed("Please run the switch command again to switch to the next account."))
             return False
 
-        data = preconditions.data
-        sequence = preconditions.sequence
+        data = preconditions.data or {}
+        sequence = preconditions.sequence or []
 
         if preconditions.kind == SwitchPreconditionKind.SINGLE_ACCOUNT:
             msg = "Only one account is managed. Add more accounts to switch between."
@@ -2202,7 +2186,7 @@ class ClaudeAccountSwitcher:
 
     def _activate_target_directly(
         self,
-        data: dict,
+        data: dict[str, Any],
         target_account: str,
         target_email: str,
         config_path: Path,
@@ -2292,9 +2276,9 @@ class ClaudeAccountSwitcher:
                 self._write_json(config_path, target_config_data)
             config_written = True
 
-            data["activeAccountNumber"] = int(target_account)
-            data["lastUpdated"] = get_timestamp()
-            self._write_json(self.sequence_file, data)
+            self._sequence_store.save(
+                SequenceData(data).set_active(int(target_account))
+            )
         except Exception:
             if config_written:
                 try:
@@ -2345,7 +2329,7 @@ class ClaudeAccountSwitcher:
 
     def _swap_target_transactional(
         self,
-        data: dict,
+        data: dict[str, Any],
         target_account: str,
         target_email: str,
         current_account: str,
@@ -2420,7 +2404,7 @@ class ClaudeAccountSwitcher:
             if not oauth_section:
                 raise SwitchError("Invalid oauthAccount in backup")
 
-            current_config_data = self._read_json(config_path)
+            current_config_data = self._read_json(config_path) or {}
             current_config_data["oauthAccount"] = oauth_section
 
             self._write_json(config_path, current_config_data)
@@ -2428,9 +2412,9 @@ class ClaudeAccountSwitcher:
             self._logger.info("Updated config file")
 
             # Step 5: Update sequence state
-            data["activeAccountNumber"] = int(target_account)
-            data["lastUpdated"] = get_timestamp()
-            self._write_json(self.sequence_file, data)
+            self._sequence_store.save(
+                SequenceData(data).set_active(int(target_account))
+            )
             transaction.record_step("sequence_updated")
 
             self._logger.info(
@@ -2476,7 +2460,7 @@ class ClaudeAccountSwitcher:
         *,
         intent: SwitchIntent | None = None,
         emit_output: bool = True,
-    ) -> dict | None:
+    ) -> dict[str, Any] | None:
         """Perform the actual account switch with transaction support.
 
         When ``emit_output`` is False (JSON mode) human output is suppressed and
@@ -2604,7 +2588,7 @@ class ClaudeAccountSwitcher:
         return session_dirs
 
     def _purge_remove_account_credentials(
-        self, data: dict | None, removed_items: list[str]
+        self, data: dict[str, Any] | None, removed_items: list[str]
     ) -> None:
         if not data:
             return

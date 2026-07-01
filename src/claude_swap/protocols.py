@@ -18,6 +18,7 @@ from claude_swap.models import (
     SwitchIntent,
     SwitchPreconditions,
 )
+from claude_swap.oauth import UsageFetchError
 
 ServiceState = Literal["not installed", "installed but not loaded", "loaded"]
 
@@ -106,8 +107,10 @@ class ListHost(Protocol):
 
     sequence_file: Path
     lock_file: Path
-    usage_cache_path: Path
     _logger: logging.Logger
+
+    @property
+    def usage_cache_path(self) -> Path: ...
 
     def _get_sequence_data_migrated(self) -> dict[str, Any] | None: ...
     def _get_current_account(self) -> tuple[str, str] | None: ...
@@ -175,5 +178,7 @@ class SwitchCliHost(Protocol):
     def _select_best_switchable(
         self, current_num: str | None,
     ) -> tuple[str | None, str]: ...
-    def _usage_by_account(self) -> dict[str, dict[str, Any] | str | None]: ...
+    def _usage_by_account(
+        self,
+    ) -> dict[str, dict[str, Any] | str | UsageFetchError | None]: ...
     def _account_is_switchable(self, account_num: str) -> bool: ...

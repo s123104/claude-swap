@@ -24,6 +24,7 @@ from claude_swap.models import Platform
 if TYPE_CHECKING:
     from claude_swap.models import BackgroundAutoSwitchIntent
 from claude_swap.paths import get_backup_root
+from claude_swap.sequence_store import AccountRecord
 from claude_swap.switcher import ClaudeAccountSwitcher, SETUP_TOKEN_SCOPES
 
 from tests.conftest import usage_payload as _usage_payload
@@ -436,9 +437,10 @@ class TestMutationLocking:
         switcher._init_sequence_file()
         switcher._register_account_slot(
             "1",
-            {"email": "tok@example.com", "uuid": "", "organizationUuid": "",
-             "organizationName": "", "added": "2024-01-01T00:00:00Z",
-             "kind": "api_key"},
+            AccountRecord.create(
+                email="tok@example.com", added="2024-01-01T00:00:00Z",
+                is_api_key=True,
+            ),
             set_active=True,
         )
         calls = self._spy_filelock(monkeypatch)
@@ -481,8 +483,9 @@ class TestMutationLocking:
         switcher._init_sequence_file()
         switcher._register_account_slot(
             "1",
-            {"email": "a@example.com", "uuid": "u", "organizationUuid": "",
-             "organizationName": "", "added": "2024-01-01T00:00:00Z"},
+            AccountRecord.create(
+                email="a@example.com", uuid="u", added="2024-01-01T00:00:00Z",
+            ),
             set_active=True,
         )
         calls = self._spy_filelock(monkeypatch)

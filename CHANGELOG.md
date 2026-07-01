@@ -6,6 +6,21 @@ Release version is defined in `pyproject.toml` (currently `0.15.0b2+haotool.1`).
 
 ## [Unreleased]
 
+### Changed
+
+- **`SequenceStore` extracted:** `sequence.json` state is now a typed, immutable
+  model (`SequenceData` / `AccountRecord` / `AutoSwitchConfig`) behind a
+  lock-agnostic store, replacing raw-dict access throughout the account
+  add/remove/switch/auto-switch paths in `switcher.py`. On-disk shape is
+  unchanged (unknown/future keys and key presence preserved). Internal refactor
+  only — no user-facing behavior change. The new module is mypy-strict; the
+  broader `switcher` typing debt is now also resolved (see below).
+- **`switcher` is now mypy-strict:** the `ignore_errors` carve-out for
+  `claude_swap.switcher` was removed after typing its `sequence.json`,
+  usage-cache, and config-dict flows and fixing the `ListHost` /
+  `SwitchCliHost` protocol signatures. Only `switch_cli` and `tui` remain
+  carved out. Internal typing only — no behavior change.
+
 ## [0.15.0b2+haotool.1] — 2026-06-28
 
 ### Added
