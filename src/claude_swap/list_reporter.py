@@ -28,6 +28,7 @@ from claude_swap.json_output import (
     status_payload,
     usage_display_line,
 )
+from claude_swap.exceptions import LockError
 from claude_swap.locking import FileLock
 from claude_swap.printer import (
     abbreviate_path,
@@ -48,6 +49,15 @@ from claude_swap.usage_cache import (
 
 if TYPE_CHECKING:
     from claude_swap.protocols import ListHost
+
+# How long a persist of a just-rotated OAuth credential may wait for the file
+# lock. Anthropic refresh tokens are single-use (claude-code#24317): by the
+# time the persist callback runs, the old token is already consumed, so giving
+# up loses the only working credential for the slot. The default 10s FileLock
+# timeout loses that race against a switch holding the lock through its
+# in-lock network refresh (~10s) plus write verification; 30s outlasts any
+# legitimate transaction while still bounding a wedged holder.
+_ROTATED_PERSIST_LOCK_TIMEOUT = 30.0
 
 
 def _format_usage_lines(usage: dict[str, Any]) -> list[str]:
@@ -375,9 +385,50 @@ class ListReporter:
                 str(num), email, creds, degraded=self._active_degraded,
             )
 
+        original_oauth = oauth.extract_oauth_data(creds)
+        # Refresh-token lineage this fetch is allowed to overwrite; grows as
+        # rotations persist so a 401-triggered second rotation still lands.
+        own_lineage = {original_oauth.get("refreshToken")} if original_oauth else set()
+
         def persist(acct_num: str, acct_email: str, new_creds: str) -> None:
-            with FileLock(self.lock_file):
+            lock = FileLock(self.lock_file)
+            if not lock.acquire(timeout=_ROTATED_PERSIST_LOCK_TIMEOUT):
+                self._logger.error(
+                    "Could not persist rotated OAuth token for account %s (%s): "
+                    "file lock still held after %.0fs. The previous refresh token "
+                    "is already consumed; if the next refresh fails with "
+                    "invalid_grant, re-add with `cswap --add-account --slot %s`.",
+                    acct_num, acct_email, _ROTATED_PERSIST_LOCK_TIMEOUT, acct_num,
+                )
+                raise LockError(
+                    f"persist of rotated token for account {acct_num} timed out"
+                )
+            try:
+                new_oauth = oauth.extract_oauth_data(new_creds)
+                new_refresh = new_oauth.get("refreshToken") if new_oauth else None
+                stored = self._host._read_account_credentials(acct_num, acct_email)
+                stored_oauth = oauth.extract_oauth_data(stored) if stored else None
+                stored_refresh = (
+                    stored_oauth.get("refreshToken") if stored_oauth else None
+                )
+                if (
+                    stored_refresh is not None
+                    and stored_refresh not in own_lineage
+                    and stored_refresh != new_refresh
+                ):
+                    # The slot was re-logged or re-imported while we were
+                    # refreshing: the on-disk credential is from a newer login
+                    # action, so ours is moot — keep theirs.
+                    self._logger.warning(
+                        "Discarding rotated OAuth token for account %s (%s): "
+                        "slot credentials changed while refreshing.",
+                        acct_num, acct_email,
+                    )
+                    return
                 self._host._write_account_credentials(acct_num, acct_email, new_creds)
+                own_lineage.add(new_refresh)
+            finally:
+                lock.release()
 
         has_live_session = bool(self._host._live_session_pids(str(num), email))
 

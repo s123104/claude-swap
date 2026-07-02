@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -11,6 +12,8 @@ from unittest.mock import MagicMock, patch
 from claude_swap import oauth
 from claude_swap.credentials import ActiveCredentials
 from claude_swap.json_output import USAGE_API_KEY, USAGE_KEYCHAIN_UNAVAILABLE
+from claude_swap.list_reporter import ListReporter
+from claude_swap.locking import FileLock
 from claude_swap.models import Platform
 from claude_swap.switcher import ClaudeAccountSwitcher
 
@@ -750,6 +753,155 @@ class TestListAccountsUsage:
         assert "25%" in output
         assert "10%" in output
         assert "cached; live fetch usage unavailable (rate limited)" in output
+
+
+class TestRotatedTokenPersistContention:
+    """R2-M2: a consumed single-use refresh token must never be dropped silently.
+
+    The inactive-slot usage fetch refreshes an expired token over the network
+    (consuming the single-use refresh token, claude-code#24317) and persists
+    the rotation via a callback that takes the file lock. With the default 10s
+    timeout, a switch holding the lock through its own in-lock network refresh
+    made the persist raise LockError, which oauth swallowed as a warning — the
+    backup kept the now-dead token and the slot needed a manual re-login.
+    """
+
+    _ROTATED = json.dumps(
+        {
+            "claudeAiOauth": {
+                "accessToken": "sk-rotated",
+                "refreshToken": "rt-rotated",
+                "expiresAt": 9_999_999_999_000,
+            }
+        }
+    )
+
+    def _seed(self, temp_home: Path, sample_sequence_data: dict):
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        switcher = ClaudeAccountSwitcher()
+        switcher.platform = Platform.LINUX
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        expired = json.dumps(
+            {
+                "claudeAiOauth": {
+                    "accessToken": "sk-old",
+                    "refreshToken": "rt-old",
+                    "expiresAt": 1000,
+                }
+            }
+        )
+        switcher._write_account_credentials("2", "account2@example.com", expired)
+        return switcher, expired
+
+    def _fetch_inactive_row(self, switcher, creds: str):
+        with (
+            patch(
+                "claude_swap.oauth.refresh_oauth_credentials",
+                return_value=self._ROTATED,
+            ),
+            patch("claude_swap.oauth.request_usage_data", side_effect=OSError("no net")),
+            patch.object(switcher, "_live_session_pids", return_value=[]),
+        ):
+            return ListReporter(switcher).fetch_account_usage(
+                (2, "account2@example.com", "", "", False, creds),
+            )
+
+    def test_persist_waits_out_a_held_lock_and_lands_the_rotation(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """A lock held past the old 10s default but released within the
+        bounded persist window must not cost the rotated token."""
+        switcher, expired = self._seed(temp_home, sample_sequence_data)
+        blocker = FileLock(switcher.lock_file)
+        assert blocker.acquire()
+        release_timer = threading.Timer(0.5, blocker.release)
+
+        with patch(
+            "claude_swap.list_reporter.FileLock",
+            side_effect=lambda p: FileLock(p, timeout=0.1),
+        ):
+            # Constructor timeout is irrelevant: persist must acquire with its
+            # own bounded budget, which outlives this 0.5s contention.
+            release_timer.start()
+            try:
+                self._fetch_inactive_row(switcher, expired)
+            finally:
+                release_timer.cancel()
+                blocker.release()
+
+        stored = switcher._read_account_credentials("2", "account2@example.com")
+        assert json.loads(stored)["claudeAiOauth"]["refreshToken"] == "rt-rotated"
+
+    def test_persist_timeout_logs_error_with_recovery_hint(
+        self,
+        temp_home: Path,
+        mock_claude_config: Path,
+        sample_sequence_data: dict,
+        caplog,
+        capsys,
+        monkeypatch,
+    ):
+        """A wedged lock holder must surface an error-level record naming the
+        slot and the re-add recovery, not a silent warning-level drop."""
+        switcher, expired = self._seed(temp_home, sample_sequence_data)
+        monkeypatch.setattr(
+            "claude_swap.list_reporter._ROTATED_PERSIST_LOCK_TIMEOUT", 0.2
+        )
+        blocker = FileLock(switcher.lock_file)
+        assert blocker.acquire()
+        try:
+            with caplog.at_level(logging.ERROR, logger="claude-swap"):
+                self._fetch_inactive_row(switcher, expired)
+        finally:
+            blocker.release()
+
+        errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert any(
+            "rotated OAuth token for account 2" in r.getMessage()
+            and "--add-account --slot 2" in r.getMessage()
+            for r in errors
+        ), [r.getMessage() for r in errors]
+        # oauth's persist wrapper still prints the user-facing warning.
+        assert "failed to save refreshed token for account 2" in capsys.readouterr().out
+
+    def test_persist_keeps_a_relogged_slot_intact(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """A re-login that lands while our refresh is in flight wins: the
+        rotated old-lineage token must not clobber the fresh login."""
+        switcher, expired = self._seed(temp_home, sample_sequence_data)
+        relogged = json.dumps(
+            {
+                "claudeAiOauth": {
+                    "accessToken": "sk-relogin",
+                    "refreshToken": "rt-relogin",
+                    "expiresAt": 9_999_999_999_000,
+                }
+            }
+        )
+
+        def refresh_and_relogin(_creds: str) -> str:
+            # The slot is re-added (new lineage) while our HTTP refresh runs.
+            switcher._write_account_credentials(
+                "2", "account2@example.com", relogged
+            )
+            return self._ROTATED
+
+        with (
+            patch(
+                "claude_swap.oauth.refresh_oauth_credentials",
+                side_effect=refresh_and_relogin,
+            ),
+            patch("claude_swap.oauth.request_usage_data", side_effect=OSError("no net")),
+            patch.object(switcher, "_live_session_pids", return_value=[]),
+        ):
+            ListReporter(switcher).fetch_account_usage(
+                (2, "account2@example.com", "", "", False, expired),
+            )
+
+        stored = switcher._read_account_credentials("2", "account2@example.com")
+        assert json.loads(stored)["claudeAiOauth"]["refreshToken"] == "rt-relogin"
 
 
 class TestActiveAccountRefresh:
