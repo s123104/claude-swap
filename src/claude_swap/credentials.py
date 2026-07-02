@@ -52,15 +52,29 @@ CLAUDE_CODE_KEYCHAIN_SERVICE = "Claude Code-credentials"
 # lives in ``~/.claude.json`` as ``primaryApiKey`` (see below).
 CLAUDE_CODE_MANAGED_KEYCHAIN_SERVICE = "Claude Code"
 
+# Bounded retry for the active OAuth-credential Keychain read. A locked/contended
+# login Keychain can fail a single `security` call transiently — e.g. just after
+# wake while the keychain is still settling, or under contention with Claude Code's
+# own statusline polling the same item — and a second attempt a moment later
+# usually succeeds. This is an I/O backoff between retries of an external CLI, NOT
+# a sleep papering over an internal race.
 _ACTIVE_READ_ATTEMPTS = 2
-_ACTIVE_READ_RETRY_DELAY = 0.3
+_ACTIVE_READ_RETRY_DELAY = 0.3  # seconds between attempts
 
 
 _T = TypeVar("_T")
 
 
 class ActiveCredentials(NamedTuple):
-    """Classified result of reading Claude Code's active credential."""
+    """Outcome of reading Claude Code's active credential.
+
+    ``value`` is the credential string (OAuth JSON or a raw managed key), ``""``
+    when none exists in any backend, or ``None`` on a plaintext-file read error.
+    ``keychain_unavailable`` is True only when the macOS OAuth Keychain read failed
+    (locked / denied / timeout) and nothing else covered it — letting callers
+    distinguish a transiently unreadable Keychain from a genuinely empty slot,
+    instead of collapsing both into a misleading "no credentials".
+    """
 
     value: str | None
     keychain_unavailable: bool
@@ -155,21 +169,23 @@ class CredentialStore:
         return self._keychain_usable_cache is not False
 
     def _read_credentials(self) -> str | None:
-        """Read Claude Code's active credential — OAuth *or* managed API key.
+        """Read Claude Code's active credential — OAuth *or* managed API key (value).
 
-        Thin wrapper preserving the historic ``str | None`` contract: credential
-        string if found, ``""`` if absent, ``None`` on plaintext-file read error.
-        Callers that need to distinguish an unreadable macOS Keychain from a real
-        empty slot should use :meth:`_read_active_credentials`.
+        Thin wrapper over :meth:`_read_active_credentials` preserving the historic
+        ``str | None`` contract the switch paths rely on: credential string if
+        found, ``""`` if not found, ``None`` on a file read error.
         """
         return self._read_active_credentials().value
 
     def _read_active_oauth_keychain(self) -> tuple[str | None, bool]:
-        """Read the active OAuth Keychain item with one bounded retry.
+        """Read the active OAuth Keychain item with a bounded retry.
 
-        Returns ``(value, failed)``. A missing item returns ``(None, False)``; a
-        locked/denied/timed-out Keychain returns ``(None, True)`` only after every
-        attempt fails.
+        Returns ``(value, failed)``. ``value`` is the credential string, or
+        ``None`` when the item is absent (rc-44) or unreadable. ``failed`` is True
+        only when *every* attempt raised a KeychainError (locked / denied /
+        timeout); a genuinely absent item (rc-44, returned as ``None`` without
+        raising) reports ``failed=False`` and is not retried. The retry rides out
+        a transient lock/contention — it does not paper over an internal race.
         """
         last_error: Exception | None = None
         for attempt in range(_ACTIVE_READ_ATTEMPTS):
@@ -179,12 +195,17 @@ class CredentialStore:
                     CLAUDE_CODE_KEYCHAIN_SERVICE,
                     macos_keychain.keychain_account_name(),
                 )
+                # A retried attempt that succeeds proves the Keychain recovered
+                # from a transient lock, so restore Keychain routing here —
+                # _kc_call's cache only flips None → True and would otherwise
+                # pin the rest of this process to file mode after one flaky read.
                 self._keychain_usable_cache = True
                 return value, False
             except macos_keychain.KEYCHAIN_ERRORS as e:
                 last_error = e
                 if attempt + 1 < _ACTIVE_READ_ATTEMPTS:
                     time.sleep(_ACTIVE_READ_RETRY_DELAY)
+        # Every attempt failed: _kc_call has flipped routing to file mode.
         self._host._logger.warning(
             f"Keychain read failed after {_ACTIVE_READ_ATTEMPTS} attempt(s), "
             f"trying file: {last_error}"
@@ -192,20 +213,33 @@ class CredentialStore:
         return None, True
 
     def _read_active_credentials(self) -> ActiveCredentials:
-        """Read Claude Code's active credential, classifying Keychain failures.
+        """Read Claude Code's active credential, classifying the outcome.
 
         Tries the OAuth credential first (Keychain "Claude Code-credentials" on
-        macOS when usable, then the plaintext file), and only then managed-key
-        locations. ``keychain_unavailable`` is True only when the OAuth Keychain
-        read failed and no file/managed-key fallback covered it.
+        macOS when usable — with a bounded retry to ride out a transient
+        lock/contention — then the plaintext ``~/.claude/.credentials.json`` Claude
+        Code also falls back to), and only then the managed-key locations (macOS
+        Keychain "Claude Code", then ``~/.claude.json`` ``primaryApiKey``). Trying
+        OAuth fully first means a macOS OAuth login that only has a file fallback
+        (Keychain empty) is never misread as an API key. A returned managed key is a
+        raw ``sk-ant-api…`` string — callers distinguish it via ``looks_like_api_key``.
+        Non-mutating.
+
+        Reports ``keychain_unavailable`` when the OAuth Keychain read failed and
+        nothing else covered it, so the display layer can say "keychain unavailable"
+        rather than "no credentials" for a merely-unreadable slot — which would
+        otherwise nudge the user into an unnecessary re-login.
         """
         keychain_failed = False
-
+        # 1. OAuth Keychain (macOS, when usable), with a bounded retry.
         if self._use_keychain():
             val, keychain_failed = self._read_active_oauth_keychain()
             if val:
                 return ActiveCredentials(val, False)
         elif self._host.platform == Platform.MACOS:
+            # Keychain already known unusable this process (a prior op failed and the
+            # capability cache stuck to file mode): if nothing is found below, that
+            # absence is "keychain unavailable", not a genuinely empty slot.
             keychain_failed = True
 
         # 2. OAuth plaintext file (Claude Code's own fallback; every platform).
@@ -223,6 +257,8 @@ class CredentialStore:
         key = self._read_managed_key()
         if key:
             return ActiveCredentials(key, False)
+        # Nothing anywhere. Flag a failed-and-uncovered OAuth Keychain read so the
+        # UI distinguishes it from a real empty slot.
         return ActiveCredentials("", keychain_failed)
 
     def _read_managed_key(self) -> str:
