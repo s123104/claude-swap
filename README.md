@@ -185,13 +185,13 @@ The service runs the same `cswap --monitor` loop, restarting on failure and writ
 systemd=true
 ```
 
-Then from Windows: `wsl --shutdown`, reopen the distro, and run `cswap service install` there. WSL may shut down the distro when idle — the monitor stops until WSL restarts. To boot the distro at Windows login, add a **Task Scheduler** task (At log on, no admin):
+Then from Windows: `wsl --shutdown`, reopen the distro, and run `cswap service install` there. WSL shuts the distro down when idle, and [systemd services do not keep it alive](https://learn.microsoft.com/en-us/windows/wsl/systemd) — so the monitor stops unless a user-launched process holds the instance open. To boot the distro at Windows login **and** keep it alive, add a **Task Scheduler** task (At log on, no admin):
 
 ```text
-wsl.exe -d <distro> -u <user> --exec /usr/bin/true
+wsl.exe -d <distro> -u <user> --exec dbus-launch true
 ```
 
-Replace `<distro>` with `echo $WSL_DISTRO_NAME` inside WSL and `<user>` with your Linux username. `cswap service install` prints this guidance on WSL.
+`dbus-launch` stays resident after `true` exits, which is what keeps the instance from idle-terminating (a command that exits immediately would not). Replace `<distro>` with `echo $WSL_DISTRO_NAME` inside WSL and `<user>` with your Linux username. `cswap service install` prints this guidance on WSL.
 
 **Windows (native).** The scheduled task runs at logon under your user account (`RunLevel` limited — no elevation). Monitor output goes to the structured log; use `cswap service logs` to inspect it.
 

@@ -218,8 +218,22 @@ class TestInstall:
         out = capsys.readouterr().out
         assert "WSL note" in out
         assert "wsl.exe -d Ubuntu -u dev" in out
+        # The suggested command must leave a long-lived process behind:
+        # `--exec /usr/bin/true` exits immediately, so the distro idles out
+        # seconds later and takes the monitor down with it.
+        assert systemd_backend._WSL_KEEPALIVE_EXEC in out
+        assert "/usr/bin/true" not in out
         assert "idle" in out.lower()
         assert ".claude" in out
+
+    def test_wsl_keepalive_command_matches_readme(self):
+        # The README documents the same Task Scheduler command; keep the two
+        # surfaces in lockstep so users never see conflicting guidance.
+        readme = (Path(systemd_backend.__file__).parents[3] / "README.md").read_text(
+            encoding="utf-8"
+        )
+        assert systemd_backend._WSL_KEEPALIVE_EXEC in readme
+        assert "--exec /usr/bin/true" not in readme
 
     def test_linger_failure_tolerated_with_warning(
         self,
