@@ -87,6 +87,13 @@ def _build_unit(switcher: ServiceHost) -> str:
         f'Environment="{key}={_systemd_escape_value(value)}"'
         for key, value in service_spec.passthrough_env().items()
     ]
+    # Restart=on-failure is load-bearing for the exit-75 retry path: the
+    # monitor exits 75 (EX_TEMPFAIL) on a PID collision precisely so systemd
+    # restarts it after RestartSec. Do NOT add SuccessExitStatus=75 or
+    # RestartPreventExitStatus=75 — both reclassify 75 as a non-restart exit
+    # and would silently disable the retry, the inverse of the design.
+    # RestartSec=30 also keeps every restart outside the default start-limit
+    # window (10s/5 tries), so the unit retries indefinitely.
     lines = [
         "[Unit]",
         "Description=Claude Swap auto-switch monitor",

@@ -89,6 +89,16 @@ class TestBuildUnit:
         assert "WantedBy=default.target" in unit
         assert "Description=Claude Swap auto-switch monitor" in unit
 
+    def test_exit_75_stays_in_the_restart_set(self, temp_home: Path):
+        # Regression guard: SuccessExitStatus=75 or RestartPreventExitStatus=75
+        # would stop Restart=on-failure from restarting after the monitor's
+        # retryable exit 75, silently disabling the service retry path.
+        switcher = ClaudeAccountSwitcher()
+        unit = systemd_backend._build_unit(switcher)
+        assert "Restart=on-failure" in unit
+        assert "SuccessExitStatus" not in unit
+        assert "RestartPreventExitStatus" not in unit
+
     def test_stamps_installed_version(self, temp_home: Path):
         from claude_swap import __version__
 
