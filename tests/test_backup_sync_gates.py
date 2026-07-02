@@ -192,3 +192,64 @@ class TestDegradedActiveReadNeverSyncs:
         assert refresh_calls == []
         assert sw._read_account_credentials("2", "bob@example.com") == ""
         capsys.readouterr()
+
+
+class TestSyncFreshnessGate:
+    """R2-M1: live→backup sync must not undo `--import --force` on the active slot."""
+
+    def _import_over_active(self, temp_home: Path) -> tuple[ClaudeAccountSwitcher, str, str]:
+        sw = _seed_switcher(
+            temp_home,
+            {"1": "user@example.com"},
+            active=1,
+            live_email="user@example.com",
+        )
+        sw.platform = Platform.LINUX
+        live_old = _oauth_creds("live-old", expires_in_s=600)
+        (temp_home / ".claude" / ".credentials.json").write_text(live_old)
+        # `--import --force` writes only the backup slot, never the live store.
+        imported = _oauth_creds("imported-fresh", expires_in_s=7200)
+        sw._write_account_credentials("1", "user@example.com", imported)
+        return sw, live_old, imported
+
+    def test_status_keeps_freshly_imported_backup(self, temp_home: Path, capsys):
+        sw, _live_old, imported = self._import_over_active(temp_home)
+
+        with patch("claude_swap.oauth.fetch_usage_for_account", return_value=None):
+            sw.status()
+
+        assert sw._read_account_credentials("1", "user@example.com") == imported
+        capsys.readouterr()
+
+    def test_list_keeps_freshly_imported_backup(self, temp_home: Path, capsys):
+        sw, _live_old, imported = self._import_over_active(temp_home)
+
+        with patch("claude_swap.oauth.fetch_usage_for_account", return_value=None):
+            sw.list_accounts()
+
+        assert sw._read_account_credentials("1", "user@example.com") == imported
+        capsys.readouterr()
+
+    def test_rotated_live_token_still_syncs_over_older_backup(
+        self, temp_home: Path, capsys
+    ):
+        """PR#70 semantics: a genuinely rotated live token (newer than the
+        backup) must keep flowing into the backup slot."""
+        sw = _seed_switcher(
+            temp_home,
+            {"1": "user@example.com"},
+            active=1,
+            live_email="user@example.com",
+        )
+        sw.platform = Platform.LINUX
+        old_backup = _oauth_creds("old", expires_in_s=60)
+        live_rotated = _oauth_creds("rotated", expires_in_s=7200)
+        sw._write_account_credentials("1", "user@example.com", old_backup)
+        (temp_home / ".claude" / ".credentials.json").write_text(live_rotated)
+
+        with patch("claude_swap.oauth.fetch_usage_for_account", return_value=None):
+            sw.status()
+
+        stored = sw._read_account_credentials("1", "user@example.com")
+        assert json.loads(stored)["claudeAiOauth"]["refreshToken"] == "rt-rotated"
+        capsys.readouterr()

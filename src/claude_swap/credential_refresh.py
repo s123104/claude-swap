@@ -160,10 +160,33 @@ class CredentialRefresher:
             or not isinstance(oauth_data.get("expiresAt"), (int, float))
         ):
             return
+        live_expiry = oauth_data["expiresAt"]
         try:
             with FileLock(self._sw.lock_file):
                 stored = self._sw._read_account_credentials(account_num, email)
                 if stored == credentials:
+                    return
+                stored_oauth = oauth.extract_oauth_data(stored) if stored else None
+                stored_expiry = stored_oauth.get("expiresAt") if stored_oauth else None
+                if (
+                    isinstance(stored_expiry, (int, float))
+                    and stored_expiry >= live_expiry
+                ):
+                    # The backup holds a token at least as new as the live
+                    # copy — e.g. `--import --force` onto the active slot just
+                    # landed fresh credentials while live still carries the
+                    # pre-import ones. Overwriting would silently undo the
+                    # import (the #79 same-slot no-op guards switch_to only).
+                    # A genuinely rotated live token is minted after the backup
+                    # it rotated from and so is strictly newer; skipping ties
+                    # cannot drop a rotation (#70 semantics preserved), while a
+                    # tie says nothing about which payload is stale — favor the
+                    # backup, consistent with the #79 import-wins decision.
+                    self._sw._logger.info(
+                        "Skipped live->backup sync for account %s: backup is newer "
+                        "than live (freshly imported?)",
+                        account_num,
+                    )
                     return
                 self.write_verified_live(
                     account_num,
