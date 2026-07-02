@@ -44,7 +44,7 @@ Install hooks once after syncing dev dependencies ([pre-commit docs](https://pre
 uv run pre-commit install
 ```
 
-Hooks run **ruff** (lint + format) and **mypy** on commit. Ruff hook versions match CI (`v0.15.20` via `astral-sh/ruff-pre-commit`). Run manually:
+Hooks run **ruff** (lint) and **mypy** on commit. Ruff hook versions match CI (`v0.15.20` via `astral-sh/ruff-pre-commit`). Run manually:
 
 ```bash
 uv run pre-commit run --all-files
@@ -78,10 +78,9 @@ Dev tools come from `uv sync --all-groups` — no separate installs needed.
 
 ```bash
 uv run ruff check src/ tests/
-uv run ruff format --check src/ tests/
 ```
 
-Fix formatting with `uv run ruff format src/ tests/`. CI gates `tests/` formatting (`ruff format --check tests/`).
+This fork does not reformat files that also exist upstream (no `ruff format` gate): keeping upstream formatting minimizes merge conflicts on every upstream sync. Match the surrounding style when editing shared files; fork-only modules may follow ruff-format style.
 
 ### Type checking (mypy)
 
@@ -96,7 +95,7 @@ Configuration lives in `pyproject.toml` under `[tool.mypy]`. A baseline `ignore_
 Before opening a PR:
 
 1. **Tests pass** — `uv run pytest`
-2. **Ruff clean** — `uv run ruff check` and `uv run ruff format --check`
+2. **Ruff clean** — `uv run ruff check`
 3. **Pre-commit** — `uv run pre-commit run --all-files` (or rely on installed hooks)
 4. **Focused diff** — one logical change per PR; no drive-by refactors
 5. **User-facing changes documented** — update `CHANGELOG.md` under `[Unreleased]` (version header tracks `pyproject.toml`)

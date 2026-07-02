@@ -36,11 +36,6 @@ jobs:
         if: runner.os == 'Linux'
         run: uv run ruff check src/ tests/
 
-      - name: Ruff format (tests)
-        # Gate formatter drift on tests/ (matches pre-commit ruff-format hook).
-        if: runner.os == 'Linux'
-        run: uv run ruff format --check tests/
-
       - name: Mypy type check
         if: runner.os == 'Linux'
         run: uv run mypy --strict src/claude_swap
