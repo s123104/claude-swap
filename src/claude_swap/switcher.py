@@ -1790,11 +1790,14 @@ class ClaudeAccountSwitcher:
             if target_account not in data.get("accounts", {}):
                 raise AccountNotFoundError(f"Account-{target_account} does not exist")
 
-            # JSON mode: short-circuit a no-op before mutating. Re-activating the
-            # account you're already on would otherwise re-write credentials, take
-            # the lock, and (on macOS) touch the Keychain — wasteful for a scripted
-            # idempotent "ensure active = N". Human mode keeps its existing behavior.
-            if json_output and data:
+            # Short-circuit a no-op before mutating. Re-activating the account
+            # you're already on would otherwise re-write credentials, take the
+            # lock, and (on macOS) touch the Keychain. Worse, the swap's backup
+            # step would overwrite the target slot with the live credentials —
+            # after `--import --force` that clobbers freshly imported good
+            # credentials with stale live ones (upstream #79). Applies to both
+            # JSON and human mode.
+            if data:
                 identity = self._get_current_account()
                 if identity is not None:
                     cur_slot = self._find_account_slot(data, identity[0], identity[1])
@@ -1802,6 +1805,9 @@ class ClaudeAccountSwitcher:
                         email = (
                             data.get("accounts", {}).get(target_account, {}).get("email", "")
                         )
+                        if not json_output:
+                            print(f"Already on Account-{target_account} ({email})")
+                            return None
                         ref = account_ref(int(target_account), email)
                         return self._switch_noop(
                             strategy="direct",
