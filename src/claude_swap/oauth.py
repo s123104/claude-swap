@@ -11,13 +11,14 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, cast
 
-from claude_swap import usage_policy
+from claude_swap import __version__, usage_policy
 from claude_swap.printer import warning as print_warning
 
 OAUTH_BETA_HEADER = "oauth-2025-04-20"
 OAUTH_EXPIRY_BUFFER_MS = 5 * 60 * 1000
 OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+_USER_AGENT = f"claude-swap/{__version__}"
 
 _logger = logging.getLogger("claude-swap")
 
@@ -136,7 +137,7 @@ def refresh_oauth_credentials(credentials: str) -> str | None:
             data=body,
             headers={
                 "Content-Type": "application/json",
-                "User-Agent": "claude-swap/1.0",
+                "User-Agent": _USER_AGENT,
             },
             method="POST",
         )
@@ -216,7 +217,7 @@ def request_usage_data(access_token: str) -> dict[str, Any]:
     headers = {
         "Authorization": f"Bearer {access_token}",
         "anthropic-beta": OAUTH_BETA_HEADER,
-        "User-Agent": "claude-swap/1.0",
+        "User-Agent": _USER_AGENT,
     }
     req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=5) as resp:
