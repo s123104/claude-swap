@@ -979,6 +979,7 @@ def run_cli_monitor(
     poll_seconds: int = MONITOR_POLL_SECONDS,
     once: bool = False,
     stream: TextIO | None = None,
+    service_mode: bool = False,
 ) -> int:
     """Run the foreground auto-switch monitor from the CLI.
 
@@ -999,7 +1000,11 @@ def run_cli_monitor(
             f"{muted(f'already running (pid {running_pid})')}",
             file=out,
         )
-        if os.environ.get(SERVICE_MONITOR_ENV_KEY) == "1":
+        # ``service_mode`` is set by the ``--service-monitor`` argv flag that
+        # service backends append to the supervised command line. The env var
+        # is the legacy channel used by units installed before the flag
+        # existed; honour it so those keep retrying until reinstalled.
+        if service_mode or os.environ.get(SERVICE_MONITOR_ENV_KEY) == "1":
             log.warning(
                 "service monitor found existing pid=%s; exiting retryable",
                 running_pid,

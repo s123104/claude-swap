@@ -60,7 +60,8 @@ class TestBuildPlist:
         plist = service._build_plist(switcher)
         argv = plist["ProgramArguments"]
         assert argv[0] == sys.executable
-        assert argv[-1] == "--monitor"
+        assert "--monitor" in argv
+        assert argv[-1] == "--service-monitor"
         assert "claude_swap" in argv
 
     def test_log_paths_under_backup_dir(self, temp_home: Path):
@@ -113,7 +114,8 @@ class TestInstall:
         with plist_path.open("rb") as fh:
             loaded = plistlib.load(fh)
         assert loaded["Label"] == service.SERVICE_LABEL
-        assert loaded["ProgramArguments"][-1] == "--monitor"
+        assert loaded["ProgramArguments"][-1] == "--service-monitor"
+        assert "--monitor" in loaded["ProgramArguments"]
         # The launchd log dir was created.
         assert (switcher.backup_dir / "logs").is_dir()
 
@@ -542,7 +544,8 @@ class TestServiceSpec:
 
         argv = service_spec.program_arguments()
         assert argv[0] == sys.executable
-        assert argv[-1] == "--monitor"
+        assert "--monitor" in argv
+        assert argv[-1] == "--service-monitor"
         assert "claude_swap" in argv
 
     def test_passthrough_env_stamps_installed_version(self):
@@ -551,7 +554,9 @@ class TestServiceSpec:
 
         env = service_spec.passthrough_env()
         assert env[service_spec.VERSION_ENV_KEY] == __version__
-        assert env[service_spec.SERVICE_MONITOR_ENV_KEY] == "1"
+        # Service mode travels on argv (Task Scheduler cannot set per-task
+        # environment variables), so the env map must not carry the legacy key.
+        assert service_spec.SERVICE_MONITOR_ENV_KEY not in env
 
     def test_log_dir_under_backup(self, temp_home: Path):
         from claude_swap import service_spec

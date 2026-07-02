@@ -11,13 +11,17 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from xml.dom import minidom
 
-from claude_swap import service_spec
+from claude_swap import __version__, service_spec
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.printer import bolded, dimmed, muted
 from claude_swap.protocols import ServiceState
 from claude_swap.protocols import ServiceHost
 
 _TASK_NS = "http://schemas.microsoft.com/windows/2004/02/mit/task"
+_VERSION_RE = re.compile(r"<Version>([^<]+)</Version>")
+# Legacy version stamp: older fork versions recorded the version as an Exec
+# environment variable in the persisted XML. Keep parsing it so the
+# version-drift reinstall prompt still fires for those installs.
 _ENV_VAR_RE = re.compile(
     r'<Variable Name="([^"]+)" Value="([^"]*)"\s*/>',
 )
@@ -38,7 +42,13 @@ def _resolve_python_executable() -> str:
 
 
 def _program_arguments() -> list[str]:
-    return [_resolve_python_executable(), "-m", "claude_swap", "--monitor"]
+    return [
+        _resolve_python_executable(),
+        "-m",
+        "claude_swap",
+        "--monitor",
+        service_spec.SERVICE_MONITOR_FLAG,
+    ]
 
 
 def _require_windows() -> None:
@@ -90,7 +100,6 @@ def _build_task_xml(switcher: ServiceHost) -> str:
     argv = _program_arguments()
     command = argv[0]
     arguments = " ".join(argv[1:])
-    env = service_spec.passthrough_env()
 
     ET.register_namespace("", _TASK_NS)
     root = ET.Element(f"{{{_TASK_NS}}}Task", {"version": "1.4"})
@@ -99,6 +108,11 @@ def _build_task_xml(switcher: ServiceHost) -> str:
     ET.SubElement(reg_info, f"{{{_TASK_NS}}}Description").text = (
         "Claude Swap auto-switch monitor"
     )
+    # Version drift is stamped here because the Exec action cannot carry it:
+    # the schema allows only Command / Arguments / WorkingDirectory under
+    # Exec, and Register-ScheduledTask rejects anything else with
+    # SCHED_E_UNEXPECTEDNODE. RegistrationInfo/Version is a schema-valid slot.
+    ET.SubElement(reg_info, f"{{{_TASK_NS}}}Version").text = __version__
 
     triggers = ET.SubElement(root, f"{{{_TASK_NS}}}Triggers")
     logon = ET.SubElement(triggers, f"{{{_TASK_NS}}}LogonTrigger")
@@ -128,13 +142,6 @@ def _build_task_xml(switcher: ServiceHost) -> str:
     exec_action = ET.SubElement(actions, f"{{{_TASK_NS}}}Exec")
     ET.SubElement(exec_action, f"{{{_TASK_NS}}}Command").text = command
     ET.SubElement(exec_action, f"{{{_TASK_NS}}}Arguments").text = arguments
-    env_vars = ET.SubElement(exec_action, f"{{{_TASK_NS}}}EnvironmentVariables")
-    for key, value in env.items():
-        ET.SubElement(
-            env_vars,
-            f"{{{_TASK_NS}}}Variable",
-            {"Name": key, "Value": value},
-        )
 
     rough = ET.tostring(root, encoding="unicode")
     parsed = minidom.parseString(rough)
@@ -142,6 +149,9 @@ def _build_task_xml(switcher: ServiceHost) -> str:
 
 
 def _installed_version_from_xml(text: str) -> str | None:
+    version_match = _VERSION_RE.search(text)
+    if version_match:
+        return version_match.group(1)
     env_vars: dict[str, str] = {}
     for match in _ENV_VAR_RE.finditer(text):
         env_vars[match.group(1)] = match.group(2)
