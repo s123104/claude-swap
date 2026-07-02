@@ -88,6 +88,42 @@ class TestBuildTaskXml:
         assert "<Command>C:\\venv\\Scripts\\pythonw.exe</Command>" in xml
         assert "<Arguments>-m claude_swap --monitor</Arguments>" in xml
 
+    def test_logon_trigger_repeats_as_watchdog(self, temp_home: Path):
+        # Task Scheduler's RestartOnFailure ignores exit codes (it only fires
+        # when the action fails to launch), so exit 75 alone would never be
+        # retried. The repeating trigger re-launches the task periodically and
+        # MultipleInstancesPolicy=IgnoreNew de-duplicates while it is alive.
+        switcher = ClaudeAccountSwitcher()
+        xml = ts_backend._build_task_xml(switcher)
+        assert "<Repetition>" in xml
+        assert "<Interval>PT5M</Interval>" in xml
+        assert "<StopAtDurationEnd>false</StopAtDurationEnd>" in xml
+        # The repetition must live inside the trigger, not a Settings block.
+        assert xml.index("<Repetition>") < xml.index("</LogonTrigger>")
+
+    def test_long_running_monitor_settings(self, temp_home: Path):
+        # Schema defaults would kill the resident monitor: ExecutionTimeLimit
+        # defaults to PT72H, and both battery settings default to true.
+        switcher = ClaudeAccountSwitcher()
+        xml = ts_backend._build_task_xml(switcher)
+        assert "<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>" in xml
+        assert "<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>" in xml
+        assert "<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>" in xml
+
+    def test_arguments_carry_service_monitor_flag(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+        xml = ts_backend._build_task_xml(switcher)
+        assert "--monitor --service-monitor" in xml
+
+    def test_no_environment_variables_element(self, temp_home: Path):
+        # The Task Scheduler XML schema only allows Command / Arguments /
+        # WorkingDirectory under Exec; an EnvironmentVariables node makes
+        # Register-ScheduledTask fail with SCHED_E_UNEXPECTEDNODE.
+        switcher = ClaudeAccountSwitcher()
+        xml = ts_backend._build_task_xml(switcher)
+        assert "EnvironmentVariables" not in xml
+        assert "<Variable " not in xml
+
     def test_xml_escapes_special_chars_in_program_path(
         self, temp_home: Path, monkeypatch: pytest.MonkeyPatch
     ):
@@ -131,7 +167,7 @@ class TestBuildTaskXml:
 
         switcher = ClaudeAccountSwitcher()
         xml = ts_backend._build_task_xml(switcher)
-        assert f'Name="CSWAP_INSTALLED_VERSION" Value="{__version__}"' in xml
+        assert f"<Version>{__version__}</Version>" in xml
 
 
 class TestInstall:
@@ -288,9 +324,24 @@ class TestState:
 
 
 class TestInstalledVersion:
-    def test_reads_version_from_persisted_xml(
+    def test_reads_version_from_registration_info(
         self, temp_home: Path, monkeypatch: pytest.MonkeyPatch
     ):
+        switcher = ClaudeAccountSwitcher()
+        xml_path = _task_xml_path(switcher)
+        xml_path.parent.mkdir(parents=True)
+        xml_path.write_text(
+            "<RegistrationInfo><Version>9.9.9</Version></RegistrationInfo>",
+            encoding="utf-8",
+        )
+        assert ts_backend._installed_version(switcher) == "9.9.9"
+
+    def test_reads_version_from_legacy_env_var_xml(
+        self, temp_home: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        # XML persisted by older fork versions stamped the version as a
+        # (schema-invalid) Exec environment variable; keep the drift warning
+        # working for those files so the reinstall prompt still fires.
         switcher = ClaudeAccountSwitcher()
         xml_path = _task_xml_path(switcher)
         xml_path.parent.mkdir(parents=True)

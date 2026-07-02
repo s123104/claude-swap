@@ -17,7 +17,14 @@ from claude_swap.printer import accent, bolded, dimmed, muted, warning
 from claude_swap.protocols import ServiceHost
 
 VERSION_ENV_KEY = "CSWAP_INSTALLED_VERSION"
+# Legacy service-mode channel. Current backends pass SERVICE_MONITOR_FLAG on
+# the supervised argv instead — Task Scheduler's XML schema has no per-task
+# environment variables, so an env var can never reach the monitor there.
+# The monitor still honours this key so services installed by older fork
+# versions keep their retry semantics until the user reinstalls (the
+# version-drift warning in ``warn_version_drift`` prompts exactly that).
 SERVICE_MONITOR_ENV_KEY = "CSWAP_SERVICE_MONITOR"
+SERVICE_MONITOR_FLAG = "--service-monitor"
 # Bound every service-manager call so a hung launchctl/systemctl/schtasks can't
 # wedge the CLI or monitor; these are short-lived management commands.
 SUBPROCESS_TIMEOUT = 10
@@ -38,15 +45,20 @@ def log_dir(switcher: ServiceHost) -> Path:
 
 
 def program_arguments() -> list[str]:
-    """Return the absolute ``python -m claude_swap --monitor`` argv to supervise."""
-    return [sys.executable, "-m", "claude_swap", "--monitor"]
+    """Return the absolute ``python -m claude_swap --monitor`` argv to supervise.
+
+    The trailing service flag tells the monitor a supervisor is watching, so a
+    PID collision may exit 75 (EX_TEMPFAIL) and rely on the supervisor's retry
+    instead of reporting success. It travels on argv rather than the
+    environment because Task Scheduler offers no per-task env vars.
+    """
+    return [sys.executable, "-m", "claude_swap", "--monitor", SERVICE_MONITOR_FLAG]
 
 
 def passthrough_env() -> dict[str, str]:
     """Environment forwarded to the supervised monitor, stamped with the version."""
     env = {k: os.environ[k] for k in _FORWARDED_ENV_KEYS if k in os.environ}
     env[VERSION_ENV_KEY] = __version__
-    env[SERVICE_MONITOR_ENV_KEY] = "1"
     return env
 
 

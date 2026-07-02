@@ -87,6 +87,13 @@ def _build_unit(switcher: ServiceHost) -> str:
         f'Environment="{key}={_systemd_escape_value(value)}"'
         for key, value in service_spec.passthrough_env().items()
     ]
+    # Restart=on-failure is load-bearing for the exit-75 retry path: the
+    # monitor exits 75 (EX_TEMPFAIL) on a PID collision precisely so systemd
+    # restarts it after RestartSec. Do NOT add SuccessExitStatus=75 or
+    # RestartPreventExitStatus=75 — both reclassify 75 as a non-restart exit
+    # and would silently disable the retry, the inverse of the design.
+    # RestartSec=30 also keeps every restart outside the default start-limit
+    # window (10s/5 tries), so the unit retries indefinitely.
     lines = [
         "[Unit]",
         "Description=Claude Swap auto-switch monitor",
@@ -190,6 +197,17 @@ def _installed_version() -> str | None:
     return service_spec.installed_version_from_env(env_vars)
 
 
+# Keepalive command suggested for the Windows Task Scheduler logon task. It
+# must leave a long-lived process attached to WSL's init: WSL idle-terminates
+# the VM when no user-launched process remains, and processes started by
+# systemd (like our monitor unit) do not count. ``dbus-launch`` stays resident
+# after ``true`` exits, so the instance is kept alive. A bare
+# ``--exec /usr/bin/true`` exits immediately and keeps nothing alive.
+# Documented in README.md ("Run it in the background" → WSL2); a test asserts
+# the two stay in sync.
+_WSL_KEEPALIVE_EXEC = "dbus-launch true"
+
+
 def _print_wsl_guidance() -> None:
     distro = os.environ.get("WSL_DISTRO_NAME", "<distro>")
     user = os.environ.get("USER") or getpass.getuser()
@@ -197,11 +215,9 @@ def _print_wsl_guidance() -> None:
     print(
         f"  {dimmed('Boot the distro at Windows login via Task Scheduler (At log on):')}"
     )
+    print(f"  {dimmed(f'wsl.exe -d {distro} -u {user} --exec {_WSL_KEEPALIVE_EXEC}')}")
     print(
-        f"  {dimmed(f'wsl.exe -d {distro} -u {user} --exec /usr/bin/true')}"
-    )
-    print(
-        f"  {dimmed('WSL may shut down your distro when idle — the monitor stops until WSL restarts.')}"
+        f"  {dimmed('The command must leave a resident process behind (dbus-launch does) — WSL shuts the distro down when idle and systemd services do not keep it alive, stopping the monitor.')}"
     )
     print(
         f"  {dimmed('WSL ~/.claude and Windows %USERPROFILE%\\\\.claude are separate; install cswap in the same environment as Claude Code.')}"

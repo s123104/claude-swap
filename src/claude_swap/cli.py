@@ -403,6 +403,15 @@ Examples:
             "stdin or omit the value to be prompted securely."
         ),
     )
+    # Internal flag appended by the service backends to the supervised
+    # ``--monitor`` argv. Hidden from --help: users start the foreground
+    # monitor without it, and setting it changes only the PID-collision exit
+    # code (75 so the supervisor retries, instead of 0).
+    parser.add_argument(
+        "--service-monitor",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     return parser
 
 
@@ -428,6 +437,8 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
         parser.error("--force can only be used with --import")
     if args.full and not args.export:
         parser.error("--full can only be used with --export")
+    if args.service_monitor and not args.monitor:
+        parser.error("--service-monitor can only be used with --monitor")
 
 
 def _cmd_export(switcher: ClaudeAccountSwitcher, args: argparse.Namespace) -> None:
@@ -457,6 +468,8 @@ def _cmd_tui(switcher: ClaudeAccountSwitcher, args: argparse.Namespace) -> None:
 def _cmd_monitor(switcher: ClaudeAccountSwitcher, args: argparse.Namespace) -> None:
     from claude_swap.monitor import run_cli_monitor
 
+    if args.service_monitor:
+        sys.exit(run_cli_monitor(switcher, service_mode=True))
     sys.exit(run_cli_monitor(switcher))
 
 
