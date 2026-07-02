@@ -8,6 +8,9 @@ import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+from claude_swap import oauth
+from claude_swap.credentials import ActiveCredentials
+from claude_swap.json_output import USAGE_API_KEY, USAGE_KEYCHAIN_UNAVAILABLE
 from claude_swap.models import Platform
 from claude_swap.switcher import ClaudeAccountSwitcher
 
@@ -1488,6 +1491,200 @@ class TestUsageCacheFreshness:
             s._refresh_switchable_usage_cache()
 
         assert s._trusted_usage_snapshots() == {}
+
+
+class TestListReporterKeychainFlag:
+    """The keychain-unavailable flag must survive across facade calls (PR#77).
+
+    ``_usage_by_account`` builds accounts info through one facade call and
+    resolves usages through another; both must observe the same reporter
+    state, or a locked Keychain shows the active account as "no credentials".
+    """
+
+    def test_usage_by_account_reports_keychain_unavailable(self, temp_home: Path):
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        data = {
+            "accounts": {
+                "1": {"email": "a1@example.com"},
+                "2": {"email": "a2@example.com"},
+            },
+            "sequence": [1, 2],
+            "activeAccountNumber": 1,
+        }
+        s._write_json(s.sequence_file, data)
+        (temp_home / ".claude.json").write_text(
+            json.dumps(
+                {
+                    "oauthAccount": {
+                        "emailAddress": "a1@example.com",
+                        "accountUuid": "u1",
+                    }
+                }
+            )
+        )
+
+        with patch.object(
+            s,
+            "_read_active_credentials",
+            return_value=ActiveCredentials(None, True),
+        ):
+            usage = s._usage_by_account()
+
+        assert usage["1"] == USAGE_KEYCHAIN_UNAVAILABLE
+
+    def test_list_reporter_instance_is_reused(self, temp_home: Path):
+        s = ClaudeAccountSwitcher()
+        assert s._list_reporter() is s._list_reporter()
+
+
+class TestRefreshGateResolvedSlots:
+    """Peers that can never yield a trusted row must not refetch every cycle.
+
+    The refresh gate treats a cache row that is a known usage sentinel, or an
+    error row within the per-slot TTL, as already answered. Only slots with a
+    missing or expired row trigger a network refresh.
+    """
+
+    def _switcher_with_peer(self, temp_home: Path) -> ClaudeAccountSwitcher:
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        data = {
+            "accounts": {
+                "1": {"email": "a1@example.com"},
+                "2": {"email": "a2@example.com"},
+            },
+            "sequence": [1, 2],
+            "activeAccountNumber": 1,
+        }
+        s._write_json(s.sequence_file, data)
+        (temp_home / ".claude.json").write_text(
+            json.dumps(
+                {
+                    "oauthAccount": {
+                        "emailAddress": "a1@example.com",
+                        "accountUuid": "u1",
+                    }
+                }
+            )
+        )
+        return s
+
+    def _seed_usage_cache(self, s: ClaudeAccountSwitcher, rows: dict) -> None:
+        cache_path = s.backup_dir / "cache" / "usage.json"
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(
+            json.dumps({"timestamp": time.time(), "data": rows}),
+            encoding="utf-8",
+        )
+
+    def _counting_refresh(self, s: ClaudeAccountSwitcher):
+        calls: list[int] = []
+        real_refresh = s._refresh_switchable_usage_cache
+
+        def refresh() -> None:
+            calls.append(1)
+            real_refresh()
+
+        return calls, refresh
+
+    def test_api_key_peer_refetches_once_then_stays_quiet(self, temp_home: Path):
+        """An API-key peer resolves to a sentinel and stops the refetch loop."""
+        s = self._switcher_with_peer(temp_home)
+        active_creds = json.dumps({"claudeAiOauth": {"accessToken": "tok"}})
+        live_usage = {"five_hour": {"pct": 96}, "seven_day": {"pct": 50}}
+        calls, refresh = self._counting_refresh(s)
+
+        with (
+            patch.object(s, "_account_is_switchable", return_value=True),
+            patch.object(s, "_read_credentials", return_value=active_creds),
+            patch.object(
+                s, "_read_account_credentials", return_value="sk-ant-api03-peer"
+            ),
+            patch(
+                "claude_swap.oauth.fetch_usage_for_account",
+                return_value=live_usage,
+            ),
+            patch.object(s, "_refresh_switchable_usage_cache", side_effect=refresh),
+        ):
+            s.build_auto_switch_decision(95, 96.0)
+            assert calls == [1]
+            # The single refresh persisted the API-key sentinel for the peer.
+            cached = s._read_json(s.usage_cache_path) or {}
+            assert cached.get("data", {}).get("2") == USAGE_API_KEY
+            s.build_auto_switch_decision(95, 96.0)
+
+        assert calls == [1]
+
+    def test_error_row_within_ttl_suppresses_refetch(self, temp_home: Path):
+        s = self._switcher_with_peer(temp_home)
+        now = time.time()
+        self._seed_usage_cache(
+            s,
+            {
+                "1": {"five_hour": {"pct": 96}, "_cached_at": now},
+                "2": {
+                    "_type": "usage_fetch_error",
+                    "reason": "network_error",
+                    "status_code": None,
+                    "message": "boom",
+                    "retry_after": None,
+                    "_cached_at": now,
+                },
+            },
+        )
+
+        with (
+            patch.object(s, "_account_is_switchable", return_value=True),
+            patch.object(s, "_refresh_switchable_usage_cache") as refresh,
+        ):
+            s.build_auto_switch_decision(95, 96.0)
+
+        refresh.assert_not_called()
+
+    def test_error_row_past_ttl_refetches_exactly_once(self, temp_home: Path):
+        """An expired error row triggers one refetch, whose re-stamped error
+        row answers the following cycle."""
+        s = self._switcher_with_peer(temp_home)
+        now = time.time()
+        self._seed_usage_cache(
+            s,
+            {
+                "1": {"five_hour": {"pct": 96}, "_cached_at": now},
+                "2": {
+                    "_type": "usage_fetch_error",
+                    "reason": "network_error",
+                    "status_code": None,
+                    "message": "boom",
+                    "retry_after": None,
+                    "_cached_at": now - 9999,
+                },
+            },
+        )
+        active_creds = json.dumps({"claudeAiOauth": {"accessToken": "tok"}})
+        peer_creds = json.dumps({"claudeAiOauth": {"accessToken": "tok2"}})
+        calls, refresh = self._counting_refresh(s)
+
+        def read_backup(num: str, email: str) -> str:
+            return peer_creds
+
+        with (
+            patch.object(s, "_account_is_switchable", return_value=True),
+            patch.object(s, "_read_credentials", return_value=active_creds),
+            patch.object(s, "_read_account_credentials", side_effect=read_backup),
+            patch(
+                "claude_swap.oauth.fetch_usage_for_account",
+                return_value=oauth.UsageFetchError(
+                    reason="network_error", message="still down"
+                ),
+            ),
+            patch.object(s, "_refresh_switchable_usage_cache", side_effect=refresh),
+        ):
+            s.build_auto_switch_decision(95, 96.0)
+            assert calls == [1]
+            s.build_auto_switch_decision(95, 96.0)
+
+        assert calls == [1]
 
 
 class TestRefreshInactiveCredentialsIfNeeded:

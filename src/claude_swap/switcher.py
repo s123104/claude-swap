@@ -166,6 +166,8 @@ class ClaudeAccountSwitcher:
         # Credential storage layer. Reads platform / credentials_dir / _logger off
         # this switcher at call time via the _StoreHost Protocol.
         self._store = CredentialStore(self)
+        # List/status renderer, created lazily by _list_reporter().
+        self._reporter: ListReporter | None = None
         # OAuth credential-freshness: verify/refresh/sync of backup tokens.
         self._refresher = CredentialRefresher(self)
         # Typed owner of sequence.json. Lock-agnostic: this switcher wraps
@@ -529,59 +531,53 @@ class ClaudeAccountSwitcher:
             write_cache(self.usage_cache_path, existing)
 
     def _refresh_switchable_usage_cache(self) -> None:
-        """Fetch usage for every switchable slot before automated planning."""
+        """Fetch usage for every switchable slot before automated planning.
+
+        Delegates each row to ``ListReporter.fetch_account_usage`` so the list
+        path and this refresh path share one fetch implementation: API-key and
+        credential-less slots persist their usage sentinels into the cache
+        instead of an unanswerable ``None`` (which could never become fresh),
+        and the active slot goes through the owner-aware refresh logic.
+        """
         data = self._get_sequence_data_migrated() or {}
-        current_identity = self._get_current_account()
-        active_num: str | None = None
-        if current_identity is not None:
-            current_email, current_org_uuid = current_identity
-            active_num = _slot_for_identity(
-                data.get("accounts", {}), current_email, current_org_uuid,
-            )
+        reporter = self._list_reporter()
+        accounts_info = [
+            info
+            for info in reporter.build_accounts_info(data)
+            if self._account_is_switchable(str(info[0]))
+        ]
+        if not accounts_info:
+            return
 
-        accounts_info: list[tuple[int, str, bool, str]] = []
-        for num in data.get("sequence", []):
-            num_str = str(num)
-            if not self._account_is_switchable(num_str):
-                continue
-            account = data.get("accounts", {}).get(num_str, {})
-            email = account.get("email", "unknown")
-            is_active = num_str == active_num
-            creds = (
-                self._read_credentials() or ""
-                if is_active
-                else self._read_account_credentials(num_str, email)
-            )
-            accounts_info.append((num, email, is_active, creds))
-
-        def fetch(
-            item: tuple[int, str, bool, str],
-        ) -> tuple[str, dict[str, Any] | oauth.UsageFetchError | None | str]:
-            num, email, is_active, creds = item
-            num_str = str(num)
-            if not creds or not oauth.extract_access_token(creds):
-                return num_str, None
-
-            def persist(acct_num: str, acct_email: str, new_creds: str) -> None:
-                with FileLock(self.lock_file):
-                    self._write_account_credentials(acct_num, acct_email, new_creds)
-
-            has_live_session = bool(self._live_session_pids(num_str, email))
-            return num_str, oauth.fetch_usage_for_account(
-                num_str,
-                email,
-                creds,
-                is_active=is_active or has_live_session,
-                persist_credentials=persist,
-            )
-
-        max_workers = min(4, max(len(accounts_info), 1))
+        max_workers = min(4, len(accounts_info))
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            results = list(executor.map(fetch, accounts_info))
+            usages = list(executor.map(reporter.fetch_account_usage, accounts_info))
 
         self._merge_usage_cache({
-            num_str: usage for num_str, usage in results
+            str(info[0]): usage for info, usage in zip(accounts_info, usages)
         })
+
+    def _unresolved_slots(self, switchable: list[str]) -> list[str]:
+        """Switchable slots whose cached usage row answers nothing yet.
+
+        A slot is answered when its raw cache row is a known usage sentinel
+        (permanent conditions like API-key accounts) or any dict row — success
+        or serialized fetch error — still within the per-slot TTL. Only slots
+        with a missing, malformed, or expired row are worth a network refetch.
+        """
+        cached, _ = read_cache_with_timestamp(self.usage_cache_path)
+        if not isinstance(cached, dict):
+            return list(switchable)
+        now = time.time()
+        unresolved: list[str] = []
+        for slot in switchable:
+            row = cached.get(slot)
+            if isinstance(row, str) and row in _KNOWN_USAGE_SENTINELS:
+                continue
+            if _usage_slot_trusted(row, now):
+                continue
+            unresolved.append(slot)
+        return unresolved
 
     def build_auto_switch_decision(
         self,
@@ -609,18 +605,18 @@ class ClaudeAccountSwitcher:
         switchable = self._switchable_slot_ids(data)
         snapshots = self._trusted_usage_snapshots()
         active_slot = live_slot or sequence_slot
-        has_switchable_peer = active_slot is not None and any(
-            slot != active_slot for slot in switchable
-        )
         has_trusted_peer = active_slot is not None and any(
             slot != active_slot for slot in snapshots
         )
-        # Refresh when there is no trusted signal, or when the only trusted
-        # signal is the active slot. A stale-peer fleet must not plan from a
-        # freshly re-stamped active row alone, but one trusted peer remains
-        # enough to avoid polling permanently-unfetchable slots every cycle.
-        if switchable and (
-            not snapshots or (has_switchable_peer and not has_trusted_peer)
+        # Refresh only when some peer slot is both untrusted and unanswered.
+        # A stale-peer fleet must not plan from a freshly re-stamped active
+        # row alone, but a peer whose cache row is a known sentinel or an
+        # error row within TTL has already answered — permanently unfetchable
+        # slots (API-key accounts, broken credentials) must not trigger a
+        # network refetch every poll cycle. One trusted peer likewise remains
+        # enough to avoid re-polling the rest of the fleet.
+        if not has_trusted_peer and any(
+            slot != active_slot for slot in self._unresolved_slots(switchable)
         ):
             self._refresh_switchable_usage_cache()
             snapshots = self._trusted_usage_snapshots()
@@ -1460,8 +1456,21 @@ class ClaudeAccountSwitcher:
         print(f"{accent('Removed')} Account-{account_num} ({email})")
 
     def _list_reporter(self) -> ListReporter:
-        from claude_swap.list_reporter import ListReporter
-        return ListReporter(self)
+        """Lazy singleton so per-run reporter state survives across facades.
+
+        ``_usage_by_account`` builds accounts info through one facade call and
+        resolves usages through another; the reporter's
+        ``_active_keychain_unavailable`` flag set by the first must still be
+        visible to the second, or a locked Keychain shows the active account
+        as "no credentials" (the misread upstream PR#77 fixed). Reuse is
+        thread-safe because the flag is only written by the main thread in
+        ``build_accounts_info``, before ``resolve_usages`` starts its thread
+        pool — keep that ordering invariant.
+        """
+        if self._reporter is None:
+            from claude_swap.list_reporter import ListReporter
+            self._reporter = ListReporter(self)
+        return self._reporter
 
     def _fetch_account_usage(
         self, account_info: tuple[int, str, str, str, bool, str],
@@ -1790,11 +1799,14 @@ class ClaudeAccountSwitcher:
             if target_account not in data.get("accounts", {}):
                 raise AccountNotFoundError(f"Account-{target_account} does not exist")
 
-            # JSON mode: short-circuit a no-op before mutating. Re-activating the
-            # account you're already on would otherwise re-write credentials, take
-            # the lock, and (on macOS) touch the Keychain — wasteful for a scripted
-            # idempotent "ensure active = N". Human mode keeps its existing behavior.
-            if json_output and data:
+            # Short-circuit a no-op before mutating. Re-activating the account
+            # you're already on would otherwise re-write credentials, take the
+            # lock, and (on macOS) touch the Keychain. Worse, the swap's backup
+            # step would overwrite the target slot with the live credentials —
+            # after `--import --force` that clobbers freshly imported good
+            # credentials with stale live ones (upstream #79). Applies to both
+            # JSON and human mode.
+            if data:
                 identity = self._get_current_account()
                 if identity is not None:
                     cur_slot = self._find_account_slot(data, identity[0], identity[1])
@@ -1802,6 +1814,9 @@ class ClaudeAccountSwitcher:
                         email = (
                             data.get("accounts", {}).get(target_account, {}).get("email", "")
                         )
+                        if not json_output:
+                            print(f"Already on Account-{target_account} ({email})")
+                            return None
                         ref = account_ref(int(target_account), email)
                         return self._switch_noop(
                             strategy="direct",

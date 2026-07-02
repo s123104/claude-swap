@@ -733,6 +733,70 @@ class TestMonitorEngine:
         assert result.kind == "threshold_no_handler"
         assert "no switch handler" in result.user_message
 
+    def test_noop_cycle_plans_once_in_monitor(self, temp_home: Path):
+        """A stay-put threshold cycle must not replan in the finalize step.
+
+        Each plan_automated_switch call reads every slot's credential backend
+        (a `security` subprocess per slot on macOS), so a saturated hold must
+        not pay it more than once inside the monitor engine.
+        """
+        switcher = ClaudeAccountSwitcher()
+        state = monitor.MonitorRuntimeState()
+        perform = MagicMock(return_value=False)
+
+        with (
+            _already_optimal_plan(switcher) as plan,
+            patch.object(
+                switcher,
+                "get_auto_switch_config",
+                return_value={"enabled": True, "threshold": 95},
+            ),
+            patch.object(switcher, "get_active_usage_pct", return_value=96.0),
+        ):
+            result = monitor.monitor_step(
+                switcher,
+                state,
+                poll_seconds=0,
+                perform_switch=perform,
+            )
+
+        assert result.kind == "already_optimal"
+        assert plan.call_count == 1
+
+    def test_noop_cycle_plans_at_most_twice_end_to_end(self, temp_home: Path):
+        """Full no-op cycle budget: one plan inside switch(), one in the monitor."""
+        switcher = bootstrap_switchable_accounts(temp_home, num_accounts=3)
+        state = monitor.MonitorRuntimeState()
+
+        def perform(decision: AutoSwitchDecisionContext) -> bool:
+            return switcher.switch(BackgroundAutoSwitchIntent(decision=decision))
+
+        # Count at the private chokepoint: switch() plans through
+        # _plan_automated_switch directly, the monitor through the public
+        # plan_automated_switch which delegates to it.
+        with (
+            patch.object(
+                switcher,
+                "_plan_automated_switch",
+                return_value=SwitchPlanResult(outcome="already_optimal"),
+            ) as plan,
+            patch.object(
+                switcher,
+                "get_auto_switch_config",
+                return_value={"enabled": True, "threshold": 95},
+            ),
+            patch.object(switcher, "get_active_usage_pct", return_value=96.0),
+        ):
+            result = monitor.monitor_step(
+                switcher,
+                state,
+                poll_seconds=0,
+                perform_switch=perform,
+            )
+
+        assert result.kind == "already_optimal"
+        assert plan.call_count <= 2
+
     def test_step_switch_failed_dedups_log(self, temp_home: Path, caplog):
         switcher = ClaudeAccountSwitcher()
         state = monitor.MonitorRuntimeState()
