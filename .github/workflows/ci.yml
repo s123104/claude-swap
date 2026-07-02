@@ -26,6 +26,29 @@ jobs:
       - name: Run tests
         run: pytest
 
+  test-windows:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        # Single pip invocation so a failure fails the step regardless of the
+        # default Windows shell (pwsh only checks the last command's exit code).
+        run: pip install -e . pytest
+
+      - name: Run tests
+        # curses ships with CPython on Linux/macOS but not on stock Windows, so
+        # the TUI tests skip here (they run on the Ubuntu job). Everything else
+        # — the cross-platform CLI, session, and process-detection paths — must
+        # pass, which is what catches Windows-only regressions.
+        run: pytest
+
   macos-keychain:
     runs-on: macos-latest
 

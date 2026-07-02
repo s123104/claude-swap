@@ -12,7 +12,14 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from claude_swap import tui
+# The TUI is built on stdlib ``curses``, which ships with CPython on Linux/macOS
+# but not on Windows (there it needs the optional ``windows-curses`` package).
+# ``tui`` imports ``curses`` at module load, so skip the whole module when it is
+# unavailable rather than erroring out collection. This mirrors the runtime,
+# where ``cswap --tui`` degrades gracefully with an install hint (see cli.py).
+pytest.importorskip("curses", reason="curses unavailable (e.g. stock Windows)")
+
+from claude_swap import tui  # noqa: E402
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.switcher import ClaudeAccountSwitcher
 
@@ -322,7 +329,7 @@ class TestCliIntegration:
         with patch.object(_sys, "argv", ["claude-swap", "--tui"]), \
              patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
              patch("claude_swap.tui.run", return_value=0) as mock_run, \
-             patch("os.geteuid", return_value=1000), \
+             patch("os.geteuid", return_value=1000, create=True), \
              patch("claude_swap.update_check.check_for_update", return_value=None):
             with pytest.raises(SystemExit) as exc:
                 cli.main()

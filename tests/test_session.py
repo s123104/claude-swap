@@ -637,10 +637,14 @@ class _ExecCalled(Exception):
 
 @pytest.fixture
 def capture_exec(monkeypatch):
-    def fake_execvpe(binary, argv, env):
-        raise _ExecCalled(binary, argv, env)
+    # Patch the handoff at the _exec() seam rather than the primitive beneath
+    # it: _exec() dispatches to os.execvpe on POSIX but subprocess.run on
+    # Windows, and patching subprocess.run here would also swallow the
+    # `claude auth status` probe that some of these tests stub separately.
+    def fake_exec(self, claude_bin, claude_args, env):
+        raise _ExecCalled(claude_bin, [claude_bin, *claude_args], env)
 
-    monkeypatch.setattr(session_mod.os, "execvpe", fake_execvpe)
+    monkeypatch.setattr(session_mod.SessionManager, "_exec", fake_exec)
     monkeypatch.setattr(
         session_mod.shutil, "which", lambda name: f"/fake/bin/{name}"
     )
@@ -742,6 +746,40 @@ class TestRun:
             manager.run("2", [])
 
         assert exc.value.env["ANTHROPIC_API_KEY"] == "sk-ant-key"
+
+
+class TestExec:
+    """The _exec() terminal handoff dispatches per-platform (runs on any host)."""
+
+    def test_posix_replaces_process_with_execvpe(self, manager, monkeypatch):
+        def fake_execvpe(binary, argv, env):
+            # os.execvpe never returns; raising models that (and lets _exec's
+            # "unreachable" guard stay unhit, as it would be in real life).
+            raise _ExecCalled(binary, argv, env)
+
+        monkeypatch.setattr(session_mod.sys, "platform", "linux")
+        monkeypatch.setattr(session_mod.os, "execvpe", fake_execvpe)
+        with pytest.raises(_ExecCalled) as exc:
+            manager._exec("/bin/claude", ["--resume"], {"A": "B"})
+        assert (exc.value.binary, exc.value.argv, exc.value.env) == (
+            "/bin/claude",
+            ["/bin/claude", "--resume"],
+            {"A": "B"},
+        )
+
+    def test_windows_runs_subprocess_and_mirrors_exit_code(self, manager, monkeypatch):
+        seen = {}
+
+        def fake_run(argv, env=None, **kwargs):
+            seen["call"] = (argv, env)
+            return SimpleNamespace(returncode=7)
+
+        monkeypatch.setattr(session_mod.sys, "platform", "win32")
+        monkeypatch.setattr(session_mod.subprocess, "run", fake_run)
+        with pytest.raises(SystemExit) as exc:
+            manager._exec("/bin/claude", ["--resume"], {"A": "B"})
+        assert exc.value.code == 7
+        assert seen["call"] == (["/bin/claude", "--resume"], {"A": "B"})
 
 
 # ---------------------------------------------------------------------------
