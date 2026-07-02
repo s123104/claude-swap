@@ -403,10 +403,13 @@ def _attempt_threshold_switch(
     wall: float,
     now: float,
     log: logging.Logger,
-) -> tuple[bool, str | None, AutoSwitchDecisionContext | None] | MonitorStepResult:
+) -> (
+    tuple[bool, str | None, Literal["already_optimal", "no_trusted_signal"] | None]
+    | MonitorStepResult
+):
     switched = False
     switch_error: str | None = None
-    decision: AutoSwitchDecisionContext | None = None
+    stay_put: Literal["already_optimal", "no_trusted_signal"] | None = None
     try:
         decision = switcher.build_auto_switch_decision(threshold, pct)
         switched = perform_switch(decision)
@@ -441,6 +444,10 @@ def _attempt_threshold_switch(
             log.info("monitor switched account at pct=%s", pct)
             state.last_switch_error = None
         else:
+            # Plan once and hand the verdict to the finalize step: replanning
+            # there would re-read every slot's credential backend (a
+            # `security` subprocess per slot on macOS) for a cycle that has
+            # already decided to stay put.
             stay_put = _stay_put_kind(switcher, decision)
             if stay_put == "no_trusted_signal":
                 log.info(
@@ -452,13 +459,12 @@ def _attempt_threshold_switch(
                     "monitor: already on optimal account at pct=%s — holding",
                     pct,
                 )
-    return switched, switch_error, decision
+    return switched, switch_error, stay_put
 
 
 def _finalize_threshold_step(
-    switcher: MonitorHost,
     state: MonitorRuntimeState,
-    decision: AutoSwitchDecisionContext | None,
+    stay_put: Literal["already_optimal", "no_trusted_signal"] | None,
     *,
     threshold: int,
     pct: float,
@@ -497,8 +503,7 @@ def _finalize_threshold_step(
             switched=True,
             user_message=f"Reached {pct:.0f}% — switched account.",
         )
-    assert decision is not None
-    stay_put = _stay_put_kind(switcher, decision)
+    assert stay_put is not None
     state.saturated_hold = True
     state.record_pcts(pct, windows)
     state.last_poll_time = now
@@ -580,11 +585,10 @@ def _step_threshold(
     )
     if isinstance(outcome, MonitorStepResult):
         return outcome
-    switched, switch_error, decision = outcome
+    switched, switch_error, stay_put = outcome
     return _finalize_threshold_step(
-        switcher,
         state,
-        decision,
+        stay_put,
         threshold=threshold,
         pct=pct,
         pct_text=pct_text,
