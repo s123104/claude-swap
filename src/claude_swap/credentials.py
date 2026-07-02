@@ -74,10 +74,20 @@ class ActiveCredentials(NamedTuple):
     (locked / denied / timeout) and nothing else covered it — letting callers
     distinguish a transiently unreadable Keychain from a genuinely empty slot,
     instead of collapsing both into a misleading "no credentials".
+
+    ``degraded`` is True when the OAuth Keychain read failed but a lower-priority
+    backend (the plaintext file or a managed key) covered it. Such a value is fine
+    to display and to fetch usage with, but its identity cannot be trusted to be
+    the active account's: in Keychain mode the plaintext file is deliberately left
+    untouched across switches (#1414), so it may hold *another* account's stale
+    credentials. Persistence paths (live→backup sync, refresh persist) must skip a
+    degraded read or they can poison the active slot's backup with a different
+    account's tokens.
     """
 
     value: str | None
     keychain_unavailable: bool
+    degraded: bool = False
 
 
 def looks_like_api_key(credentials: str | None) -> bool:
@@ -229,6 +239,12 @@ class CredentialStore:
         nothing else covered it, so the display layer can say "keychain unavailable"
         rather than "no credentials" for a merely-unreadable slot — which would
         otherwise nudge the user into an unnecessary re-login.
+
+        Reports ``degraded`` when the OAuth Keychain read failed but a
+        lower-priority backend covered it. The plaintext file is deliberately not
+        removed by Keychain-mode writes (#1414), so after an A→B switch it can
+        still hold account A's credentials; a locked Keychain must not let that
+        file impersonate B's live credential in any persistence path.
         """
         keychain_failed = False
         # 1. OAuth Keychain (macOS, when usable), with a bounded retry.
@@ -251,12 +267,12 @@ class CredentialStore:
                 self._host._logger.error(f"Failed to read credentials file: {e}")
                 return ActiveCredentials(None, False)
             if text.strip():
-                return ActiveCredentials(text, False)
+                return ActiveCredentials(text, False, degraded=keychain_failed)
 
         # 3. Managed API key (Keychain "Claude Code" on macOS, then primaryApiKey).
         key = self._read_managed_key()
         if key:
-            return ActiveCredentials(key, False)
+            return ActiveCredentials(key, False, degraded=keychain_failed)
         # Nothing anywhere. Flag a failed-and-uncovered OAuth Keychain read so the
         # UI distinguishes it from a real empty slot.
         return ActiveCredentials("", keychain_failed)

@@ -115,6 +115,7 @@ class ListReporter:
     def __init__(self, host: ListHost) -> None:
         self._host = host
         self._active_keychain_unavailable = False
+        self._active_degraded = False
 
     @property
     def sequence_file(self) -> Path:
@@ -216,7 +217,11 @@ class ListReporter:
             active = self._host._read_active_credentials()
             creds = active.value or ""
             active_keychain_unavailable = active.keychain_unavailable
-            if creds:
+            if creds and not active.degraded:
+                # A degraded read (Keychain failed, plaintext file covered it)
+                # may hold ANOTHER account's leftover credentials; syncing it
+                # would poison this slot's backup. The sync is an optimization,
+                # so skipping the degraded case is safe.
                 self._host._sync_live_account_credentials_to_backup(
                     account_num,
                     current_email,
@@ -225,6 +230,7 @@ class ListReporter:
             usage, usage_note = self.resolve_active_usage_entry(
                 account_num, current_email, creds=creds,
                 keychain_unavailable=active_keychain_unavailable,
+                degraded=active.degraded,
             )
             if isinstance(usage, dict):
                 lines = _format_usage_lines(usage)
@@ -256,7 +262,11 @@ class ListReporter:
         updated: list[tuple[int, str, str, str, bool, str]] = []
         for num, email, org_name, org_uuid, is_active, creds in accounts_info:
             if is_active:
-                if creds:
+                # A degraded active read (Keychain failed, a leftover file
+                # covered it) may belong to another account; syncing it would
+                # poison this slot's backup. The sync is an optimization, so
+                # skipping the degraded case is safe.
+                if creds and not self._active_degraded:
                     self._host._sync_live_account_credentials_to_backup(
                         str(num),
                         email,
@@ -291,6 +301,7 @@ class ListReporter:
 
         accounts_info: list[tuple[int, str, str, str, bool, str]] = []
         self._active_keychain_unavailable = False
+        self._active_degraded = False
         for num in data.get("sequence", []):
             account = data.get("accounts", {}).get(str(num), {})
             email = account.get("email", "unknown")
@@ -302,6 +313,7 @@ class ListReporter:
                 active = self._host._read_active_credentials()
                 creds = active.value or ""
                 self._active_keychain_unavailable = active.keychain_unavailable
+                self._active_degraded = active.degraded
             else:
                 creds = self._host._read_account_credentials(str(num), email)
 
@@ -359,7 +371,9 @@ class ListReporter:
                 return USAGE_KEYCHAIN_UNAVAILABLE
             return USAGE_NO_CREDENTIALS
         if is_active:
-            return self.fetch_active_usage(str(num), email, creds)
+            return self.fetch_active_usage(
+                str(num), email, creds, degraded=self._active_degraded,
+            )
 
         def persist(acct_num: str, acct_email: str, new_creds: str) -> None:
             with FileLock(self.lock_file):
@@ -377,14 +391,19 @@ class ListReporter:
         return result
 
     def fetch_active_usage(
-        self, account_num: str, email: str, creds: str,
+        self, account_num: str, email: str, creds: str, *, degraded: bool = False,
     ) -> UsageEntry:
         """Usage for the active/default account, refreshing its token only when safe."""
         oauth_data = oauth.extract_oauth_data(creds)
         if not oauth_data or not oauth_data.get("accessToken"):
             return USAGE_NO_CREDENTIALS
 
-        owned = self._active_cc_running() or bool(
+        # A degraded active read (Keychain failed; a leftover plaintext file
+        # covered it) may hold another account's credentials: fetching usage
+        # with it is fine, but consuming its single-use refresh token — or
+        # persisting the rotation into this account's live/backup stores —
+        # would poison the slot. Route it through the fetch-only owner path.
+        owned = degraded or self._active_cc_running() or bool(
             self._host._live_session_pids(account_num, email)
         )
         if owned:
@@ -466,12 +485,14 @@ class ListReporter:
         *,
         creds: str | None = None,
         keychain_unavailable: bool = False,
+        degraded: bool = False,
     ) -> tuple[UsageEntry, oauth.UsageFetchError | None]:
         """Usage entry for the active account (cache-first, owner-aware refresh)."""
         if creds is None:
             active = self._host._read_active_credentials()
             creds = active.value or ""
             keychain_unavailable = active.keychain_unavailable
+            degraded = active.degraded
         if looks_like_api_key(creds):
             return USAGE_API_KEY, None
         if not creds or not oauth.extract_access_token(creds):
@@ -488,7 +509,7 @@ class ListReporter:
             if isinstance(usage, dict) and _usage_slot_trusted(usage, time.time()):
                 return usage, None
 
-        fetched = self.fetch_active_usage(account_num, email, creds)
+        fetched = self.fetch_active_usage(account_num, email, creds, degraded=degraded)
         previous = previous_cached.get(account_num)
         display, note = _merge_usage_with_previous(fetched, previous)
         self._host._merge_usage_cache({account_num: fetched})

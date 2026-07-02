@@ -1977,11 +1977,12 @@ class ClaudeAccountSwitcher:
             if not isinstance(usage, dict):
                 usage = None
         else:
-            creds = self._read_credentials() or ""
+            active = self._read_active_credentials()
+            creds = active.value or ""
             if not creds or not oauth.extract_access_token(creds):
                 return None
             fetched = self._list_reporter().fetch_active_usage(
-                "active", current_email, creds,
+                "active", current_email, creds, degraded=active.degraded,
             )
             usage = fetched if isinstance(fetched, dict) else None
 

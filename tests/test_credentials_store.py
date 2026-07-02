@@ -283,9 +283,17 @@ class TestMacosKeychainFallback:
         assert result == ActiveCredentials("", True)
         assert s._read_credentials() == ""
 
-    def test_active_read_keychain_failure_covered_by_file(
+    def test_active_read_keychain_failure_covered_by_file_is_degraded(
         self, temp_home: Path, monkeypatch, block_real_keychain
     ):
+        """A file read that covers a FAILED Keychain read is usable but degraded.
+
+        Keychain-mode writes deliberately leave ``.credentials.json`` untouched
+        (#1414), so after an A→B switch the file can still hold account A's
+        credentials. The value is fine for display/usage, but the ``degraded``
+        flag must mark it so persistence paths never treat it as the active
+        account's live credential (cross-account backup poisoning).
+        """
         s = self._macos_switcher()
         cred = get_credentials_path()
         cred.parent.mkdir(parents=True, exist_ok=True)
@@ -294,7 +302,20 @@ class TestMacosKeychainFallback:
         monkeypatch.setattr("claude_swap.credentials._ACTIVE_READ_RETRY_DELAY", 0)
 
         result = s._read_active_credentials()
-        assert result == ActiveCredentials("FROM-FILE", False)
+        assert result == ActiveCredentials("FROM-FILE", False, degraded=True)
+
+    def test_active_read_file_without_keychain_failure_is_not_degraded(
+        self, temp_home: Path, block_real_keychain
+    ):
+        """The legit file fallback (Keychain item merely absent, rc-44) keeps
+        its upstream semantics: not degraded, safe to sync (#60/#66 users)."""
+        s = self._macos_switcher()
+        cred = get_credentials_path()
+        cred.parent.mkdir(parents=True, exist_ok=True)
+        cred.write_text("FROM-FILE")
+
+        result = s._read_active_credentials()
+        assert result == ActiveCredentials("FROM-FILE", False, degraded=False)
 
     def test_active_read_absent_item_is_not_keychain_unavailable(
         self, temp_home: Path, block_real_keychain

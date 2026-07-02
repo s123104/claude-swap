@@ -15,6 +15,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from claude_swap import monitor, oauth, tui
+from claude_swap.credentials import ActiveCredentials
 from claude_swap.usage_policy import binding_pct as max_usage_pct
 from claude_swap.exceptions import ClaudeSwitchError, SwitchError, ValidationError
 from claude_swap.models import (
@@ -202,7 +203,11 @@ class TestActiveUsagePct:
         creds = json.dumps({"claudeAiOauth": {"accessToken": "tok"}})
         usage = {"five_hour": {"pct": 96}, "seven_day": {"pct": 20}}
         with (
-            patch.object(switcher, "_read_credentials", return_value=creds),
+            patch.object(
+                switcher,
+                "_read_active_credentials",
+                return_value=ActiveCredentials(creds, False),
+            ),
             patch(
                 "claude_swap.oauth.fetch_usage_for_account",
                 return_value=usage,
@@ -215,7 +220,11 @@ class TestActiveUsagePct:
         switcher = ClaudeAccountSwitcher()
         creds = json.dumps({"claudeAiOauth": {"accessToken": "tok"}})
         with (
-            patch.object(switcher, "_read_credentials", return_value=creds),
+            patch.object(
+                switcher,
+                "_read_active_credentials",
+                return_value=ActiveCredentials(creds, False),
+            ),
             patch(
                 "claude_swap.oauth.fetch_usage_for_account",
                 return_value=None,
