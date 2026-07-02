@@ -863,25 +863,51 @@ def _read_running_pid(path: Path) -> int | None:
     return pid if _pid_is_running(pid) else None
 
 
-def _acquire_monitor_pid(path: Path) -> int | None:
-    existing = _read_running_pid(path)
-    if existing is not None:
-        return existing
+def _remove_stale_pid_file(path: Path) -> None:
+    """Remove a dead owner's PID file, and only that file (read-verify-unlink).
+
+    Every PID-file writer creates with ``O_CREAT|O_EXCL``, so between two reads
+    the content can only change if a concurrent starter unlinked the stale file
+    and won the create. Re-reading immediately before the unlink and requiring
+    the exact bytes just judged stale keeps this cleanup from deleting that
+    winner's fresh PID file — the TOCTOU that let two monitors run at once.
+    """
     try:
-        path.unlink()
-    except FileNotFoundError:
-        pass
+        stale_text = path.read_text(encoding="utf-8")
+    except OSError:
+        return
+    try:
+        pid = int(stale_text.strip())
+    except ValueError:
+        pid = None
+    if pid is not None and _pid_is_running(pid):
+        return
+    try:
+        if path.read_text(encoding="utf-8") == stale_text:
+            path.unlink()
     except OSError:
         pass
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    except FileExistsError:
-        return _read_running_pid(path)
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        handle.write(str(os.getpid()))
-    return None
+
+def _acquire_monitor_pid(path: Path) -> int | None:
+    # Bounded retry: each FileExistsError means a concurrent starter created
+    # the file after our cleanup; the next pass either reports it as the live
+    # owner or cleans it up if it already died.
+    for _ in range(3):
+        existing = _read_running_pid(path)
+        if existing is not None:
+            return existing
+        _remove_stale_pid_file(path)
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            continue
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(str(os.getpid()))
+        return None
+    return _read_running_pid(path)
 
 
 def acquire_pid(switcher: MonitorHost) -> int | None:

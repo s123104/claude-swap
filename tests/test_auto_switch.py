@@ -1418,6 +1418,91 @@ class TestMonitorPidLifecycle:
 
         assert existing == 12345
 
+    def test_acquire_stale_cleanup_preserves_concurrent_winner(
+        self, temp_home: Path
+    ):
+        """R2-M3: two starters race on a stale PID file; the loser's cleanup
+        must not delete the winner's freshly written PID file.
+
+        Reproduces the TOCTOU: process A judges the file stale, process B then
+        completes the whole acquisition (cleanup + O_EXCL create), and A
+        resumes with its own cleanup. The old unconditional unlink deleted B's
+        fresh file and let A's O_EXCL succeed — two monitor singletons. The
+        read-verify-unlink cleanup sees content that no longer matches what A
+        judged stale and leaves B's file alone; A then reports B as the owner.
+        """
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        pid_path = switcher.backup_dir / "auto-switch-monitor.pid"
+        pid_path.write_text("99999999", encoding="utf-8")  # stale, dead owner
+
+        real_cleanup = monitor._remove_stale_pid_file
+        b_won = {"done": False}
+
+        def cleanup_with_b_winning_first(path):
+            # B runs its entire acquisition inside A's window between the
+            # staleness read and the stale-file cleanup.
+            if not b_won["done"]:
+                b_won["done"] = True
+                assert monitor._acquire_monitor_pid(path) is None
+                assert path.read_text(encoding="utf-8") == str(os.getpid())
+            return real_cleanup(path)
+
+        with (
+            patch(
+                "claude_swap.monitor._pid_is_running",
+                side_effect=lambda pid: pid == os.getpid(),
+            ),
+            patch(
+                "claude_swap.monitor._remove_stale_pid_file",
+                side_effect=cleanup_with_b_winning_first,
+            ),
+        ):
+            owner_seen_by_a = monitor._acquire_monitor_pid(pid_path)
+
+        # A must defer to B — not believe it owns the singleton too.
+        assert owner_seen_by_a == os.getpid()
+        assert pid_path.read_text(encoding="utf-8") == str(os.getpid())
+
+    def test_remove_stale_pid_file_only_removes_verified_content(
+        self, temp_home: Path, monkeypatch
+    ):
+        """The cleanup unlinks only when the re-read matches the bytes it
+        judged stale; content swapped by a concurrent winner survives."""
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        pid_path = switcher.backup_dir / "auto-switch-monitor.pid"
+        pid_path.write_text("424242", encoding="utf-8")
+
+        # Dead owner, stable content: removed.
+        with patch("claude_swap.monitor._pid_is_running", return_value=False):
+            monitor._remove_stale_pid_file(pid_path)
+        assert not pid_path.exists()
+
+        # Dead owner, but the content changes between the staleness read and
+        # the verify read (a concurrent winner replaced the file): kept.
+        pid_path.write_text("424242", encoding="utf-8")
+        real_read_text = Path.read_text
+        reads = {"n": 0}
+
+        def racing_read_text(self_path, *args, **kwargs):
+            if self_path == pid_path:
+                reads["n"] += 1
+                if reads["n"] == 2:
+                    return str(os.getpid())  # winner's fresh pid
+            return real_read_text(self_path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", racing_read_text)
+        with patch("claude_swap.monitor._pid_is_running", return_value=False):
+            monitor._remove_stale_pid_file(pid_path)
+        monkeypatch.setattr(Path, "read_text", real_read_text)
+        assert pid_path.exists()
+
+        # Live owner: never removed.
+        with patch("claude_swap.monitor._pid_is_running", return_value=True):
+            monitor._remove_stale_pid_file(pid_path)
+        assert pid_path.exists()
+
     def test_run_cli_monitor_releases_pid_in_finally(self, temp_home: Path):
         switcher = ClaudeAccountSwitcher()
         switcher._setup_directories()
