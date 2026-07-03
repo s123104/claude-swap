@@ -543,15 +543,3 @@ class TestMacosKeychainFallback:
         assert not s._store._backup_enc_path("1", "a@example.com").exists()
         assert s._read_credentials() == ""
         assert not get_credentials_path().exists()
-
-    @pytest.mark.skip(
-        reason="_print_switch_followup removed; backend-specific followup no longer exists"
-    )
-    def test_switch_followup_reflects_recorded_backend(self, temp_home: Path, capsys):
-        s = self._macos_switcher()
-        s._store._last_active_credentials_backend = "file"
-        s._print_switch_followup()
-        assert "next message" in capsys.readouterr().out
-        s._store._last_active_credentials_backend = "keychain"
-        s._print_switch_followup()
-        assert "30 seconds" in capsys.readouterr().out
