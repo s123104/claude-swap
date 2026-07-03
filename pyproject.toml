@@ -57,50 +57,16 @@ target-version = "py312"
 line-length = 88
 
 [tool.mypy]
-# Incremental typing baseline; tighten overrides as modules are cleaned up.
-# https://mypy.readthedocs.io/en/stable/existing_code.html
+# The whole package is strict; `uv run mypy` (pre-commit) and
+# `mypy --strict src/claude_swap` (CI) check the same thing.
 python_version = "3.12"
+strict = true
 namespace_packages = true
 explicit_package_bases = true
 mypy_path = "src"
 files = ["src/claude_swap"]
 ignore_missing_imports = true
-warn_unused_ignores = true
-warn_redundant_casts = true
 warn_unreachable = true
-no_implicit_optional = true
-
-[[tool.mypy.overrides]]
-module = [
-    "claude_swap.usage_policy",
-    "claude_swap.protocols",
-    "claude_swap.models",
-    "claude_swap.json_output",
-    "claude_swap.oauth",
-    "claude_swap.credential_refresh",
-    "claude_swap.session",
-    "claude_swap.locking",
-    "claude_swap.logging_config",
-    "claude_swap.migrations",
-    "claude_swap.cli",
-    "claude_swap.printer",
-    "claude_swap.service_spec",
-    "claude_swap.service_backends",
-    "claude_swap.service_backends.launchd",
-    "claude_swap.service_backends.systemd",
-    "claude_swap.service_backends.task_scheduler",
-    "claude_swap.service",
-    "claude_swap.transfer",
-    "claude_swap.cache",
-    "claude_swap.usage_cache",
-    "claude_swap.monitor",
-    "claude_swap.credentials",
-    "claude_swap.list_reporter",
-    "claude_swap.sequence_store",
-    "claude_swap.switcher",
-]
-strict = true
-
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
