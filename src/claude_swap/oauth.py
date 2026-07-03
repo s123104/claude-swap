@@ -238,6 +238,31 @@ def build_usage_result(data: dict) -> dict | None:
             except (TypeError, ValueError) as e:
                 _logger.debug("extra_usage parse failed: %r", e)
 
+    # Per-model weekly limits live in the newer ``limits`` array as
+    # ``weekly_scoped`` entries carrying a ``scope.model.display_name`` (e.g.
+    # "Fable"). The legacy five_hour/seven_day keys above never expose these, so
+    # surface each scoped window separately. Absent/older responses (no
+    # ``limits``) simply yield no ``scoped`` key.
+    limits = data.get("limits")
+    if isinstance(limits, list):
+        scoped: list[dict] = []
+        for lim in limits:
+            if not isinstance(lim, dict):
+                continue
+            scope = lim.get("scope")
+            model = scope.get("model") if isinstance(scope, dict) else None
+            name = model.get("display_name") if isinstance(model, dict) else None
+            pct = lim.get("percent")
+            if not name or not isinstance(pct, (int, float)):
+                continue
+            scoped_entry: dict = {"name": name, "pct": float(pct)}
+            if lim.get("resets_at"):
+                scoped_entry["resets_at"] = lim["resets_at"]
+                scoped_entry["countdown"], scoped_entry["clock"] = format_reset(lim["resets_at"])
+            scoped.append(scoped_entry)
+        if scoped:
+            result["scoped"] = scoped
+
     return result if result else None
 
 

@@ -104,6 +104,14 @@ def _format_usage_lines(usage: dict) -> list[str]:
             lines.append(f"7d: {d7['pct']:>3.0f}%   resets {d7['clock']:<12}  in {d7['countdown']}")
         else:
             lines.append(f"7d: {d7['pct']:>3.0f}%")
+    for w in usage.get("scoped") or []:
+        # Per-model weekly limits (e.g. Fable). Flag ones at/over the limit so a
+        # maxed model — the usual reason to switch — stands out.
+        marker = "  (!)" if w["pct"] >= 100 else ""
+        if "clock" in w:
+            lines.append(f"{w['name']}: {w['pct']:>3.0f}%   resets {w['clock']:<12}  in {w['countdown']}{marker}")
+        else:
+            lines.append(f"{w['name']}: {w['pct']:>3.0f}%{marker}")
     return lines
 
 

@@ -27,6 +27,7 @@ from claude_swap.switcher import (
     ClaudeAccountSwitcher,
     SECURITY_SERVICE,
     SETUP_TOKEN_SCOPES,
+    _format_usage_lines,
 )
 
 
@@ -3606,3 +3607,43 @@ class TestMacosKeychainFallback:
         s._last_active_credentials_backend = "keychain"
         s._print_switch_followup()
         assert "30 seconds" in capsys.readouterr().out
+
+
+class TestFormatUsageLines:
+    """Test _format_usage_lines rendering, including per-model scoped windows."""
+
+    def test_scoped_lines_render_per_model_with_at_limit_marker(self):
+        usage = {
+            "five_hour": {"pct": 7.0, "clock": "20:39", "countdown": "1h 30m"},
+            "seven_day": {"pct": 72.0, "clock": "21:59", "countdown": "3h"},
+            "scoped": [
+                {"name": "Fable", "pct": 100.0, "clock": "21:59", "countdown": "3h"},
+            ],
+        }
+        lines = _format_usage_lines(usage)
+        assert lines[0].startswith("5h:")
+        assert lines[1].startswith("7d:")
+        fable = lines[2]
+        assert fable.startswith("Fable:")
+        assert "100%" in fable
+        assert fable.rstrip().endswith("(!)")  # at/over limit marker
+
+    def test_scoped_under_limit_has_no_marker(self):
+        usage = {"scoped": [{"name": "Fable", "pct": 40.0, "clock": "21:59", "countdown": "3h"}]}
+        lines = _format_usage_lines(usage)
+        assert len(lines) == 1
+        assert lines[0].startswith("Fable:")
+        assert "40%" in lines[0]
+        assert "resets 21:59" in lines[0]
+        assert "in 3h" in lines[0]
+        assert not lines[0].rstrip().endswith("(!)")
+
+    def test_scoped_without_clock_renders_pct_only(self):
+        usage = {"scoped": [{"name": "Fable", "pct": 100.0}]}
+        lines = _format_usage_lines(usage)
+        assert lines == ["Fable: 100%  (!)"]
+
+    def test_no_scoped_key_renders_only_standard_windows(self):
+        usage = {"five_hour": {"pct": 7.0}, "seven_day": {"pct": 72.0}}
+        lines = _format_usage_lines(usage)
+        assert all(not line.startswith("Fable:") for line in lines)

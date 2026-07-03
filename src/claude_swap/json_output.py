@@ -37,6 +37,13 @@ def _window_to_json(entry: dict) -> dict:
     return out
 
 
+def _scoped_window_to_json(entry: dict) -> dict:
+    """Project a per-model scoped weekly window, carrying its model name."""
+    out = _window_to_json(entry)
+    out["name"] = entry["name"]
+    return out
+
+
 def usage_to_json(usage: dict) -> dict:
     """Convert the internal usage dict to its camelCase JSON projection.
 
@@ -63,6 +70,8 @@ def usage_to_json(usage: dict) -> dict:
         if "clock" in spend:
             spend_out["clock"] = spend["clock"]
         out["spend"] = spend_out
+    if "scoped" in usage:
+        out["scoped"] = [_scoped_window_to_json(w) for w in usage["scoped"]]
     return out
 
 

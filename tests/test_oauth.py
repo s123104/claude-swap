@@ -277,6 +277,55 @@ class TestFetchUsage:
         assert result["seven_day"]["pct"] == 61.0
         assert "spend" not in result
 
+    def test_scoped_per_model_limits(self):
+        """weekly_scoped entries in limits[] surface as result['scoped'] by model name."""
+        from datetime import timedelta
+        fixed_now = datetime(2026, 3, 23, 12, 0, 0, tzinfo=timezone.utc)
+        future = fixed_now + timedelta(hours=3)
+        response_data = {
+            "five_hour": {"utilization": 7.0, "resets_at": None},
+            "seven_day": {"utilization": 72.0, "resets_at": None},
+            "seven_day_opus": None,
+            "limits": [
+                {"kind": "session", "group": "session", "percent": 7,
+                 "resets_at": None, "scope": None, "is_active": False},
+                {"kind": "weekly_all", "group": "weekly", "percent": 72,
+                 "resets_at": None, "scope": None, "is_active": False},
+                {"kind": "weekly_scoped", "group": "weekly", "percent": 100,
+                 "severity": "critical", "resets_at": future.isoformat(),
+                 "scope": {"model": {"id": None, "display_name": "Fable"}, "surface": None},
+                 "is_active": True},
+            ],
+        }
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps(response_data).encode()
+        mock_response.__enter__ = lambda s: s
+        mock_response.__exit__ = MagicMock(return_value=False)
+        with patch("claude_swap.oauth.urllib.request.urlopen", return_value=mock_response), \
+             patch("claude_swap.oauth.datetime") as mock_dt:
+            mock_dt.fromisoformat = datetime.fromisoformat
+            mock_dt.now.return_value = fixed_now
+            result = oauth.fetch_usage("sk-test-token")
+
+        assert result is not None
+        # Only the model-scoped entry is surfaced; session/weekly_all (scope=None) are not.
+        assert len(result["scoped"]) == 1
+        fable = result["scoped"][0]
+        assert fable["name"] == "Fable"
+        assert fable["pct"] == 100.0
+        assert fable["resets_at"] == future.isoformat()
+        assert fable["countdown"] == "3h 0m"
+        assert "clock" in fable
+
+    def test_no_limits_no_scoped_key(self):
+        """A response without a limits array yields no 'scoped' key (backward compat)."""
+        result = self._fetch_with_response({
+            "five_hour": {"utilization": 22.0, "resets_at": None},
+            "seven_day": {"utilization": 61.0, "resets_at": None},
+        })
+        assert result is not None
+        assert "scoped" not in result
+
 
 class TestRefreshOAuthCredentials:
     """Test direct OAuth refresh requests."""
