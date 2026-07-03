@@ -7,6 +7,7 @@ import logging
 import urllib.error
 import urllib.request
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from claude_swap.printer import warning as print_warning
@@ -47,21 +48,41 @@ def is_oauth_token_expired(expires_at: object) -> bool:
     return now_ms + OAUTH_EXPIRY_BUFFER_MS >= int(expires_at)
 
 
-def refresh_oauth_credentials(credentials: str) -> str | None:
+@dataclass(frozen=True)
+class RefreshOutcome:
+    """Result of a refresh-token grant attempt.
+
+    ``credentials`` is the full rotated credentials JSON on success, else None.
+    ``error`` classifies failures so callers can distinguish a dead refresh-token
+    lineage (permanent: quarantine, stop retrying) from a network blip
+    (transient: retry later):
+
+    - ``None`` — success (``credentials`` is set)
+    - ``"invalid_grant"`` — the token endpoint rejected the grant; this refresh
+      token is dead and re-login is required
+    - ``"no_refresh_token"`` — the stored credential carries no usable refresh
+      token (also permanent for retry purposes)
+    - ``"transient"`` — network/server error; the token may still be valid
+    """
+
+    credentials: str | None
+    error: str | None
+
+
+def try_refresh_oauth_credentials(credentials: str) -> RefreshOutcome:
     """Refresh an OAuth access token via direct token endpoint POST."""
     try:
         data = json.loads(credentials)
-        oauth = data.get("claudeAiOauth")
-        if not isinstance(oauth, dict):
-            return None
+    except json.JSONDecodeError:
+        return RefreshOutcome(None, "no_refresh_token")
+    oauth = data.get("claudeAiOauth") if isinstance(data, dict) else None
+    if not isinstance(oauth, dict) or not oauth.get("refreshToken"):
+        return RefreshOutcome(None, "no_refresh_token")
 
-        refresh_token = oauth.get("refreshToken")
-        if not refresh_token:
-            return None
-
+    try:
         body = json.dumps({
             "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
+            "refresh_token": oauth["refreshToken"],
             "client_id": OAUTH_CLIENT_ID,
         }).encode()
 
@@ -86,14 +107,27 @@ def refresh_oauth_credentials(credentials: str) -> str | None:
             oauth["scopes"] = resp_data["scope"].split()
 
         data["claudeAiOauth"] = oauth
-        return json.dumps(data)
+        return RefreshOutcome(json.dumps(data), None)
     except urllib.error.HTTPError as e:
         body = e.read().decode(errors="replace") if hasattr(e, "read") else ""
         _logger.debug("OAuth refresh failed: %r, body: %s", e, body[:500])
-        return None
+        # Permanent only when the server itself rejected the grant: a 4xx AND
+        # an explicit marker in the body. Anything ambiguous stays transient —
+        # a misclassified transient costs one retry, a misclassified permanent
+        # would wrongly quarantine a live token.
+        if e.code in (400, 401, 403) and (
+            "invalid_grant" in body or "invalid_client" in body
+        ):
+            return RefreshOutcome(None, "invalid_grant")
+        return RefreshOutcome(None, "transient")
     except Exception as e:
         _logger.debug("OAuth refresh failed: %r", e)
-        return None
+        return RefreshOutcome(None, "transient")
+
+
+def refresh_oauth_credentials(credentials: str) -> str | None:
+    """Refresh an OAuth access token; None on any failure (see RefreshOutcome)."""
+    return try_refresh_oauth_credentials(credentials).credentials
 
 
 

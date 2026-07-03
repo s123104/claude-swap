@@ -319,6 +319,81 @@ class TestRefreshOAuthCredentials:
         assert "scope" not in seen_body
 
 
+class TestTryRefreshOAuthCredentials:
+    """Typed refresh outcomes: permanent vs transient failure classification."""
+
+    _make_credentials = staticmethod(TestRefreshOAuthCredentials._make_credentials)
+
+    @staticmethod
+    def _http_error(code, body: bytes, msg="err"):
+        import io
+
+        return urllib.error.HTTPError(
+            oauth.OAUTH_TOKEN_URL, code, msg, hdrs=None, fp=io.BytesIO(body)
+        )
+
+    def test_success_rotates_and_has_no_error(self):
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps({
+            "access_token": "new-access",
+            "refresh_token": "new-refresh",
+            "expires_in": 3600,
+        }).encode()
+        mock_response.__enter__ = lambda s: s
+        mock_response.__exit__ = MagicMock(return_value=False)
+
+        with patch(
+            "claude_swap.oauth.urllib.request.urlopen", return_value=mock_response
+        ):
+            outcome = oauth.try_refresh_oauth_credentials(self._make_credentials())
+
+        assert outcome.error is None
+        rotated = json.loads(outcome.credentials)["claudeAiOauth"]
+        assert rotated["accessToken"] == "new-access"
+        assert rotated["refreshToken"] == "new-refresh"
+
+    def test_invalid_grant_body_on_400_is_permanent(self):
+        err = self._http_error(400, b'{"error": "invalid_grant"}')
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=err):
+            outcome = oauth.try_refresh_oauth_credentials(self._make_credentials())
+        assert outcome.credentials is None
+        assert outcome.error == "invalid_grant"
+
+    def test_400_without_marker_is_transient(self):
+        err = self._http_error(400, b'{"error": "temporarily_unavailable"}')
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=err):
+            outcome = oauth.try_refresh_oauth_credentials(self._make_credentials())
+        assert outcome.error == "transient"
+
+    def test_5xx_is_transient_even_with_marker(self):
+        err = self._http_error(500, b'{"error": "invalid_grant"}')
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=err):
+            outcome = oauth.try_refresh_oauth_credentials(self._make_credentials())
+        assert outcome.error == "transient"
+
+    def test_network_error_is_transient(self):
+        with patch(
+            "claude_swap.oauth.urllib.request.urlopen",
+            side_effect=urllib.error.URLError("dns"),
+        ):
+            outcome = oauth.try_refresh_oauth_credentials(self._make_credentials())
+        assert outcome.error == "transient"
+
+    def test_missing_refresh_token_is_permanent(self):
+        creds = json.dumps({"claudeAiOauth": {"accessToken": "a", "expiresAt": 0}})
+        outcome = oauth.try_refresh_oauth_credentials(creds)
+        assert outcome.error == "no_refresh_token"
+
+    def test_invalid_json_is_permanent(self):
+        outcome = oauth.try_refresh_oauth_credentials("not json")
+        assert outcome.error == "no_refresh_token"
+
+    def test_wrapper_returns_none_on_failure(self):
+        err = self._http_error(400, b'{"error": "invalid_grant"}')
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=err):
+            assert oauth.refresh_oauth_credentials(self._make_credentials()) is None
+
+
 class TestBuildTokenStatus:
     """Test token status formatting."""
 

@@ -23,6 +23,7 @@ from claude_swap.exceptions import (
 )
 from claude_swap import oauth
 from claude_swap.cache import MISSING, read_cache, write_cache
+from claude_swap.claude_locks import claude_config_lock, claude_credentials_lock
 from claude_swap.json_output import (
     SCHEMA_VERSION,
     USAGE_API_KEY,
@@ -456,6 +457,67 @@ class ClaudeAccountSwitcher:
     def read_account_config(self, account_num: str, email: str) -> str:
         """Public wrapper for session bootstrap. Empty string when missing."""
         return self._read_account_config(account_num, email)
+
+    # -- public accessors for the auto-switch engine -----------------------
+
+    def usage_by_account(self) -> dict[str, dict | str | None]:
+        """Public wrapper: account number → usage entry (cache-first)."""
+        return self._usage_by_account()
+
+    def switchable_account_numbers(self) -> list[str]:
+        """Account numbers in rotation order that have usable stored backups."""
+        data = self._get_sequence_data() or {}
+        return [
+            str(num)
+            for num in data.get("sequence", [])
+            if self._account_is_switchable(str(num))
+        ]
+
+    def account_kind_for(self, account_num: str) -> str:
+        """Public wrapper: ``"api_key"`` or ``"oauth"`` (setup-tokens read as oauth)."""
+        return self._account_kind(account_num)
+
+    def account_email(self, account_num: str) -> str:
+        """Stored email for a slot; empty string when unknown."""
+        data = self._get_sequence_data() or {}
+        return data.get("accounts", {}).get(str(account_num), {}).get("email", "")
+
+    def current_account_number(self) -> str | None:
+        """Slot of the live login; ``None`` when there is none or it's unmanaged.
+
+        Deliberately no fallback to the recorded ``activeAccountNumber``: an
+        unmanaged live login must return ``None`` — never a guessed slot — so
+        the auto-switch engine can't evaluate the wrong account's usage and
+        overwrite a login cswap doesn't own (``_perform_switch`` would take
+        the no-backup direct-activation path). Use :meth:`has_live_login` to
+        tell the two ``None`` cases apart.
+        """
+        identity = self._get_current_account()
+        if identity is None:
+            return None
+        data = self._get_sequence_data() or {}
+        email, org_uuid = identity
+        return self._find_account_slot(data, email, org_uuid)
+
+    def has_live_login(self) -> bool:
+        """Whether ``~/.claude.json`` carries any live account identity."""
+        return self._get_current_account() is not None
+
+    def live_session_pids_for(self, account_num: str, email: str) -> list[int]:
+        """Public wrapper: PIDs of live ``cswap run`` sessions for a slot."""
+        return self._live_session_pids(account_num, email)
+
+    def persist_backup_credentials(
+        self, account_num: str, email: str, credentials: str
+    ) -> None:
+        """Persist rotated credentials to a slot's backup store, under the lock.
+
+        For inactive accounts only — never routes to the active store. Mirrors
+        the persist callback ``_collect_usage`` uses. The caller must NOT hold
+        ``self.lock_file`` (FileLock is non-reentrant).
+        """
+        with FileLock(self.lock_file):
+            self._write_account_credentials(account_num, email, credentials)
 
     # -- session profile lifecycle ----------------------------------------
 
@@ -1276,36 +1338,49 @@ class ClaudeAccountSwitcher:
 
         def persist_active(num: str, acct_email: str, new_creds: str) -> None:
             nonlocal persist_skipped
-            with FileLock(self.lock_file):
-                live = self._read_credentials() or ""
-                live_oauth = oauth.extract_oauth_data(live) if live else None
-                live_refresh = live_oauth.get("refreshToken") if live_oauth else None
-                # Re-check owners + refresh-token lineage under the lock. If a Claude
-                # Code / session appeared, or an external write (e.g. a user /login)
-                # replaced the credential since we read it, skip rather than clobber a
-                # live process's newer credential. Best effort, not perfectly atomic.
-                if (
-                    self._active_cc_running()
-                    or self._live_session_pids(num, acct_email)
-                    or live_refresh != original_refresh
+            # Failing to acquire any lock means the rotated credential was NOT
+            # persisted — mark it skipped (never show usage for it) before the
+            # error propagates to oauth._persist's warning path. The Claude
+            # Code locks matter here too: _write_credentials touches the
+            # active store and (via _clear_managed_key) possibly ~/.claude.json,
+            # and holding them closes the owner-check-to-write gap.
+            try:
+                with (
+                    FileLock(self.lock_file),
+                    claude_credentials_lock(),
+                    claude_config_lock(),
                 ):
-                    persist_skipped = True
-                    self._logger.warning(
-                        "Active-account refresh for %s (%s): owner appeared or refresh "
-                        "token changed mid-refresh; discarding rotated credential.",
-                        num, acct_email,
+                    live = self._read_credentials() or ""
+                    live_oauth = oauth.extract_oauth_data(live) if live else None
+                    live_refresh = (
+                        live_oauth.get("refreshToken") if live_oauth else None
                     )
-                    return
-                # A write failure leaves the live store holding the now-consumed
-                # original refresh token, so mark the persist as skipped (never show
-                # usage for it) and re-raise — oauth._persist swallows the exception
-                # but logs its "failed to persist" warning first.
-                try:
+                    # Re-check owners + refresh-token lineage under the lock. If a Claude
+                    # Code / session appeared, or an external write (e.g. a user /login)
+                    # replaced the credential since we read it, skip rather than clobber a
+                    # live process's newer credential. Best effort, not perfectly atomic.
+                    if (
+                        self._active_cc_running()
+                        or self._live_session_pids(num, acct_email)
+                        or live_refresh != original_refresh
+                    ):
+                        persist_skipped = True
+                        self._logger.warning(
+                            "Active-account refresh for %s (%s): owner appeared or refresh "
+                            "token changed mid-refresh; discarding rotated credential.",
+                            num, acct_email,
+                        )
+                        return
+                    # A write failure leaves the live store holding the now-consumed
+                    # original refresh token, so mark the persist as skipped (never show
+                    # usage for it) and re-raise — oauth._persist swallows the exception
+                    # but logs its "failed to persist" warning first.
                     self._write_credentials(new_creds)  # active store — Claude Code reads this
                     self._write_account_credentials(num, acct_email, new_creds)  # backup in sync
-                except Exception:
+            except Exception:
+                if not persist_skipped:
                     persist_skipped = True
-                    raise
+                raise
 
         usage = oauth.fetch_usage_for_account(
             account_num, email, creds,
@@ -2216,7 +2291,15 @@ class ClaudeAccountSwitcher:
                 else:
                     warnings_out.append(msg)
 
-        with FileLock(self.lock_file):
+        # Beyond cswap's own lock, hold Claude Code's advisory locks for the
+        # whole mutation (including rollback paths): its token refresh runs
+        # under ~/.claude.lock and re-reads credentials there — holding it
+        # means a mid-refresh Claude Code either finishes before our swap
+        # (backup captures the rotated token) or re-checks after it and aborts.
+        # ~/.claude.json.lock likewise keeps the oauthAccount splice from
+        # interleaving with Claude Code's own config writes. Everything under
+        # here is local I/O — no network while locks are held.
+        with FileLock(self.lock_file), claude_credentials_lock(), claude_config_lock():
             data = self._get_sequence_data()
             active_account = data.get("activeAccountNumber")
             current_account = str(active_account) if active_account is not None else None

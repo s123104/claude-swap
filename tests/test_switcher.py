@@ -3197,6 +3197,70 @@ class TestUsageAwareSwitch:
         assert s._get_sequence_data()["activeAccountNumber"] == 3
 
 
+class TestClaudeCodeLockCooperation:
+    """_perform_switch must hold Claude Code's own advisory locks
+    (~/.claude.lock and ~/.claude.json.lock) while mutating credentials/config,
+    and fail cleanly — before any mutation — when Claude Code holds them."""
+
+    _setup = TestUsageAwareSwitch._setup
+    _seed = TestUsageAwareSwitch._seed
+    _make_live = TestUsageAwareSwitch._make_live
+
+    def test_switch_holds_both_cc_locks_at_write_time(self, temp_home: Path):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+
+        creds_lock = temp_home / ".claude.lock"
+        config_lock = temp_home / ".claude.json.lock"
+        seen: list[tuple[bool, bool]] = []
+        original_write = s._write_credentials
+
+        def spying_write(credentials: str) -> None:
+            seen.append((creds_lock.is_dir(), config_lock.is_dir()))
+            original_write(credentials)
+
+        with patch.object(s, "_write_credentials", side_effect=spying_write), \
+             patch.object(s, "list_accounts"):
+            s.switch_to("2")
+
+        assert s._get_sequence_data()["activeAccountNumber"] == 2
+        assert seen and all(pair == (True, True) for pair in seen)
+        # Released after the switch.
+        assert not creds_lock.exists()
+        assert not config_lock.exists()
+
+    def test_preheld_cc_lock_fails_cleanly_without_mutation(
+        self, temp_home: Path, monkeypatch
+    ):
+        from claude_swap import claude_locks
+        from claude_swap.exceptions import ClaudeCodeLockTimeout
+
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+
+        monkeypatch.setattr(claude_locks, "DEFAULT_TIMEOUT_S", 0.3)
+        (temp_home / ".claude.lock").mkdir()  # fresh mtime = live CC refresh
+
+        live_creds_before = (
+            temp_home / ".claude" / ".credentials.json"
+        ).read_text()
+        with pytest.raises(ClaudeCodeLockTimeout):
+            s.switch_to("2")
+
+        # Nothing was mutated: locks acquire before any write.
+        assert s._get_sequence_data()["activeAccountNumber"] == 1
+        live_creds_after = (
+            temp_home / ".claude" / ".credentials.json"
+        ).read_text()
+        assert live_creds_after == live_creds_before
+        # The holder's lock was left alone.
+        assert (temp_home / ".claude.lock").is_dir()
+
+
 class TestMacosKeychainFallback:
     """macOS auto-fallback to file storage when the Keychain is unusable, plus the
     ``.enc``-wins backup reconciliation.
