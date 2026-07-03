@@ -23,7 +23,7 @@ from xml.dom import minidom
 
 from claude_swap import __version__, service_spec
 from claude_swap.exceptions import ClaudeSwitchError
-from claude_swap.printer import bolded, dimmed, muted
+from claude_swap.printer import bolded, dimmed, muted, warning
 from claude_swap.protocols import ServiceState
 from claude_swap.protocols import ServiceHost
 
@@ -252,6 +252,20 @@ class TaskSchedulerBackend:
         _unregister_task(check=False)
         _register_task(xml_path)
         _start_task()
+        config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+        if config_dir:
+            # launchd/systemd forward CLAUDE_CONFIG_DIR to the monitor, but
+            # the task XML schema cannot carry environment variables — the
+            # monitor only sees what the user account's baseline environment
+            # holds, and with the default config dir it would watch an empty
+            # sessions directory and idle forever.
+            warning(
+                "CLAUDE_CONFIG_DIR is set in this shell, but Task Scheduler "
+                "cannot forward it to the background monitor. Make it a "
+                "user-level environment variable first:\n"
+                f'  setx CLAUDE_CONFIG_DIR "{config_dir}"\n'
+                "then run `cswap service install` again from a new shell."
+            )
         service_spec.print_install_success(
             switcher,
             artifact_path=xml_path,

@@ -272,6 +272,40 @@ class TestInstall:
         ts_backend.TaskSchedulerBackend().install(switcher)
         assert "<LogonTrigger>" in xml_path.read_text(encoding="utf-8")
 
+    def test_install_warns_when_claude_config_dir_cannot_be_forwarded(
+        self,
+        temp_home: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ):
+        # launchd/systemd forward CLAUDE_CONFIG_DIR to the monitor; the task
+        # XML schema has no env-var slot, so a shell-only value strands the
+        # background monitor on the default config dir, silently idle.
+        _force_win32(monkeypatch)
+        config_dir = temp_home / "custom-claude"
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir))
+        monkeypatch.setattr(subprocess, "run", _stub_run())
+
+        ts_backend.TaskSchedulerBackend().install(ClaudeAccountSwitcher())
+
+        out = capsys.readouterr().out
+        assert "cannot forward" in out
+        assert f'setx CLAUDE_CONFIG_DIR "{config_dir}"' in out
+
+    def test_install_stays_quiet_without_claude_config_dir(
+        self,
+        temp_home: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ):
+        _force_win32(monkeypatch)
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+        monkeypatch.setattr(subprocess, "run", _stub_run())
+
+        ts_backend.TaskSchedulerBackend().install(ClaudeAccountSwitcher())
+
+        assert "CLAUDE_CONFIG_DIR" not in capsys.readouterr().out
+
     def test_register_failure_raises(
         self, temp_home: Path, monkeypatch: pytest.MonkeyPatch
     ):
