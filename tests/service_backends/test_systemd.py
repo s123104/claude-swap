@@ -230,9 +230,12 @@ class TestInstall:
         assert "wsl.exe -d Ubuntu -u dev" in out
         # The suggested command must leave a long-lived process behind:
         # `--exec /usr/bin/true` exits immediately, so the distro idles out
-        # seconds later and takes the monitor down with it.
+        # seconds later and takes the monitor down with it. It must also be
+        # preinstalled: `dbus-launch` (dbus-x11) is absent from the default
+        # Ubuntu WSL image, so copying that guidance failed outright.
         assert systemd_backend._WSL_KEEPALIVE_EXEC in out
         assert "/usr/bin/true" not in out
+        assert "dbus-launch" not in out
         assert "idle" in out.lower()
         assert ".claude" in out
 
@@ -244,6 +247,7 @@ class TestInstall:
         )
         assert systemd_backend._WSL_KEEPALIVE_EXEC in readme
         assert "--exec /usr/bin/true" not in readme
+        assert "dbus-launch" not in readme
 
     def test_linger_failure_tolerated_with_warning(
         self,

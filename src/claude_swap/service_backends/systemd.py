@@ -183,12 +183,14 @@ def _installed_version() -> str | None:
 # Keepalive command suggested for the Windows Task Scheduler logon task. It
 # must leave a long-lived process attached to WSL's init: WSL idle-terminates
 # the VM when no user-launched process remains, and processes started by
-# systemd (like our monitor unit) do not count. ``dbus-launch`` stays resident
-# after ``true`` exits, so the instance is kept alive. A bare
-# ``--exec /usr/bin/true`` exits immediately and keeps nothing alive.
+# systemd (like our monitor unit) do not count. ``sleep infinity`` never
+# exits, so the instance stays alive; it ships with coreutils, unlike the
+# previously suggested ``dbus-launch`` (dbus-x11 package), which the default
+# Ubuntu WSL image does not include. A bare ``--exec /usr/bin/true`` exits
+# immediately and keeps nothing alive.
 # Documented in README.md ("Run it in the background" → WSL2); a test asserts
 # the two stay in sync.
-_WSL_KEEPALIVE_EXEC = "dbus-launch true"
+_WSL_KEEPALIVE_EXEC = "sleep infinity"
 
 
 def _print_wsl_guidance() -> None:
@@ -200,7 +202,7 @@ def _print_wsl_guidance() -> None:
     )
     print(f"  {dimmed(f'wsl.exe -d {distro} -u {user} --exec {_WSL_KEEPALIVE_EXEC}')}")
     print(
-        f"  {dimmed('The command must leave a resident process behind (dbus-launch does) — WSL shuts the distro down when idle and systemd services do not keep it alive, stopping the monitor.')}"
+        f"  {dimmed('The command must leave a resident process behind (sleep infinity never exits) — WSL shuts the distro down when idle and systemd services do not keep it alive, stopping the monitor.')}"
     )
     print(
         f"  {dimmed('WSL ~/.claude and Windows %USERPROFILE%\\\\.claude are separate; install cswap in the same environment as Claude Code.')}"
