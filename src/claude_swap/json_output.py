@@ -15,9 +15,9 @@ from claude_swap import oauth
 # Bump only on a breaking change to any payload shape. Scripts key off this.
 SCHEMA_VERSION = 1
 
-# Sentinel entries that ``_resolve_usages`` / ``_fetch_active_usage`` yield in place
-# of a usage dict. Kept here (the serialization hub) so the human renderer and the
-# JSON projection agree instead of scattering raw strings.
+# Sentinel entries that ``resolve_usages`` / ``resolve_active_usage_entry`` yield
+# in place of a usage dict. Kept here (the serialization hub) so the human renderer
+# and the JSON projection agree instead of scattering raw strings.
 USAGE_NO_CREDENTIALS = "no credentials"
 USAGE_TOKEN_EXPIRED = "token expired"
 # API-key (``/login`` managed key) accounts have no subscription quota; usage is
