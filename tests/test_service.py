@@ -455,6 +455,82 @@ class TestPlatformGuard:
         with pytest.raises(ClaudeSwitchError, match="not supported"):
             fn(ClaudeAccountSwitcher())
 
+    def test_unsupported_backend_refuses_every_action(self, temp_home: Path):
+        # select_backend() returns this placeholder for UNKNOWN platforms; its
+        # whole surface must refuse with the same actionable message.
+        from claude_swap.service_backends import UnsupportedBackend
+
+        backend = UnsupportedBackend()
+        assert backend.platform_label == "unsupported"
+        assert "unsupported" in backend.describe()
+        switcher = ClaudeAccountSwitcher()
+        for call in (
+            lambda: backend.install(switcher),
+            lambda: backend.uninstall(switcher),
+            lambda: backend.state(),
+            lambda: backend.status(switcher),
+            lambda: backend.logs(switcher),
+        ):
+            with pytest.raises(ClaudeSwitchError, match="not supported"):
+                call()
+
+
+class TestLaunchdBackendEdges:
+    def test_describe_and_label(self):
+        backend = launchd.LaunchdBackend()
+        assert backend.platform_label == "launchd"
+        assert "launchd" in backend.describe()
+
+    def test_launchctl_timeout_raises_actionable_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            MagicMock(
+                side_effect=subprocess.TimeoutExpired(cmd="launchctl", timeout=10)
+            ),
+        )
+        with pytest.raises(ClaudeSwitchError, match="timed out"):
+            launchd._launchctl("print", "gui/501/x")
+
+    def test_installed_version_none_when_plist_missing_or_invalid(
+        self, temp_home: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        plist_path = temp_home / "absent.plist"
+        monkeypatch.setattr(launchd, "_plist_path", lambda: plist_path)
+        assert launchd._installed_version() is None
+
+        plist_path.write_bytes(b"not a plist at all")
+        assert launchd._installed_version() is None
+
+    def test_install_write_failure_cleans_up_temp_file(
+        self, temp_home: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A failed plist dump must remove the temp file and propagate —
+        never leave a half-written agent for launchd to load."""
+        _force_darwin(monkeypatch)
+        plist_path = (
+            temp_home / "Library" / "LaunchAgents" / f"{service_spec.SERVICE_LABEL}.plist"
+        )
+        monkeypatch.setattr(launchd, "_plist_path", lambda: plist_path)
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            MagicMock(side_effect=AssertionError("launchctl must not run")),
+        )
+        monkeypatch.setattr(
+            launchd.plistlib,
+            "dump",
+            MagicMock(side_effect=OSError("disk full")),
+        )
+
+        with pytest.raises(OSError, match="disk full"):
+            launchd.LaunchdBackend().install(ClaudeAccountSwitcher())
+
+        assert not plist_path.exists()
+        assert list(plist_path.parent.glob("*.tmp")) == []
+
 
 # --------------------------------------------------------------------------- #
 # CLI routing                                                                  #

@@ -324,6 +324,150 @@ class TestState:
         assert ts_backend.TaskSchedulerBackend().state() == expected
 
 
+class TestQueryTaskState:
+    def test_absent_task_maps_to_not_exists(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.setattr(subprocess, "run", _stub_run(returncode=2))
+        assert ts_backend._query_task_state() == (False, "")
+
+    def test_present_task_returns_trimmed_state(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.setattr(subprocess, "run", _stub_run(stdout="Ready\r\n"))
+        assert ts_backend._query_task_state() == (True, "Ready")
+
+
+class TestStatus:
+    def test_not_installed_prints_and_skips_version_read(
+        self,
+        temp_home: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ):
+        monkeypatch.setattr(ts_backend, "_query_task_state", lambda: (False, ""))
+
+        rc = ts_backend.TaskSchedulerBackend().status(ClaudeAccountSwitcher())
+
+        assert rc == 0
+        assert "not installed" in capsys.readouterr().out
+
+    def test_disabled_task_prints_reload_hint(
+        self,
+        temp_home: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ):
+        monkeypatch.setattr(
+            ts_backend, "_query_task_state", lambda: (True, "Disabled")
+        )
+
+        rc = ts_backend.TaskSchedulerBackend().status(ClaudeAccountSwitcher())
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "installed but not loaded" in out
+        assert "cswap service install" in out
+
+    def test_loaded_surfaces_task_state_and_decision_log(
+        self,
+        temp_home: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ):
+        monkeypatch.setattr(ts_backend, "_query_task_state", lambda: (True, "Running"))
+
+        switcher = ClaudeAccountSwitcher()
+        rc = ts_backend.TaskSchedulerBackend().status(switcher)
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "loaded" in out
+        assert "state = Running" in out
+        assert "decision log" in out
+
+    def test_loaded_warns_on_version_drift(
+        self,
+        temp_home: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ):
+        switcher = ClaudeAccountSwitcher()
+        xml_path = _task_xml_path(switcher)
+        xml_path.parent.mkdir(parents=True)
+        xml_path.write_text(
+            "<RegistrationInfo><Version>0.0.1</Version></RegistrationInfo>",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(ts_backend, "_query_task_state", lambda: (True, "Ready"))
+
+        ts_backend.TaskSchedulerBackend().status(switcher)
+
+        out = capsys.readouterr().out
+        assert "0.0.1" in out
+        assert "cswap service install" in out
+
+
+class TestLogs:
+    def test_missing_log_and_unregistered_task(
+        self,
+        temp_home: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ):
+        monkeypatch.setattr(ts_backend, "_query_task_state", lambda: (False, ""))
+
+        rc = ts_backend.TaskSchedulerBackend().logs(ClaudeAccountSwitcher())
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "claude-swap.log (structured)" in out
+        assert "(none yet)" in out
+        assert "(task not registered)" in out
+
+    def test_tails_structured_log_and_prints_task_state(
+        self,
+        temp_home: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ):
+        switcher = ClaudeAccountSwitcher()
+        switcher.backup_dir.mkdir(parents=True, exist_ok=True)
+        (switcher.backup_dir / "claude-swap.log").write_text(
+            "old-line\nrecent-line-1\nrecent-line-2\n"
+        )
+        monkeypatch.setattr(ts_backend, "_query_task_state", lambda: (True, "Ready"))
+
+        rc = ts_backend.TaskSchedulerBackend().logs(switcher, lines=2)
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "recent-line-1" in out
+        assert "recent-line-2" in out
+        assert "old-line" not in out
+        assert "State: Ready" in out
+
+
+class TestRunGuards:
+    def test_run_timeout_raises_actionable_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            MagicMock(
+                side_effect=subprocess.TimeoutExpired(cmd="powershell", timeout=10)
+            ),
+        )
+        with pytest.raises(ClaudeSwitchError, match="timed out"):
+            ts_backend._powershell("Get-ScheduledTask")
+
+    def test_describe_and_label(self):
+        backend = ts_backend.TaskSchedulerBackend()
+        assert backend.platform_label == "task_scheduler"
+        assert "Task Scheduler" in backend.describe()
+
+
 class TestInstalledVersion:
     def test_reads_version_from_registration_info(
         self, temp_home: Path, monkeypatch: pytest.MonkeyPatch
@@ -351,6 +495,9 @@ class TestInstalledVersion:
             encoding="utf-8",
         )
         assert ts_backend._installed_version(switcher) == "9.9.9"
+
+    def test_none_when_xml_backup_missing(self, temp_home: Path):
+        assert ts_backend._installed_version(ClaudeAccountSwitcher()) is None
 
 
 class TestSelectBackendWindows:

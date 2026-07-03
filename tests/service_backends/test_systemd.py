@@ -453,6 +453,267 @@ class TestSelectBackendLinux:
         assert backend.platform_label == "systemd"
 
 
+class TestStatus:
+    def _fake_run(self, responses: dict[str, tuple[int, str, str]]):
+        """Dispatch on the systemctl verb; default to rc=0 empty output."""
+
+        def run(argv, **kwargs):
+            completed = MagicMock()
+            rc, stdout, stderr = (0, "", "")
+            for verb, response in responses.items():
+                if verb in argv:
+                    rc, stdout, stderr = response
+                    break
+            completed.returncode = rc
+            completed.stdout = stdout
+            completed.stderr = stderr
+            return completed
+
+        return run
+
+    def test_not_installed_prints_and_skips_systemctl(
+        self,
+        temp_home: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ):
+        unit_path = _unit_path(temp_home / ".config")
+        monkeypatch.setattr(systemd_backend, "_unit_path", lambda: unit_path)
+        sentinel = MagicMock(side_effect=AssertionError("must not run systemctl"))
+        monkeypatch.setattr(subprocess, "run", sentinel)
+
+        rc = systemd_backend.SystemdBackend().status(ClaudeAccountSwitcher())
+
+        assert rc == 0
+        assert "not installed" in capsys.readouterr().out
+
+    def test_installed_but_not_loaded_prints_reload_hint(
+        self,
+        temp_home: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ):
+        unit_path = _unit_path(temp_home / ".config")
+        unit_path.parent.mkdir(parents=True)
+        unit_path.write_text("[Unit]\n")
+        monkeypatch.setattr(systemd_backend, "_unit_path", lambda: unit_path)
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            self._fake_run({"is-active": (3, "inactive\n", "")}),
+        )
+
+        rc = systemd_backend.SystemdBackend().status(ClaudeAccountSwitcher())
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "installed but not loaded" in out
+        assert "cswap service install" in out
+
+    def test_loaded_surfaces_state_lines_and_decision_log(
+        self,
+        temp_home: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ):
+        unit_path = _unit_path(temp_home / ".config")
+        unit_path.parent.mkdir(parents=True)
+        unit_path.write_text("[Unit]\n")
+        monkeypatch.setattr(systemd_backend, "_unit_path", lambda: unit_path)
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            self._fake_run(
+                {
+                    "is-active": (0, "active\n", ""),
+                    "status": (0, "state = running\nnoise line\n", ""),
+                }
+            ),
+        )
+
+        switcher = ClaudeAccountSwitcher()
+        rc = systemd_backend.SystemdBackend().status(switcher)
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "loaded" in out
+        assert "state = running" in out
+        assert "noise line" not in out
+        assert "decision log" in out
+
+    def test_loaded_warns_on_version_drift(
+        self,
+        temp_home: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ):
+        unit_path = _unit_path(temp_home / ".config")
+        unit_path.parent.mkdir(parents=True)
+        unit_path.write_text(
+            '[Service]\nEnvironment="CSWAP_INSTALLED_VERSION=0.0.1"\n'
+        )
+        monkeypatch.setattr(systemd_backend, "_unit_path", lambda: unit_path)
+        monkeypatch.setattr(
+            subprocess, "run", self._fake_run({"is-active": (0, "active\n", "")})
+        )
+
+        systemd_backend.SystemdBackend().status(ClaudeAccountSwitcher())
+
+        out = capsys.readouterr().out
+        assert "0.0.1" in out
+        assert "cswap service install" in out
+
+
+class TestLogs:
+    def test_missing_structured_log_and_unloaded_unit(
+        self,
+        temp_home: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ):
+        def run(argv, **kwargs):
+            completed = MagicMock()
+            completed.returncode = 4
+            completed.stdout = ""
+            completed.stderr = "Unit cswap-monitor.service could not be found."
+            return completed
+
+        monkeypatch.setattr(subprocess, "run", run)
+
+        rc = systemd_backend.SystemdBackend().logs(ClaudeAccountSwitcher())
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "claude-swap.log (structured)" in out
+        assert "(none yet)" in out
+        assert "(unit not loaded yet)" in out
+
+    def test_tails_structured_log_and_journal(
+        self,
+        temp_home: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ):
+        switcher = ClaudeAccountSwitcher()
+        switcher.backup_dir.mkdir(parents=True, exist_ok=True)
+        (switcher.backup_dir / "claude-swap.log").write_text(
+            "old-line\nrecent-line-1\nrecent-line-2\n"
+        )
+
+        def run(argv, **kwargs):
+            completed = MagicMock()
+            completed.returncode = 0
+            completed.stderr = ""
+            completed.stdout = (
+                "journal-line-1\njournal-line-2\n" if argv[0] == "journalctl" else ""
+            )
+            return completed
+
+        monkeypatch.setattr(subprocess, "run", run)
+
+        rc = systemd_backend.SystemdBackend().logs(switcher, lines=2)
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "recent-line-1" in out
+        assert "recent-line-2" in out
+        assert "old-line" not in out
+        assert "journal-line-1" in out
+
+    def test_journal_failure_reported_cleanly(
+        self,
+        temp_home: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ):
+        def run(argv, **kwargs):
+            completed = MagicMock()
+            completed.stdout = ""
+            if argv[0] == "journalctl":
+                completed.returncode = 1
+                completed.stderr = ""
+            else:
+                completed.returncode = 0
+                completed.stderr = ""
+            return completed
+
+        monkeypatch.setattr(subprocess, "run", run)
+
+        rc = systemd_backend.SystemdBackend().logs(ClaudeAccountSwitcher())
+
+        assert rc == 0
+        assert "(no journal entries yet)" in capsys.readouterr().out
+
+
+class TestHelpers:
+    def test_describe_and_label(self):
+        backend = systemd_backend.SystemdBackend()
+        assert backend.platform_label == "systemd"
+        assert "systemd" in backend.describe()
+
+    def test_run_timeout_raises_actionable_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            MagicMock(
+                side_effect=subprocess.TimeoutExpired(cmd="systemctl", timeout=10)
+            ),
+        )
+        with pytest.raises(ClaudeSwitchError, match="timed out"):
+            systemd_backend._systemctl("is-active", "x")
+
+    def test_unit_path_honors_xdg_config_home(
+        self, temp_home: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(temp_home / "xdg"))
+        assert systemd_backend._unit_path() == (
+            temp_home / "xdg" / "systemd" / "user" / systemd_backend.UNIT_NAME
+        )
+        monkeypatch.delenv("XDG_CONFIG_HOME")
+        assert systemd_backend._unit_path() == (
+            temp_home / ".config" / "systemd" / "user" / systemd_backend.UNIT_NAME
+        )
+
+    def test_pid1_detection_reads_proc_comm(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.setattr(Path, "read_text", lambda self, **kw: "systemd\n")
+        assert systemd_backend._pid1_is_systemd() is True
+        monkeypatch.setattr(
+            Path,
+            "read_text",
+            lambda self, **kw: (_ for _ in ()).throw(OSError("no /proc")),
+        )
+        assert systemd_backend._pid1_is_systemd() is False
+
+    def test_escape_quotes_empty_and_spaced_arguments(self):
+        assert systemd_backend._systemd_escape("") == '""'
+        assert systemd_backend._systemd_escape("/plain/path") == "/plain/path"
+        assert systemd_backend._systemd_escape("has space") == '"has space"'
+
+    def test_installed_version_none_when_unit_missing(
+        self, temp_home: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.setattr(
+            systemd_backend, "_unit_path", lambda: temp_home / "absent.service"
+        )
+        assert systemd_backend._installed_version() is None
+
+    def test_installed_version_skips_env_lines_without_assignment(
+        self, temp_home: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        unit_path = temp_home / "unit.service"
+        unit_path.write_text(
+            "[Service]\n"
+            "Environment=NOASSIGNMENT\n"
+            'Environment="CSWAP_INSTALLED_VERSION=1.2.3"\n'
+        )
+        monkeypatch.setattr(systemd_backend, "_unit_path", lambda: unit_path)
+        assert systemd_backend._installed_version() == "1.2.3"
+
+
 class TestRequireSystemd:
     """The pre-flight guard must also verify the per-user manager, not just PID 1."""
 
@@ -486,3 +747,27 @@ class TestRequireSystemd:
             subprocess, "run", _stub_run(returncode=0, stdout="")
         )
         systemd_backend._require_systemd()
+
+    def test_raises_when_user_bus_connection_fails(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        _force_linux(monkeypatch)
+        monkeypatch.setattr(systemd_backend, "_pid1_is_systemd", lambda: True)
+        # No status output at all plus a bus error: no session D-Bus (headless
+        # SSH / WSL without linger) — enable --now would fail confusingly.
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            _stub_run(
+                returncode=1,
+                stdout="",
+                stderr="Failed to connect to bus: No medium found",
+            ),
+        )
+        with pytest.raises(ClaudeSwitchError, match="enable-linger"):
+            systemd_backend._require_systemd()
+
+    def test_raises_on_non_linux_platform(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setattr(sys, "platform", "darwin")
+        with pytest.raises(ClaudeSwitchError, match="requires Linux or WSL"):
+            systemd_backend._require_systemd()
