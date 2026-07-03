@@ -2,9 +2,23 @@
 
 All notable user-facing changes to claude-swap are documented here.
 
-Release version is defined in `pyproject.toml` (currently `0.15.1+haotool.1`).
+Release version is defined in `pyproject.toml` (currently `0.16.0b1+haotool.1`).
 
 ## [Unreleased]
+
+### Added
+
+- **Upstream v0.16.0b1 merged** (`--share-history`, upstream #80 plus the
+  author's hardening pass): `cswap run --share-history` links `projects/` and
+  `history.jsonl` from `~/.claude` into the session profile so every account
+  sees one unified conversation history. History a profile already accumulated
+  is merged into `~/.claude` first (skipped while a live session holds the
+  profile); stale share manifests can only ever unlink symlinks, never real
+  history; seeded history files/dirs match Claude Code's own 0600/0700 modes.
+  POSIX-only — the flag is rejected on Windows, where copy-mode sharing would
+  fork history instead of sharing it. Merged clean: no fork-side code needed
+  changes, and upstream's new session code passes the fork's global
+  `mypy --strict` untouched.
 
 ### Fixed
 

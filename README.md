@@ -8,7 +8,7 @@ Multi-account switcher for Claude Code. Easily switch between multiple Claude ac
 
 | Item | Value |
 |------|-------|
-| **Release version (SSOT)** | `pyproject.toml` → `[project].version` (currently `0.15.1+haotool.1`) |
+| **Release version (SSOT)** | `pyproject.toml` → `[project].version` (currently `0.16.0b1+haotool.1`) |
 | **Scheme** | [PEP 440](https://peps.python.org/pep-0440/) with a **local version label** (`+haotool.1`) to distinguish this fork from upstream |
 | **PyPI** | **Not publishable** — PyPI rejects local version segments (`+…`); this fork is installed from git/source only |
 | **Upstream PyPI** | Publishes plain semver (e.g. `0.15.1`) without the `+haotool.*` suffix |
@@ -106,10 +106,10 @@ Launch Claude Code as a specific account in the current terminal only — every 
 cswap run 2                     # launch Claude Code as account 2, here only
 cswap run user@example.com      # by email
 cswap run 2 -- --resume         # everything after '--' is forwarded to claude
-cswap run 2 --no-share          # don't share your ~/.claude customizations
+cswap run 2 --share-history     # share your chat history with this account too
 ```
 
-Your `~/.claude` customizations (settings, keybindings, CLAUDE.md, skills, commands, agents) are shared into the session by default — use `--no-share` for a bare profile. Conversation history stays per-account.
+Sessions use your normal `~/.claude` setup (settings, CLAUDE.md, skills, etc.), but each account keeps its own chat history. Pass `--share-history` if you want your accounts to continue the same conversations — a session started under one account shows up in `--resume` under the others, and nothing already saved is lost. Not supported on Windows yet.
 
 ### Auto-switch at usage limit (Beta)
 
