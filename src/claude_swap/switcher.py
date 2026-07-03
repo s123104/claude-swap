@@ -169,8 +169,11 @@ class ClaudeAccountSwitcher:
         self.lock_file = self.backup_dir / ".lock"
         self._logger = setup_logging(self.backup_dir, debug=debug)
 
-        # Credential storage layer. Reads platform / credentials_dir / _logger off
-        # this switcher at call time via the _StoreHost Protocol.
+        # The credential storage layer (active + per-account backup stores, macOS
+        # Keychain-vs-file routing, the per-process capability cache). Reads its
+        # live config (platform, _logger, credentials_dir) back off this switcher.
+        # Constructed BEFORE run_migrations(), which performs storage ops on macOS.
+        # One store per switcher: the capability cache is per-process.
         self._store = CredentialStore(self)
         # List/status renderer, created lazily by _list_reporter().
         self._reporter: ListReporter | None = None
@@ -293,29 +296,24 @@ class ClaudeAccountSwitcher:
             raise
 
     def _read_credentials(self) -> str | None:
-        """Read Claude Code's active credentials (delegates to CredentialStore)."""
         return self._store._read_credentials()
 
     def _read_active_credentials(self) -> ActiveCredentials:
-        """Read active credentials with Keychain availability classification."""
         return self._store._read_active_credentials()
 
     def _write_credentials(self, credentials: str, *, verify: bool = False) -> None:
-        """Write Claude Code's active credentials (delegates to CredentialStore)."""
         self._store._write_credentials(credentials, verify=verify)
 
     def _uses_file_backup_backend(self) -> bool:
-        """Whether per-account backups live in files vs. Keychain (delegates)."""
         return self._store._uses_file_backup_backend()
 
     def _read_account_credentials(self, account_num: str, email: str) -> str:
-        """Read account credentials from backup (delegates to CredentialStore)."""
         return self._store._read_account_credentials(account_num, email)
 
     def _write_account_credentials(
         self, account_num: str, email: str, credentials: str
     ) -> None:
-        """Write account backup credentials, then invalidate the session profile.
+        """Write account credentials to backup, then invalidate the slot's session.
 
         Pure storage is delegated to ``CredentialStore``; the session-lifecycle
         side effect below is switcher-owned (the store is data-only toward its
@@ -373,7 +371,6 @@ class ClaudeAccountSwitcher:
         return self._refresher.refresh_inactive_if_needed(account_num, email, credentials)
 
     def _delete_account_credentials(self, account_num: str, email: str) -> None:
-        """Delete account credentials from backup (delegates to CredentialStore)."""
         self._store._delete_account_credentials(account_num, email)
 
 
@@ -902,14 +899,15 @@ class ClaudeAccountSwitcher:
             )
 
     def _reject_cross_kind_collision(self, email: str, is_api_key: bool) -> None:
-        """Reject registering a token whose (email, personal-org) already exists
-        as the *other* kind.
+        """Reject registering a token whose (email, personal-org) already exists as
+        the *other* kind.
 
         Identity is matched on ``(email, organizationUuid)`` only, so two slots
-        sharing an email across kinds could not be told apart at switch time.
-        Refuse the collision and point the user at a distinct ``--email``. The
-        default ``…@token.local`` labels never collide; this only guards a
-        forced ``--email``.
+        sharing an email across kinds (one OAuth, one API key) could not be told
+        apart at switch time. Rather than thread ``kind`` through the whole identity
+        system, refuse the collision and point the user at a distinct ``--email``.
+        The default ``…@token.local`` labels never collide; this only guards a forced
+        ``--email``.
         """
         data = self._get_sequence_data()
         if not data:
@@ -1270,17 +1268,17 @@ class ClaudeAccountSwitcher:
 
         Useful for headless servers or when the token is received from another
         machine, without needing a prior Claude Code login on this machine. The
-        token type is auto-detected: an ``sk-ant-api…`` value is a managed API
-        key (stored raw, activated on Claude Code's API-key auth axis), anything
-        else is treated as an OAuth setup-token. No Anthropic API calls are made.
+        token type is auto-detected: an ``sk-ant-api…`` value is a managed API key
+        (stored raw, activated on Claude Code's API-key auth axis), anything else is
+        treated as an OAuth setup-token. No Anthropic API calls are made.
 
         Args:
-            token: Raw OAuth setup-token or ``sk-ant-api…`` key, or ``"-"`` to
-                   read one line from stdin, or ``""`` to prompt via getpass.
+            token: Raw OAuth setup-token or ``sk-ant-api…`` key, or ``"-"`` to read
+                   one line from stdin, or ``""`` to prompt securely via getpass.
             email: Email address to associate with the account. When omitted,
                    defaults to ``setup-token-{slot}@token.local`` (or
-                   ``api-key-{slot}@token.local`` for API keys) since these
-                   tokens carry no real email metadata.
+                   ``api-key-{slot}@token.local`` for API keys) since these tokens
+                   carry no real email metadata.
             slot:  Slot number to use; auto-assigned when ``None``.
         """
         import getpass
@@ -1390,7 +1388,11 @@ class ClaudeAccountSwitcher:
         )
 
     def remove_account(self, identifier: str, assume_yes: bool = False) -> None:
-        """Remove account from managed accounts."""
+        """Remove account from managed accounts.
+
+        When ``assume_yes`` is True the confirmation prompt is skipped (used by
+        the TUI, which collects confirmation before calling).
+        """
         if not self.sequence_file.exists():
             raise ConfigError("No accounts are managed yet")
 
@@ -1505,80 +1507,80 @@ class ClaudeAccountSwitcher:
         return self._list_reporter().active_account_usage(account_num, current_email)
 
     def _usage_by_account(self) -> dict[str, dict[str, Any] | str | oauth.UsageFetchError | None]:
-            """Map account number → usage entry (per-slot cache) for managed accounts."""
-            reporter = self._list_reporter()
-            accounts_info = reporter.build_accounts_info()
-            usages, _ = reporter.resolve_usages(accounts_info)
-            return {
-                str(info[0]): usage for info, usage in zip(accounts_info, usages)
-            }
+        """Map account number → usage entry (per-slot cache) for managed accounts."""
+        reporter = self._list_reporter()
+        accounts_info = reporter.build_accounts_info()
+        usages, _ = reporter.resolve_usages(accounts_info)
+        return {
+            str(info[0]): usage for info, usage in zip(accounts_info, usages)
+        }
 
     def _select_best_switchable(
-            self, current_num: str | None
-        ) -> tuple[str | None, str]:
-            """Decide the ``best`` strategy target relative to the current account.
+        self, current_num: str | None
+    ) -> tuple[str | None, str]:
+        """Decide the ``best`` strategy target relative to the current account.
 
-            Compares the rate-limit headroom of every *other* switchable account
-            against the current one and only recommends a switch it can *prove*
-            lands on strictly more headroom — never onto an account worse than (or
-            merely unverifiable against) where the user already is. When a switch
-            can't be proven beneficial, it stays put; bare ``cswap --switch``
-            remains the way to force a plain rotation. Returns ``(target, note)``:
+        Compares the rate-limit headroom of every *other* switchable account
+        against the current one and only recommends a switch it can *prove*
+        lands on strictly more headroom — never onto an account worse than (or
+        merely unverifiable against) where the user already is. When a switch
+        can't be proven beneficial, it stays put; bare ``cswap --switch``
+        remains the way to force a plain rotation. Returns ``(target, note)``:
 
-            - ``(num, "")`` — switch to ``num`` (strictly more headroom than current)
-            - ``(None, "current-unavailable")`` — current account's usage is unknown,
-              so no comparison is possible → stay
-            - ``(None, "no-comparison")`` — no other account has known usage → stay
-            - ``(None, "incomplete-comparison")`` — current is best among the
-              accounts we can measure, but some candidate's usage is unknown, so we
-              can't claim it's the best or that everything is exhausted → stay
-            - ``(None, "stay")`` — current account provably has the most headroom
-            - ``(None, "exhausted")`` — current is the best and every account is at
-              its limit (switching would not help) → stay
-            - ``(None, "none")`` — no other switchable account exists
+        - ``(num, "")`` — switch to ``num`` (strictly more headroom than current)
+        - ``(None, "current-unavailable")`` — current account's usage is unknown,
+          so no comparison is possible → stay
+        - ``(None, "no-comparison")`` — no other account has known usage → stay
+        - ``(None, "incomplete-comparison")`` — current is best among the
+          accounts we can measure, but some candidate's usage is unknown, so we
+          can't claim it's the best or that everything is exhausted → stay
+        - ``(None, "stay")`` — current account provably has the most headroom
+        - ``(None, "exhausted")`` — current is the best and every account is at
+          its limit (switching would not help) → stay
+        - ``(None, "none")`` — no other switchable account exists
 
-            Ties (including current-vs-other) resolve in favor of staying put.
-            Never raises on network failure.
-            """
-            from claude_swap.usage_policy import rank_slots
+        Ties (including current-vs-other) resolve in favor of staying put.
+        Never raises on network failure.
+        """
+        from claude_swap.usage_policy import rank_slots
 
-            data = self._get_sequence_data() or {}
-            others = [
-                str(n) for n in data.get("sequence", [])
-                if str(n) != str(current_num) and self._account_is_switchable(str(n))
-            ]
-            usage = self._usage_by_account()
-            result = rank_slots(
-                cast("dict[str, object]", usage),
-                mode="headroom_best",
-                current=str(current_num) if current_num is not None else None,
-                candidates=others,
-            )
-            return result.target, result.note or ""
+        data = self._get_sequence_data() or {}
+        others = [
+            str(n) for n in data.get("sequence", [])
+            if str(n) != str(current_num) and self._account_is_switchable(str(n))
+        ]
+        usage = self._usage_by_account()
+        result = rank_slots(
+            cast("dict[str, object]", usage),
+            mode="headroom_best",
+            current=str(current_num) if current_num is not None else None,
+            candidates=others,
+        )
+        return result.target, result.note or ""
 
     def _switch_result_from_op(
-            self, op: dict[str, Any], strategy: str, extra_warnings: list[str] | None = None
-        ) -> dict[str, Any]:
-            return switch_result_from_op(op, strategy, extra_warnings)
+        self, op: dict[str, Any], strategy: str, extra_warnings: list[str] | None = None
+    ) -> dict[str, Any]:
+        return switch_result_from_op(op, strategy, extra_warnings)
 
     def _switch_noop(
-            self,
-            *,
-            strategy: str,
-            reason: str,
-            message: str,
-            from_ref: dict[str, Any] | None = None,
-            to_ref: dict[str, Any] | None = None,
-            warnings: list[str] | None = None,
-        ) -> dict[str, Any]:
-            return switch_noop(
-                strategy=strategy,
-                reason=reason,
-                message=message,
-                from_ref=from_ref,
-                to_ref=to_ref,
-                warnings=warnings,
-            )
+        self,
+        *,
+        strategy: str,
+        reason: str,
+        message: str,
+        from_ref: dict[str, Any] | None = None,
+        to_ref: dict[str, Any] | None = None,
+        warnings: list[str] | None = None,
+    ) -> dict[str, Any]:
+        return switch_noop(
+            strategy=strategy,
+            reason=reason,
+            message=message,
+            from_ref=from_ref,
+            to_ref=to_ref,
+            warnings=warnings,
+        )
 
     def _resolve_fresh_machine_target(
         self,
@@ -1776,112 +1778,112 @@ class ClaudeAccountSwitcher:
         return None, hit_limit
 
     def switch_to(
-            self, identifier: str, json_output: bool = False, force: bool = False
-        ) -> dict[str, Any] | None:
-            """Switch to specific account.
+        self, identifier: str, json_output: bool = False, force: bool = False
+    ) -> dict[str, Any] | None:
+        """Switch to specific account.
 
-            ``force`` activates the target's stored credentials directly, skipping
-            both the already-active no-op guard and the backup-current step —
-            the recovery path for a live login gone stale (e.g. after --import).
-            """
-            if not self.sequence_file.exists():
-                raise ConfigError("No accounts are managed yet")
+        ``force`` activates the target's stored credentials directly, skipping
+        both the already-active no-op guard and the backup-current step —
+        the recovery path for a live login gone stale (e.g. after --import).
+        """
+        if not self.sequence_file.exists():
+            raise ConfigError("No accounts are managed yet")
 
-            # Ensure org fields are migrated before resolving accounts
-            self._get_sequence_data_migrated()
+        # Ensure org fields are migrated before resolving accounts
+        self._get_sequence_data_migrated()
 
-            # Resolve identifier
-            if not identifier.isdigit():
-                if not self._validate_email(identifier):
-                    raise ValidationError(f"Invalid email format: {identifier}")
+        # Resolve identifier
+        if not identifier.isdigit():
+            if not self._validate_email(identifier):
+                raise ValidationError(f"Invalid email format: {identifier}")
 
-                # For email identifiers, handle ambiguous matches interactively —
-                # except in JSON mode, where we never prompt. There we fall through
-                # to _resolve_account_identifier, which raises a ConfigError listing
-                # the matching slots (+ org labels) → structured error envelope.
-                if not json_output:
-                    data = self._get_sequence_data() or {}
-                    matches = [
-                        num for num, acc in data.get("accounts", {}).items()
-                        if acc.get("email") == identifier
-                    ]
-                    if len(matches) > 1:
-                        print(f"Multiple accounts found for '{identifier}':")
-                        for num in matches:
-                            acc = data["accounts"][num]
-                            tag = self._get_display_tag(
-                                acc.get("email", ""),
-                                acc.get("organizationName", ""),
-                                acc.get("organizationUuid", ""),
-                            )
-                            print(f"  {num}: {identifier} {muted(f'[{tag}]')}")
-                        choice = input("Enter account number to switch to: ").strip()
-                        if not choice.isdigit() or choice not in matches:
-                            print(dimmed("Cancelled"))
-                            return None
-                        identifier = choice
-
-            target_account = self._resolve_account_identifier(identifier)
-            if not target_account:
-                raise AccountNotFoundError(
-                    f"No account found with identifier: {identifier}"
-                )
-
-            data = self._get_sequence_data() or {}
-            if target_account not in data.get("accounts", {}):
-                raise AccountNotFoundError(f"Account-{target_account} does not exist")
-
-            # Short-circuit a no-op before mutating (issue #79). A self-switch
-            # would first back up the live credentials into the target slot —
-            # destroying a freshly imported backup with a possibly stale login —
-            # then read them straight back. It also re-writes credentials, takes
-            # the lock, and (on macOS) touches the Keychain for nothing. --force
-            # skips this guard on purpose: its job is to rewrite the live login
-            # from the stored backup.
-            if not force and data:
-                identity = self._get_current_account()
-                if identity is not None:
-                    cur_slot = self._find_account_slot(data, identity[0], identity[1])
-                    if cur_slot == target_account:
-                        email = (
-                            data.get("accounts", {}).get(target_account, {}).get("email", "")
+            # For email identifiers, handle ambiguous matches interactively —
+            # except in JSON mode, where we never prompt. There we fall through
+            # to _resolve_account_identifier, which raises a ConfigError listing
+            # the matching slots (+ org labels) → structured error envelope.
+            if not json_output:
+                data = self._get_sequence_data() or {}
+                matches = [
+                    num for num, acc in data.get("accounts", {}).items()
+                    if acc.get("email") == identifier
+                ]
+                if len(matches) > 1:
+                    print(f"Multiple accounts found for '{identifier}':")
+                    for num in matches:
+                        acc = data["accounts"][num]
+                        tag = self._get_display_tag(
+                            acc.get("email", ""),
+                            acc.get("organizationName", ""),
+                            acc.get("organizationUuid", ""),
                         )
-                        if not json_output:
-                            print(
-                                f"{accent('Already on')} Account-{target_account} ({email})"
-                            )
-                            print(dimmed(
-                                "To rewrite the live login from the stored backup "
-                                "(e.g. after --import), run: "
-                                f"cswap --switch-to {target_account} --force"
-                            ))
-                            return None
-                        ref = account_ref(int(target_account), email)
-                        return self._switch_noop(
-                            strategy="direct",
-                            reason="already-active",
-                            from_ref=ref,
-                            to_ref=ref,
-                            message=f"Already on Account-{target_account} ({email})",
-                        )
+                        print(f"  {num}: {identifier} {muted(f'[{tag}]')}")
+                    choice = input("Enter account number to switch to: ").strip()
+                    if not choice.isdigit() or choice not in matches:
+                        print(dimmed("Cancelled"))
+                        return None
+                    identifier = choice
 
-            op = self._perform_switch(
-                target_account, emit_output=not json_output, force_activate=force
+        target_account = self._resolve_account_identifier(identifier)
+        if not target_account:
+            raise AccountNotFoundError(
+                f"No account found with identifier: {identifier}"
             )
-            result = (
-                self._switch_result_from_op(op or {}, "direct") if json_output else None
+
+        data = self._get_sequence_data() or {}
+        if target_account not in data.get("accounts", {}):
+            raise AccountNotFoundError(f"Account-{target_account} does not exist")
+
+        # Short-circuit a no-op before mutating (issue #79). A self-switch
+        # would first back up the live credentials into the target slot —
+        # destroying a freshly imported backup with a possibly stale login —
+        # then read them straight back. It also re-writes credentials, takes
+        # the lock, and (on macOS) touches the Keychain for nothing. --force
+        # skips this guard on purpose: its job is to rewrite the live login
+        # from the stored backup.
+        if not force and data:
+            identity = self._get_current_account()
+            if identity is not None:
+                cur_slot = self._find_account_slot(data, identity[0], identity[1])
+                if cur_slot == target_account:
+                    email = (
+                        data.get("accounts", {}).get(target_account, {}).get("email", "")
+                    )
+                    if not json_output:
+                        print(
+                            f"{accent('Already on')} Account-{target_account} ({email})"
+                        )
+                        print(dimmed(
+                            "To rewrite the live login from the stored backup "
+                            "(e.g. after --import), run: "
+                            f"cswap --switch-to {target_account} --force"
+                        ))
+                        return None
+                    ref = account_ref(int(target_account), email)
+                    return self._switch_noop(
+                        strategy="direct",
+                        reason="already-active",
+                        from_ref=ref,
+                        to_ref=ref,
+                        message=f"Already on Account-{target_account} ({email})",
+                    )
+
+        op = self._perform_switch(
+            target_account, emit_output=not json_output, force_activate=force
+        )
+        result = (
+            self._switch_result_from_op(op or {}, "direct") if json_output else None
+        )
+        # A forced self-activation really rewrote the live credentials from the
+        # stored backup — "already-active" would misdescribe that mutation.
+        # A cross-slot force stays "switched": reason reports the outcome, not
+        # the skipped-backup mechanism.
+        if result is not None and force and not result["switched"]:
+            to = result["to"]
+            result["reason"] = "activated"
+            result["message"] = (
+                f"Activated Account-{to['number']} ({to['email']}) from stored backup"
             )
-            # A forced self-activation really rewrote the live credentials from the
-            # stored backup — "already-active" would misdescribe that mutation.
-            # A cross-slot force stays "switched": reason reports the outcome, not
-            # the skipped-backup mechanism.
-            if result is not None and force and not result["switched"]:
-                to = result["to"]
-                result["reason"] = "activated"
-                result["message"] = (
-                    f"Activated Account-{to['number']} ({to['email']}) from stored backup"
-                )
-            return result
+        return result
 
     def list_accounts(
         self,

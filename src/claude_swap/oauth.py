@@ -421,7 +421,7 @@ def _persist(
     *,
     persist_mandatory: bool = False,
 ) -> None:
-    """Call the persist callback, warning loudly on best-effort failure."""
+    """Call the persist callback, warning loudly on failure."""
     if not callback:
         return
     try:
