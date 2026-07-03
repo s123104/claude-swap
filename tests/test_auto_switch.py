@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -1441,6 +1442,48 @@ class TestMonitorPidLifecycle:
             assert monitor._tasklist_image(4242) == (True, None)
         with patch("claude_swap.monitor.subprocess.run", side_effect=OSError):
             assert monitor._tasklist_image(4242) == (False, None)
+
+    def test_tasklist_timeout_keeps_conservative_holder_bias(self):
+        # A hung tasklist (WMI-backed and able to stall forever) must map to
+        # "undeterminable" instead of wedging the supervised monitor at
+        # startup, where IgnoreNew would swallow every watchdog re-fire.
+        with patch(
+            "claude_swap.monitor.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd="tasklist", timeout=10),
+        ):
+            assert monitor._tasklist_image(4242) == (False, None)
+            assert monitor._pid_is_running_windows(4242) is True
+
+    def test_windows_cmdline_timeout_maps_to_undeterminable(self):
+        # (False, None) is the "query never ran" shape; the caller keeps the
+        # conservative holder bias for it (covered above).
+        with patch(
+            "claude_swap.monitor.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd="powershell", timeout=10),
+        ):
+            assert monitor._windows_cmdline(4242) == (False, None)
+
+    @pytest.mark.parametrize(
+        "probe",
+        [monitor._tasklist_image, monitor._windows_cmdline],
+    )
+    def test_windows_pid_probes_bounded_and_windowless(
+        self, monkeypatch: pytest.MonkeyPatch, probe
+    ):
+        # Simulate the win32-only constant so the flag plumbing is asserted on
+        # every platform; windows-latest exercises the real value.
+        monkeypatch.setattr(monitor, "_NO_WINDOW", 0x08000000)
+        captured: dict[str, object] = {}
+
+        def fake_run(argv, **kwargs):
+            captured.update(kwargs)
+            return MagicMock(returncode=0, stdout="")
+
+        with patch("claude_swap.monitor.subprocess.run", side_effect=fake_run):
+            probe(4242)
+
+        assert captured["timeout"] == monitor._WINDOWS_PID_PROBE_TIMEOUT
+        assert captured["creationflags"] == 0x08000000
 
     def test_run_cli_monitor_starts_when_pidfile_has_reused_pid(
         self,

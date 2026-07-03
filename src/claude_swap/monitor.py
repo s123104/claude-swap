@@ -798,6 +798,17 @@ def _pid_command(pid: int) -> str | None:
     return result.stdout.strip()
 
 
+# Bound the Windows PID probes: WMI (and a wedged tasklist) can hang
+# indefinitely (see models.Platform.detect), and a hung probe stalls the
+# supervised monitor at startup while Task Scheduler still counts it as
+# Running — IgnoreNew then swallows every watchdog re-fire, silently and
+# permanently. A timeout maps to "undeterminable" (conservative bias).
+_WINDOWS_PID_PROBE_TIMEOUT = 10
+# Keep probes from flashing a console window when the monitor runs under
+# pythonw (GUI subsystem); the constant only exists on Windows.
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
 def _tasklist_image(pid: int) -> tuple[bool, str | None]:
     """Query Windows ``tasklist`` for a PID.
 
@@ -811,8 +822,10 @@ def _tasklist_image(pid: int) -> tuple[bool, str | None]:
             capture_output=True,
             text=True,
             check=False,
+            timeout=_WINDOWS_PID_PROBE_TIMEOUT,
+            creationflags=_NO_WINDOW,
         )
-    except OSError:
+    except (OSError, subprocess.TimeoutExpired):
         return (False, None)
     if result.returncode != 0:
         return (False, None)
@@ -885,8 +898,10 @@ def _windows_cmdline(pid: int) -> tuple[bool, str | None]:
             capture_output=True,
             text=True,
             check=False,
+            timeout=_WINDOWS_PID_PROBE_TIMEOUT,
+            creationflags=_NO_WINDOW,
         )
-    except OSError:
+    except (OSError, subprocess.TimeoutExpired):
         return (False, None)
     if result.returncode != 0:
         return (False, None)
