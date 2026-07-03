@@ -314,6 +314,7 @@ def unset_setting(backup_root: Path, dotted_key: str) -> bool:
     section = raw.get(spec.section)
     if not isinstance(section, dict) or spec.json_key not in section:
         return False
+    raw["schemaVersion"] = raw.get("schemaVersion", SETTINGS_SCHEMA_VERSION)
     del section[spec.json_key]
     if not section:
         del raw[spec.section]

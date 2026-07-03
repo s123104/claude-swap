@@ -162,6 +162,14 @@ class TestSetUnsetSetting:
         raw = json.loads(settings_path(tmp_path).read_text())
         assert "autoswitch" not in raw
 
+    def test_unset_stamps_schema_version_on_unversioned_file(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(
+            json.dumps({"autoswitch": {"threshold": 80}})
+        )
+        assert unset_setting(tmp_path, "autoswitch.threshold") is True
+        raw = json.loads(settings_path(tmp_path).read_text())
+        assert raw["schemaVersion"] == 1
+
     def test_unset_absent_key_is_noop(self, tmp_path: Path):
         assert unset_setting(tmp_path, "autoswitch.threshold") is False
         assert not settings_path(tmp_path).exists()
