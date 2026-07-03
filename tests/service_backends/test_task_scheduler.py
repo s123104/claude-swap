@@ -102,6 +102,24 @@ class TestBuildTaskXml:
         # The repetition must live inside the trigger, not a Settings block.
         assert xml.index("<Repetition>") < xml.index("</LogonTrigger>")
 
+    def test_time_trigger_covers_the_install_session(self, temp_home: Path):
+        # A logon trigger's repetition only arms on an actual logon, and
+        # Start-ScheduledTask arms no trigger at all — so without this
+        # TimeTrigger a monitor dying in the install session (before the next
+        # logon) would never be pulled back.
+        switcher = ClaudeAccountSwitcher()
+        xml = ts_backend._build_task_xml(switcher)
+        assert "<LogonTrigger>" in xml
+        assert "<TimeTrigger>" in xml
+        time_trigger = xml[xml.index("<TimeTrigger>") : xml.index("</TimeTrigger>")]
+        # The repetition must live inside the TimeTrigger node, with no
+        # Duration so it repeats forever.
+        assert "<Repetition>" in time_trigger
+        assert "<Interval>PT5M</Interval>" in time_trigger
+        assert "<Duration>" not in time_trigger
+        assert "<StartBoundary>" in time_trigger
+        assert "<Enabled>true</Enabled>" in time_trigger
+
     def test_long_running_monitor_settings(self, temp_home: Path):
         # Schema defaults would kill the resident monitor: ExecutionTimeLimit
         # defaults to PT72H, and both battery settings default to true.

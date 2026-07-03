@@ -2,7 +2,7 @@
 
 The odd one out among the backends: Task Scheduler has no real supervisor
 semantics, so the task XML approximates them — the monitor's exit-75 retry
-rides a repeating logon trigger plus ``MultipleInstancesPolicy=IgnoreNew``,
+rides repeating logon and time triggers plus ``MultipleInstancesPolicy=IgnoreNew``,
 and the version stamp lives in ``RegistrationInfo/Version`` because the
 schema has no per-task environment variables. ``pythonw.exe`` keeps the
 hidden task from flashing a console window; the persisted XML under the
@@ -17,6 +17,7 @@ import re
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
+from datetime import datetime
 from pathlib import Path
 from xml.dom import minidom
 
@@ -111,6 +112,21 @@ def _build_task_xml(switcher: ServiceHost) -> str:
     ET.SubElement(repetition, f"{{{_TASK_NS}}}Interval").text = "PT5M"
     ET.SubElement(repetition, f"{{{_TASK_NS}}}StopAtDurationEnd").text = "false"
     ET.SubElement(logon, f"{{{_TASK_NS}}}Enabled").text = "true"
+    # The logon trigger's repetition only arms on an actual logon;
+    # Start-ScheduledTask (the install-time kick) arms no trigger at all, so
+    # in the install session a dead monitor would stay dead until the next
+    # logon — exactly when the exit-75 race is most likely. This TimeTrigger
+    # anchors the same 5-minute watchdog at install time (no Duration =
+    # repeats forever); Settings/StartWhenAvailable covers the boundary
+    # already being in the past once registration completes.
+    time_trigger = ET.SubElement(triggers, f"{{{_TASK_NS}}}TimeTrigger")
+    time_repetition = ET.SubElement(time_trigger, f"{{{_TASK_NS}}}Repetition")
+    ET.SubElement(time_repetition, f"{{{_TASK_NS}}}Interval").text = "PT5M"
+    ET.SubElement(time_repetition, f"{{{_TASK_NS}}}StopAtDurationEnd").text = "false"
+    ET.SubElement(time_trigger, f"{{{_TASK_NS}}}StartBoundary").text = (
+        datetime.now().replace(microsecond=0).isoformat()
+    )
+    ET.SubElement(time_trigger, f"{{{_TASK_NS}}}Enabled").text = "true"
 
     principals = ET.SubElement(root, f"{{{_TASK_NS}}}Principals")
     principal = ET.SubElement(
