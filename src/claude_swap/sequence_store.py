@@ -176,7 +176,7 @@ class SequenceData:
 
         Filters *every* matching entry from ``sequence`` (not just the first)
         so a corrupt array with duplicate slot ids can't leave a straggler —
-        matching the pre-extraction ``remove_account`` behaviour.
+        matching the pre-extraction ``remove_account`` behavior.
         """
         data = self._copy()
         num = int(account_num)

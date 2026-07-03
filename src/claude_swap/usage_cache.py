@@ -84,7 +84,7 @@ def _persist_usage_cache_entry(
     if isinstance(current, oauth.UsageFetchError):
         if prev_trusted is not None:
             # Keep showing the trusted prior usage, but do not drop a server
-            # Retry-After: stamp it as a side field so monitor backoff can honour
+            # Retry-After: stamp it as a side field so monitor backoff can honor
             # it even while a fresh-enough usage row masks the active error.
             # Always rewrite the side field from the *current* error so a stale
             # Retry-After from an earlier 429 cannot survive a later non-429

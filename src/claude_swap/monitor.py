@@ -62,7 +62,7 @@ MONITOR_POLL_NEAR_TRIGGER_RATIO = 0.95
 
 # Exponential backoff on consecutive usage-API failures.
 MONITOR_FAILURE_BACKOFF_BASE = MONITOR_POLL_SECONDS_MIN
-# Honour a server ``Retry-After`` up to this ceiling so a 429 cannot wedge the
+# Honor a server ``Retry-After`` up to this ceiling so a 429 cannot wedge the
 # monitor into a pathologically long sleep.
 MONITOR_RETRY_AFTER_CAP = 300
 
@@ -343,7 +343,7 @@ def _step_usage_unavailable(
         state.consecutive_failures, t_max=poll_seconds,
     )
     if retry_after is not None:
-        # A rate-limited fetch carries the server's own backoff window; honour
+        # A rate-limited fetch carries the server's own backoff window; honor
         # it (capped) rather than hammering the API on our shorter schedule.
         interval = max(interval, min(retry_after, MONITOR_RETRY_AFTER_CAP))
     log.warning(
@@ -723,7 +723,7 @@ def monitor_step(
     )
     # A trusted prior usage row can mask an active 429: get_active_usage_pct
     # then returns the stale pct (not None), so this path — not the
-    # usage-unavailable one — runs. Still honour the server's Retry-After
+    # usage-unavailable one — runs. Still honor the server's Retry-After
     # (capped) for any stay/hold interval so we don't poll through the window.
     retry_after = switcher.get_active_usage_retry_after()
     if retry_after is not None:
@@ -1109,7 +1109,7 @@ def run_cli_monitor(
         # ``service_mode`` is set by the ``--service-monitor`` argv flag that
         # service backends append to the supervised command line. The env var
         # is the legacy channel used by units installed before the flag
-        # existed; honour it so those keep retrying until reinstalled.
+        # existed; honor it so those keep retrying until reinstalled.
         if service_mode or os.environ.get(SERVICE_MONITOR_ENV_KEY) == "1":
             log.warning(
                 "service monitor found existing pid=%s; exiting retryable",

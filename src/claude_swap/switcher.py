@@ -1537,7 +1537,7 @@ class ClaudeAccountSwitcher:
               its limit (switching would not help) → stay
             - ``(None, "none")`` — no other switchable account exists
 
-            Ties (including current-vs-other) resolve in favour of staying put.
+            Ties (including current-vs-other) resolve in favor of staying put.
             Never raises on network failure.
             """
             from claude_swap.usage_policy import rank_slots
@@ -1973,7 +1973,7 @@ class ClaudeAccountSwitcher:
         """Server-supplied ``Retry-After`` (seconds) when the active account's
         usage fetch was rate-limited, else ``None``.
 
-        The monitor honours this server-specified backoff window on HTTP 429
+        The monitor honors this server-specified backoff window on HTTP 429
         instead of guessing with its own exponential failure backoff. Reads the
         cache-first usage entry, so it adds no extra network call after a poll.
 

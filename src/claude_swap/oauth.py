@@ -37,7 +37,7 @@ def parse_retry_after_seconds(value: str | None) -> int | None:
     """Parse a ``Retry-After`` header value into a positive number of seconds.
 
     Anthropic sends the delta-seconds form (e.g. ``"60"``); the HTTP-date form
-    is not honoured here. Returns ``None`` for absent, non-numeric, or
+    is not honored here. Returns ``None`` for absent, non-numeric, or
     non-positive values so callers fall back to their own backoff.
     """
     if not value:

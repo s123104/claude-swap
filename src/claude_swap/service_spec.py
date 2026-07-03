@@ -22,7 +22,7 @@ VERSION_ENV_KEY = "CSWAP_INSTALLED_VERSION"
 # Legacy service-mode channel. Current backends pass SERVICE_MONITOR_FLAG on
 # the supervised argv instead — Task Scheduler's XML schema has no per-task
 # environment variables, so an env var can never reach the monitor there.
-# The monitor still honours this key so services installed by older fork
+# The monitor still honors this key so services installed by older fork
 # versions keep their retry semantics until the user reinstalls (the
 # version-drift warning in ``warn_version_drift`` prompts exactly that).
 SERVICE_MONITOR_ENV_KEY = "CSWAP_SERVICE_MONITOR"
