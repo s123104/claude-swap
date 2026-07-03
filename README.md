@@ -277,6 +277,8 @@ cswap --import backup.cswap --force          # Overwrite existing
 
 The export file is plaintext JSON. If you need encryption, pipe through your tool of choice (e.g. `cswap --export - | gpg -c > backup.gpg`).
 
+If an imported account is the one you're currently logged in as, activate the imported credentials with `cswap --switch-to N --force` (a plain `--switch-to` of the current account is a safe no-op and won't touch the import).
+
 ### JSON output for scripting
 
 Add `--json` to `--list`, `--status`, `--switch`, or `--switch-to` to emit a single machine-readable JSON object on stdout (human-readable notices go to stderr). Useful for scripting auto-swap and quota tracking.

@@ -771,3 +771,18 @@ def import_accounts(
     _eprint(
         f"Done: {imported} imported, {overwritten} overwritten, {skipped} skipped"
     )
+
+    # If we just rewrote the stored backup for the account that is the current
+    # live login, a plain switch would back the (possibly stale) live
+    # credentials up over it (issue #79) — point at the explicit activation
+    # path instead.
+    written_slots = {write["target_num"] for write in completed_writes}
+    identity = switcher._get_current_account()
+    final = switcher._get_sequence_data()
+    if identity is not None and final is not None:
+        live_slot = switcher._find_account_slot(final, identity[0], identity[1])
+        if live_slot is not None and live_slot in written_slots:
+            _eprint(
+                f"Note: {identity[0]} is your current live login — activate the "
+                f"imported credentials with: cswap --switch-to {live_slot} --force"
+            )

@@ -1914,6 +1914,142 @@ class TestPerformSwitchPostDisplay:
         assert config_path.read_text() == original_config_text
 
 
+class TestSwitchToSelfSlotAndForce:
+    """Issue #79: --switch-to onto the active account must not back up the
+    live credentials into the target slot (destroying a freshly imported
+    backup); --force is the explicit stored-backup → live recovery path."""
+
+    _install_store_patches = staticmethod(
+        TestPerformSwitchPostDisplay._install_store_patches
+    )
+
+    IMPORTED_1 = json.dumps({
+        "claudeAiOauth": {
+            "accessToken": "sk-imported-1",
+            "refreshToken": "rt-imported-1",
+        },
+    })
+    LIVE_1 = json.dumps({
+        "claudeAiOauth": {
+            "accessToken": "sk-live-1",
+            "refreshToken": "rt-live-1",
+        },
+    })
+
+    def _post_import_state(self, temp_home, sample_sequence_data):
+        """Accounts 1 (active, live) & 2, with slot 1's stored backup holding
+        freshly imported credentials that differ from the (stale) live ones."""
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher.platform = Platform.LINUX
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+
+        (temp_home / ".claude" / ".credentials.json").write_text(self.LIVE_1)
+
+        creds_store = {
+            ("1", "test@example.com"): self.IMPORTED_1,
+            ("2", "account2@example.com"): json.dumps({
+                "claudeAiOauth": {
+                    "accessToken": "sk-2",
+                    "refreshToken": "rt-2",
+                },
+            }),
+        }
+        configs_store = {
+            ("1", "test@example.com"): json.dumps({
+                "oauthAccount": {
+                    "emailAddress": "test@example.com",
+                    "accountUuid": "test-uuid-1234",
+                },
+            }),
+            ("2", "account2@example.com"): json.dumps({
+                "oauthAccount": {
+                    "emailAddress": "account2@example.com",
+                    "accountUuid": "uuid-2",
+                },
+            }),
+        }
+        live_state = {"creds": self.LIVE_1}
+        return switcher, creds_store, configs_store, live_state
+
+    def test_switch_to_current_slot_is_noop_preserving_backup(
+        self,
+        temp_home: Path,
+        mock_claude_config: Path,
+        sample_sequence_data: dict,
+        capsys,
+    ):
+        """Human-mode self-switch neither poisons the stored backup nor
+        rewrites the live credentials. Against main this fails: the switch
+        backed up the live creds into slot 1 before reading them back."""
+        switcher, creds, configs, live = self._post_import_state(
+            temp_home, sample_sequence_data,
+        )
+        patches = self._install_store_patches(switcher, creds, configs, live)
+        try:
+            result = switcher.switch_to("1")
+        finally:
+            for p in patches:
+                p.stop()
+
+        assert result is None
+        assert creds[("1", "test@example.com")] == self.IMPORTED_1
+        assert live["creds"] == self.LIVE_1
+        out = capsys.readouterr().out
+        assert "Already on" in out and "Account-1" in out
+        assert "cswap --switch-to 1 --force" in out
+
+    def test_force_self_activation_restores_imported_creds(
+        self,
+        temp_home: Path,
+        mock_claude_config: Path,
+        sample_sequence_data: dict,
+        capsys,
+    ):
+        """--switch-to 1 --force rewrites the live login from the stored
+        backup without backing up the stale live creds first."""
+        switcher, creds, configs, live = self._post_import_state(
+            temp_home, sample_sequence_data,
+        )
+        patches = self._install_store_patches(switcher, creds, configs, live)
+        try:
+            result = switcher.switch_to("1", force=True)
+        finally:
+            for p in patches:
+                p.stop()
+
+        assert result is None
+        assert live["creds"] == self.IMPORTED_1
+        assert creds[("1", "test@example.com")] == self.IMPORTED_1
+        data = switcher._get_sequence_data()
+        assert data["activeAccountNumber"] == 1
+        assert "Activated" in capsys.readouterr().out
+
+    def test_force_cross_slot_skips_backup_of_current(
+        self,
+        temp_home: Path,
+        mock_claude_config: Path,
+        sample_sequence_data: dict,
+    ):
+        """--switch-to 2 --force lands on account 2 without writing the stale
+        live creds into slot 1's freshly imported backup."""
+        switcher, creds, configs, live = self._post_import_state(
+            temp_home, sample_sequence_data,
+        )
+        patches = self._install_store_patches(switcher, creds, configs, live)
+        try:
+            switcher.switch_to("2", force=True)
+        finally:
+            for p in patches:
+                p.stop()
+
+        assert creds[("1", "test@example.com")] == self.IMPORTED_1
+        assert json.loads(live["creds"])["claudeAiOauth"]["accessToken"] == "sk-2"
+        data = switcher._get_sequence_data()
+        assert data["activeAccountNumber"] == 2
+
+
 # ── Task 1: AccountInfo org fields ───────────────────────────────────────────
 
 class TestAccountInfoOrgFields:

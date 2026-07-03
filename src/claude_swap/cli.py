@@ -91,6 +91,31 @@ Examples:
         sys.exit(130)
 
 
+def _use_native_tls() -> None:
+    """Route TLS trust decisions through the OS-native verifier.
+
+    Claude's token endpoint (``platform.claude.com``) serves a Let's Encrypt
+    chain. Python's stdlib ``ssl`` uses OpenSSL, which on Windows loads the
+    system cert store as a flat set and matches CA certs by *subject name*, so a
+    stale, expired duplicate of an intermediate (e.g. an old ``ISRG Root X2``
+    left in the user's store) can shadow the valid path and fail verification
+    with "certificate has expired" even though the served chain is valid — which
+    silently breaks inactive-account token refresh. The OS-native verifiers
+    (SChannel on Windows, SecureTransport on macOS) build the chain correctly
+    and don't trip on the expired duplicate — the same reason Claude Code (Node,
+    with its own bundled roots) is unaffected. ``truststore`` delegates to them.
+
+    Best-effort: on any failure fall back to stdlib ``ssl`` rather than block
+    the CLI over a TLS-trust nicety.
+    """
+    try:
+        import truststore
+
+        truststore.inject_into_ssl()
+    except Exception:
+        pass
+
+
 def _service_command(argv: list[str]) -> None:
     """Handle `cswap service install|uninstall|status|logs`.
 
@@ -317,7 +342,11 @@ Examples:
     parser.add_argument(
         "--force",
         action="store_true",
-        help="Overwrite existing accounts during import",
+        help=(
+            "Overwrite existing accounts during import; with --switch-to, "
+            "activate the stored credentials without backing up the current "
+            "login first"
+        ),
     )
     parser.add_argument(
         "--full",
@@ -433,8 +462,8 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
         parser.error("--email can only be used with --add-token")
     if args.account is not None and not args.export:
         parser.error("--account can only be used with --export")
-    if args.force and not args.import_:
-        parser.error("--force can only be used with --import")
+    if args.force and not (args.import_ or args.switch_to):
+        parser.error("--force can only be used with --import or --switch-to")
     if args.full and not args.export:
         parser.error("--full can only be used with --export")
     if args.service_monitor and not args.monitor:
@@ -501,9 +530,9 @@ def _dispatch_action(
             )
         switcher.switch(strategy=args.strategy)
     elif args.switch_to:
-        if args.json:
-            return switcher.switch_to(args.switch_to, json_output=True)
-        switcher.switch_to(args.switch_to)
+        return switcher.switch_to(
+            args.switch_to, json_output=args.json, force=args.force
+        )
     elif args.status:
         if args.json:
             return switcher.status(json_output=True)
@@ -523,6 +552,7 @@ def _dispatch_action(
 
 def main() -> None:
     """Main entry point for the CLI."""
+    _use_native_tls()
     if len(sys.argv) > 1 and sys.argv[1] in _SUBCOMMANDS:
         # Subcommands return only in tests where exec/sys.exit is mocked.
         globals()[_SUBCOMMANDS[sys.argv[1]]](sys.argv[2:])

@@ -364,6 +364,54 @@ class TestSwitchJson:
         assert result["reason"] == "already-active"
         assert result["from"] == result["to"] == {"number": 1, "email": "test@example.com"}
 
+    def test_switch_to_force_self_activation_reports_activated(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict, capsys,
+    ):
+        """--switch-to <current> --force rewrites creds from the stored backup:
+        switched stays identity-based (false) but reason says 'activated'."""
+        switcher, creds, configs, live = _two_account_stores(temp_home, sample_sequence_data)
+        creds[("1", "test@example.com")] = json.dumps(
+            {"claudeAiOauth": {"accessToken": "sk-imported-1", "refreshToken": "rt-imported-1"}}
+        )
+        patches = _install_patches(switcher, creds, configs, live)
+        try:
+            result = switcher.switch_to("1", json_output=True, force=True)
+        finally:
+            for p in patches:
+                p.stop()
+
+        assert capsys.readouterr().out == ""
+        assert result["switched"] is False
+        assert result["reason"] == "activated"
+        assert result["from"] == result["to"] == {"number": 1, "email": "test@example.com"}
+        assert result["message"].startswith("Activated Account-1")
+        # The live login was really rewritten from the stored backup.
+        assert json.loads(live["creds"])["claudeAiOauth"]["accessToken"] == "sk-imported-1"
+
+    def test_switch_to_force_cross_slot_reports_switched(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict, capsys,
+    ):
+        """A cross-slot force is a real switch; reason reports the outcome,
+        not the skipped-backup mechanism."""
+        switcher, creds, configs, live = _two_account_stores(temp_home, sample_sequence_data)
+        slot1_before = creds[("1", "test@example.com")]
+        patches = _install_patches(switcher, creds, configs, live)
+        try:
+            result = switcher.switch_to("2", json_output=True, force=True)
+        finally:
+            for p in patches:
+                p.stop()
+
+        assert capsys.readouterr().out == ""
+        assert result["switched"] is True
+        assert result["reason"] == "switched"
+        assert result["from"] == {"number": 1, "email": "test@example.com"}
+        assert result["to"] == {"number": 2, "email": "account2@example.com"}
+        # Backup-current was skipped: slot 1's stored creds are untouched.
+        assert creds[("1", "test@example.com")] == slot1_before
+
     def test_noop_from_equals_to(
         self, temp_home: Path, mock_claude_config: Path,
     ):

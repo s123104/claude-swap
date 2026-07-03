@@ -146,7 +146,7 @@ class TestCLI:
         """--list --token-status should call list_accounts(show_token_status=True)."""
         with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
              patch.object(sys, "argv", ["claude-swap", "--list", "--token-status"]), \
-             patch("os.geteuid", return_value=1000), \
+             patch("os.geteuid", return_value=1000, create=True), \
              patch("claude_swap.update_check.check_for_update", return_value=None):
             cli.main()
 
@@ -184,7 +184,7 @@ class TestCLI:
         """--switch --strategy best forwards the strategy to switch()."""
         with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
              patch.object(sys, "argv", ["claude-swap", "--switch", "--strategy", "best"]), \
-             patch("os.geteuid", return_value=1000), \
+             patch("os.geteuid", return_value=1000, create=True), \
              patch("claude_swap.update_check.check_for_update", return_value=None):
             cli.main()
 
@@ -195,7 +195,7 @@ class TestCLI:
         """Bare --switch forwards strategy=None."""
         with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
              patch.object(sys, "argv", ["claude-swap", "--switch"]), \
-             patch("os.geteuid", return_value=1000), \
+             patch("os.geteuid", return_value=1000, create=True), \
              patch("claude_swap.update_check.check_for_update", return_value=None):
             cli.main()
 
@@ -276,13 +276,40 @@ class TestCLI:
         assert excinfo.value.code == 2
         assert "--account can only be used with --export" in capsys.readouterr().err
 
-    def test_force_flag_requires_import(self, capsys):
-        """--force should only be accepted alongside --import."""
+    def test_force_flag_requires_import_or_switch_to(self, capsys):
+        """--force should only be accepted alongside --import or --switch-to."""
         with patch.object(sys, "argv", ["claude-swap", "--list", "--force"]):
             with pytest.raises(SystemExit) as excinfo:
                 cli.main()
         assert excinfo.value.code == 2
-        assert "--force can only be used with --import" in capsys.readouterr().err
+        assert (
+            "--force can only be used with --import or --switch-to"
+            in capsys.readouterr().err
+        )
+
+    def test_switch_to_force_forwarded(self):
+        """--switch-to 2 --force forwards force=True to switch_to()."""
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch.object(sys, "argv", ["claude-swap", "--switch-to", "2", "--force"]), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            cli.main()
+
+        switcher_cls.return_value.switch_to.assert_called_once_with(
+            "2", json_output=False, force=True
+        )
+
+    def test_switch_to_without_force_forwards_false(self):
+        """Plain --switch-to forwards force=False."""
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch.object(sys, "argv", ["claude-swap", "--switch-to", "2"]), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            cli.main()
+
+        switcher_cls.return_value.switch_to.assert_called_once_with(
+            "2", json_output=False, force=False
+        )
 
     def test_export_and_import_are_mutually_exclusive(self):
         """--export and --import cannot be combined."""
@@ -321,7 +348,7 @@ class TestCLI:
              patch.object(
                  sys, "argv", ["claude-swap", "--export", "/tmp/x", "--account", "2"]
              ), \
-             patch("os.geteuid", return_value=1000), \
+             patch("os.geteuid", return_value=1000, create=True), \
              patch("claude_swap.update_check.check_for_update", return_value=None):
             cli.main()
         export_fn.assert_called_once_with(
@@ -343,7 +370,7 @@ class TestCLI:
              patch.object(
                  sys, "argv", ["claude-swap", "--export", "/tmp/x", "--full"]
              ), \
-             patch("os.geteuid", return_value=1000), \
+             patch("os.geteuid", return_value=1000, create=True), \
              patch("claude_swap.update_check.check_for_update", return_value=None):
             cli.main()
         export_fn.assert_called_once_with(
@@ -357,7 +384,7 @@ class TestCLI:
              patch.object(
                  sys, "argv", ["claude-swap", "--import", "/tmp/x", "--force"]
              ), \
-             patch("os.geteuid", return_value=1000), \
+             patch("os.geteuid", return_value=1000, create=True), \
              patch("claude_swap.update_check.check_for_update", return_value=None):
             cli.main()
         import_fn.assert_called_once_with(
@@ -497,7 +524,7 @@ class TestRunCommand:
 
         with patch("claude_swap.session.SessionManager", FakeSessionManager), \
              patch("claude_swap.cli.ClaudeAccountSwitcher"), \
-             patch("os.geteuid", return_value=1000), \
+             patch("os.geteuid", return_value=1000, create=True), \
              patch.object(sys, "argv", ["claude-swap", *argv]):
             cli.main()
         return calls
@@ -566,7 +593,7 @@ class TestRunCommand:
 
         with patch("claude_swap.session.SessionManager", FailingSessionManager), \
              patch("claude_swap.cli.ClaudeAccountSwitcher"), \
-             patch("os.geteuid", return_value=1000), \
+             patch("os.geteuid", return_value=1000, create=True), \
              patch.object(sys, "argv", ["claude-swap", "run", "2"]):
             with pytest.raises(SystemExit) as excinfo:
                 cli.main()
@@ -716,7 +743,7 @@ class TestJsonOutputCli:
         payload = {"schemaVersion": 1, "activeAccountNumber": None, "accounts": []}
         with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
              patch.object(sys, "argv", ["claude-swap", "--list", "--json"]), \
-             patch("os.geteuid", return_value=1000), \
+             patch("os.geteuid", return_value=1000, create=True), \
              patch("claude_swap.update_check.check_for_update", return_value=None):
             switcher_cls.return_value.list_accounts.return_value = payload
             cli.main()
@@ -731,7 +758,7 @@ class TestJsonOutputCli:
         payload = {"schemaVersion": 1, "switched": True}
         with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
              patch.object(sys, "argv", ["claude-swap", "--switch", "--json"]), \
-             patch("os.geteuid", return_value=1000), \
+             patch("os.geteuid", return_value=1000, create=True), \
              patch("claude_swap.update_check.check_for_update", return_value=None):
             switcher_cls.return_value.switch.return_value = payload
             cli.main()
@@ -746,7 +773,7 @@ class TestJsonOutputCli:
 
         with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
              patch.object(sys, "argv", ["claude-swap", "--status", "--json"]), \
-             patch("os.geteuid", return_value=1000), \
+             patch("os.geteuid", return_value=1000, create=True), \
              patch("claude_swap.update_check.check_for_update", return_value=None):
             switcher_cls.return_value.status.side_effect = ConfigError("nope")
             with pytest.raises(SystemExit) as excinfo:

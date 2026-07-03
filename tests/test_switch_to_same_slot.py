@@ -1,11 +1,12 @@
-"""Same-slot ``--switch-to`` must be a no-op in human mode too (upstream #79).
+"""Boundary tests for the same-slot ``--switch-to`` no-op (upstream #79).
 
-After ``cswap --import backup.cswap --force`` the slot holds fresh credentials
-while the live keychain may still hold broken ones for the same identity. A
-human-mode ``--switch-to`` onto that slot used to run the full swap, whose
-backup step overwrote the freshly imported slot credentials with the live
-(possibly broken) ones. These tests pin the no-op short-circuit for human
-mode and its boundaries.
+Upstream's fix (acb0644) makes a self-switch a no-op in both modes and adds
+``--force`` as the explicit stored-backup → live recovery path; its core
+behavior is pinned by ``TestSwitchToSelfSlotAndForce`` in test_switcher.py.
+This module keeps only the boundaries upstream does not cover: the guard
+short-circuits *before* ``_perform_switch``, keys off the live identity (not
+a drifted ``activeAccountNumber``), and never swallows a genuine cross-slot
+switch.
 """
 
 from __future__ import annotations
@@ -97,31 +98,6 @@ def _post_import_switcher(temp_home: Path, sample_sequence_data: dict):
 
 
 class TestHumanModeSameSlotNoop:
-    def test_same_slot_preserves_imported_slot_credentials(
-        self,
-        temp_home: Path,
-        mock_claude_config: Path,
-        sample_sequence_data: dict,
-        capsys,
-    ):
-        """Human-mode same-slot switch-to must not overwrite the slot backup."""
-        switcher, creds_store, live_state, patches = _post_import_switcher(
-            temp_home, sample_sequence_data
-        )
-        for p in patches:
-            p.start()
-        try:
-            result = switcher.switch_to("1", json_output=False)
-        finally:
-            for p in patches:
-                p.stop()
-
-        assert result is None
-        # The imported slot credentials survive; live is untouched.
-        assert creds_store[("1", "test@example.com")] == GOOD_SLOT_CREDS
-        assert live_state["creds"] == BAD_LIVE_CREDS
-        assert "Already on Account-1 (test@example.com)" in capsys.readouterr().out
-
     def test_same_slot_short_circuits_before_perform_switch(
         self,
         temp_home: Path,
@@ -168,7 +144,9 @@ class TestHumanModeSameSlotNoop:
         assert result is None
         assert creds_store[("1", "test@example.com")] == GOOD_SLOT_CREDS
         assert live_state["creds"] == BAD_LIVE_CREDS
-        assert "Already on Account-1 (test@example.com)" in capsys.readouterr().out
+        out = capsys.readouterr().out
+        assert "Already on" in out and "Account-1" in out
+        assert "cswap --switch-to 1 --force" in out
 
     def test_different_slot_still_performs_full_swap(
         self,

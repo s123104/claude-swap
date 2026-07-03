@@ -62,12 +62,8 @@ jobs:
             --ignore=tests/test_macos_keychain.py \
             --ignore=tests/test_macos_keychain_contract.py
 
-  windows:
+  test-windows:
     runs-on: windows-latest
-    # Informational until the POSIX-only tests (file-mode asserts, signals) are
-    # guarded for win32. Non-blocking so it surfaces real Windows failures
-    # without gating merges; promote into the matrix above once green.
-    continue-on-error: true
 
     steps:
       - uses: actions/checkout@v4
@@ -77,16 +73,17 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@v5
-        with:
-          enable-cache: true
-
       - name: Install dependencies
-        run: uv sync --all-groups --locked
+        # Single pip invocation so a failure fails the step regardless of the
+        # default Windows shell (pwsh only checks the last command's exit code).
+        run: pip install -e . pytest
 
-      - name: Run tests (informational)
-        run: uv run pytest -q -p no:cacheprovider
+      - name: Run tests
+        # curses ships with CPython on Linux/macOS but not on stock Windows, so
+        # the TUI tests skip here (they run on the Ubuntu job). Everything else
+        # — the cross-platform CLI, session, and process-detection paths — must
+        # pass, which is what catches Windows-only regressions.
+        run: pytest
 
   macos-keychain:
     runs-on: macos-latest
