@@ -6,8 +6,41 @@ Release version is defined in `pyproject.toml` (currently `0.15.1+haotool.1`).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Rotated OAuth tokens survive a wedged lock holder:** when persisting a
+  just-refreshed single-use token cannot take the file lock within its 30s
+  budget, the rotation is parked in a slot-tagged, owner-only pending file
+  next to the backup and applied automatically by the next list/status/switch
+  pass over the slot. A re-login or import that lands after the park wins over
+  the parked rotation. Previously the token was dropped with only a log
+  record, degrading the slot to manual re-login.
+
 ### Changed
 
+- **mypy config collapsed to global strict:** the per-module override list is
+  gone; the config-driven run (pre-commit) now enforces exactly what CI does.
+  Internal only — no behavior change.
+- **Docs drift fixed:** README/CHANGELOG version strings track `pyproject.toml`
+  again, CONTRIBUTING's mypy notes match the strict config, and the
+  upstream-sync doc points at the `converge/*` branch flow.
+- **Test hardening:** the `--import` rollback failure matrix and the service
+  backends' status/logs/error surfaces are now covered (transfer 84% → 95%;
+  launchd/systemd/task_scheduler 98–100% line coverage).
+
+## [0.15.1+haotool.1] — 2026-07-03
+
+### Changed
+
+- **Upstream v0.15.1 merged** (plus upstream `main` as of 2026-07-03):
+  - OS-native TLS trust via `truststore` (upstream #78), fixing
+    inactive-account token refresh behind corporate/AV-intercepted TLS,
+    which the fork's background monitor is especially exposed to.
+  - `--switch-to` onto the current account is a no-op; `--force` restores the
+    stored credentials over the live login (upstream #79 design, superseding
+    the fork's interim same-slot guard). `--import` over the live login now
+    hints at `--switch-to <slot> --force`.
+  - Upstream Windows test fixes adopted; the Windows CI job is now blocking.
 - **`SequenceStore` extracted:** `sequence.json` state is now a typed, immutable
   model (`SequenceData` / `AccountRecord` / `AutoSwitchConfig`) behind a
   lock-agnostic store, replacing raw-dict access throughout the account
@@ -23,6 +56,47 @@ Release version is defined in `pyproject.toml` (currently `0.15.1+haotool.1`).
   (a `_RotationParams` TypedDict, precondition None-narrowing, and `curses.window`
   annotations), removing the last `ignore_errors` entry — all 35 modules now pass
   `mypy --strict`. Typing only — no behavior change.
+- **Switch paths converged:** the CLI strategy dispatch and the switcher now
+  share one switch-decision implementation, and four test-only shims were
+  removed from production code. Internal refactor — no behavior change.
+
+### Fixed
+
+- **Cross-account backup poisoning on macOS:** an active-credential read that
+  fell back to a leftover plaintext file while the Keychain was locked is
+  classified as degraded and is never synced into the active slot's backup —
+  the file may hold another account's tokens.
+- **`--import --force` onto the active slot** is no longer silently undone by
+  the next `--list`/`--status` live→backup sync: the sync skips when the
+  backup is at least as new as the live credential (import-wins, #79
+  semantics).
+- **Rotated single-use tokens under lock contention:** the persist waits out
+  legitimate lock holders (30s budget) and re-checks the slot's refresh-token
+  lineage under the lock, so contention no longer drops the only working
+  credential and a mid-refresh re-login is never clobbered.
+- **Monitor PID-file acquisition race:** the stale-file path re-verifies the
+  PID file still holds the dead PID before unlinking it, so two monitors can
+  no longer both win the singleton; the PID holder is identified by an argv
+  fingerprint instead of loose substrings, eliminating recycled-PID false
+  positives.
+- **Windows Task Scheduler service:** the task XML drops the schema-invalid
+  `EnvironmentVariables` block (service mode travels on argv), overrides the
+  hostile schema defaults (72h `ExecutionTimeLimit`, battery kill switches),
+  and repeats the logon trigger every five minutes with `IgnoreNew` so a dead
+  monitor is restarted while a healthy one is never disturbed.
+- **WSL keepalive guidance** now suggests `dbus-launch true` — a command that
+  actually leaves a resident process holding the WSL instance open.
+- **Usage cache after account removal:** removing a slot reclaims its
+  `usage.json` row, and cache freshness compares the managed subset instead of
+  requiring exact key-set equality — the 15s TTL cache works again after any
+  removal, and the auto-switch refresh gate no longer refetches
+  already-answered slots every cycle.
+- **Keychain-unavailable classification** is preserved across the list/status
+  facades, so a locked Keychain shows as unavailable instead of
+  "no credentials".
+- **Credential write verification** checks the store the write actually landed
+  on, and `add_account` re-resolves the slot under the lock; the OAuth
+  User-Agent is bound to the package version.
 
 ## [0.15.0b2+haotool.1] — 2026-06-28
 
