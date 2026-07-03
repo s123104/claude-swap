@@ -46,6 +46,11 @@ from claude_swap.switcher import ClaudeAccountSwitcher, auto_switch_display
 _MIN_ROWS = 12
 _MIN_COLS = 60
 
+
+# --- ANSI → curses style mapping -------------------------------------------
+# printer.py emits a fixed, small set of SGR codes. We tokenize captured output
+# into our own style bitflags (parse-time, curses-free) and resolve them to
+# curses attributes at draw time (_style_to_attr), after initscr().
 _STYLE_BOLD = 1
 _STYLE_DIM = 2
 _STYLE_RED = 4
@@ -70,7 +75,12 @@ CursesWindow = curses.window
 
 
 def _ansi_segments(text: str) -> list[tuple[str, int]]:
-    """Split a line into ``(visible_text, style_flags)`` runs."""
+    """Split a single line into ``(visible_text, style_flags)`` runs.
+
+    Escape sequences are removed from the visible text. Unknown SGR codes are
+    ignored. A reset (``0`` or empty) clears all flags. Plain text returns a
+    single ``(text, 0)`` run; an empty string returns ``[("", 0)]``.
+    """
     segments: list[tuple[str, int]] = []
     flags = 0
     pos = 0
@@ -93,6 +103,7 @@ def _clamp_interval(n: int, lo: int = 1, hi: int = 60) -> int:
     return max(lo, min(hi, n))
 
 
+# Curses color pair numbers (initialized lazily by _init_colors).
 _PAIR_RED = 1
 _PAIR_YELLOW = 2
 _PAIR_ACCENT = 3
@@ -175,9 +186,13 @@ def run(switcher: ClaudeAccountSwitcher) -> int:
         return 0
 
 
+# ---------------------------------------------------------------------------
 # Main menu loop
+# ---------------------------------------------------------------------------
+
+
 class _ExitRequested(Exception):
-    """Control-flow signal to exit the curses wrapper cleanly (not a user error)."""
+    """Internal signal to break out of the curses loop."""
 
 
 def _main_loop(stdscr: CursesWindow, switcher: ClaudeAccountSwitcher) -> int:
@@ -248,7 +263,11 @@ def _main_loop(stdscr: CursesWindow, switcher: ClaudeAccountSwitcher) -> int:
             _show_message(stdscr, "Operation cancelled.")
 
 
+# ---------------------------------------------------------------------------
 # Sub-flows
+# ---------------------------------------------------------------------------
+
+
 def _do_switch(stdscr: CursesWindow, switcher: ClaudeAccountSwitcher) -> None:
     items = _account_items(switcher)
     if not items:
@@ -304,8 +323,7 @@ def _do_remove(stdscr: CursesWindow, switcher: ClaudeAccountSwitcher) -> None:
     if not _confirm(stdscr, f"Remove account {choice}? Type 'y' to confirm: "):
         return
     _run_inline(
-        stdscr,
-        "Remove account",
+        stdscr, "Remove account",
         lambda: switcher.remove_account(choice, assume_yes=True),
     )
 
@@ -336,7 +354,7 @@ def _watch_loop(
     stdscr: CursesWindow, switcher: ClaudeAccountSwitcher, interval: int = 5,
 ) -> None:
     """Re-capture ``list_accounts()`` every ``interval`` seconds and redraw."""
-    stdscr.timeout(250)
+    stdscr.timeout(250)  # non-blocking getch, 250ms tick
     try:
         last_refresh = 0.0
         body: list[str] = []
@@ -344,7 +362,7 @@ def _watch_loop(
             now = time.monotonic()
             if now - last_refresh >= interval:
                 body = _capture(lambda: switcher.list_accounts()).splitlines()
-                now = time.monotonic()
+                now = time.monotonic()  # recompute after the (possibly slow) fetch
                 last_refresh = now
 
             stdscr.erase()
@@ -370,14 +388,14 @@ def _watch_loop(
             key = stdscr.getch()
             if key in (ord("q"), 27):
                 return
-            if key in (ord("+"), ord("=")):
+            elif key in (ord("+"), ord("=")):
                 interval = _clamp_interval(interval + 1)
             elif key in (ord("-"), ord("_")):
                 interval = _clamp_interval(interval - 1)
             elif key == ord("r"):
                 last_refresh = 0.0
     finally:
-        stdscr.timeout(-1)
+        stdscr.timeout(-1)  # restore blocking input
 
 
 # Auto-switch flow
@@ -613,7 +631,11 @@ def _draw_monitor(
     stdscr.refresh()
 
 
+# ---------------------------------------------------------------------------
 # Helpers
+# ---------------------------------------------------------------------------
+
+
 def _status_line(switcher: ClaudeAccountSwitcher) -> str:
     """Compact one-liner: 'Active: email [org] · N managed'. Pure-local, no network."""
     seq = switcher._get_sequence_data() or {}
@@ -687,7 +709,11 @@ def _account_items(switcher: ClaudeAccountSwitcher) -> list[tuple[str, str | Non
     return items
 
 
+# ---------------------------------------------------------------------------
 # Curses primitives — kept thin so we can mock them in tests
+# ---------------------------------------------------------------------------
+
+
 def _select_from(
     stdscr: CursesWindow,
     title: str,
@@ -797,12 +823,6 @@ def _show_message(stdscr: CursesWindow, msg: str, is_error: bool = False) -> Non
     stdscr.getch()
 
 
-def _draw_header(stdscr: CursesWindow, title: str, subtitle: str, cols: int) -> None:
-    stdscr.addstr(1, 2, title[: cols - 4], curses.A_BOLD)
-    if subtitle:
-        stdscr.addstr(2, 2, subtitle[: cols - 4], curses.A_DIM)
-
-
 def _pager(
     stdscr: CursesWindow, title: str, lines: list[str], subtitle: str = "",
 ) -> None:
@@ -813,7 +833,7 @@ def _pager(
         rows, cols = stdscr.getmaxyx()
         _draw_header(stdscr, title, subtitle, cols)
         body_top = 4
-        body_height = max(1, rows - body_top - 1)
+        body_height = max(1, rows - body_top - 1)  # reserve the footer row
         max_top = max(0, len(lines) - body_height)
         top = min(top, max_top)
         for i in range(body_height):
@@ -844,6 +864,12 @@ def _pager(
             top = max_top
         elif key in (curses.KEY_ENTER, 10, 13, 27, ord("q")):
             return
+
+
+def _draw_header(stdscr: CursesWindow, title: str, subtitle: str, cols: int) -> None:
+    stdscr.addstr(1, 2, title[: cols - 4], curses.A_BOLD)
+    if subtitle:
+        stdscr.addstr(2, 2, subtitle[: cols - 4], curses.A_DIM)
 
 
 def _capture(fn: Callable[..., Any]) -> str:

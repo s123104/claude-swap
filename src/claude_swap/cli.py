@@ -466,24 +466,35 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
     """Enforce cross-flag constraints argparse cannot express directly."""
     if args.token_status and not (args.list or args.health):
         parser.error("--token-status can only be used with --list or --health")
+
     if args.json and not (args.list or args.status or args.switch or args.switch_to):
         parser.error(
             "--json can only be used with --list, --status, --switch, or --switch-to"
         )
+
     if args.json and args.token_status:
+        # Token status is not part of the JSON v1 schema; reject rather than
+        # silently ignore it (a future additive field can add it).
         parser.error("--token-status cannot be combined with --json")
+
     if args.strategy is not None and not args.switch:
         parser.error("--strategy can only be used with --switch")
+
     if args.slot is not None and not (args.add_account or args.add_token is not None):
         parser.error("--slot can only be used with --add-account or --add-token")
+
     if args.email is not None and args.add_token is None:
         parser.error("--email can only be used with --add-token")
+
     if args.account is not None and not args.export:
         parser.error("--account can only be used with --export")
+
     if args.force and not (args.import_ or args.switch_to):
         parser.error("--force can only be used with --import or --switch-to")
+
     if args.full and not args.export:
         parser.error("--full can only be used with --export")
+
     if args.service_monitor and not args.monitor:
         parser.error("--service-monitor can only be used with --monitor")
 
@@ -528,7 +539,9 @@ def _dispatch_action(
         switcher.add_account(slot=args.slot)
     elif args.add_token is not None:
         switcher.add_account_from_token(
-            token=args.add_token, email=args.email, slot=args.slot
+            token=args.add_token,
+            email=args.email,
+            slot=args.slot,
         )
     elif args.remove_account:
         switcher.remove_account(args.remove_account)
@@ -595,6 +608,8 @@ def main() -> None:
     # init-time failures (e.g. MigrationError on a backup-dir collision)
     # are presented like every other ClaudeSwitchError: clean stderr line,
     # exit 1, no traceback.
+    # JSON-capable commands return a payload; the CLI is the single point that
+    # serializes it (so no command writes JSON to stdout itself).
     try:
         switcher = ClaudeAccountSwitcher(debug=args.debug)
 
@@ -606,12 +621,16 @@ def main() -> None:
 
         payload = _dispatch_action(switcher, args)
     except ClaudeSwitchError as e:
+        # In JSON mode keep stdout pure JSON: emit the structured error envelope
+        # there (exit 1) instead of a red stderr line.
         if args.json:
             print(json.dumps(error_envelope(e), indent=2))
         else:
             error(f"Error: {e}")
         sys.exit(1)
     except KeyboardInterrupt:
+        # Route the cancellation note to stderr in JSON mode so stdout stays
+        # parseable (the guarantee covers completion / handled errors, not Ctrl-C).
         print(
             f"\n{dimmed('Operation cancelled')}",
             file=sys.stderr if args.json else sys.stdout,

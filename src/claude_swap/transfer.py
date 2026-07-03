@@ -17,12 +17,12 @@ from typing import TYPE_CHECKING, Any
 
 from claude_swap import __version__
 from claude_swap.credentials import looks_like_api_key
-from claude_swap.locking import FileLock
 from claude_swap.exceptions import (
     ConfigError,
     CredentialReadError,
     TransferError,
 )
+from claude_swap.locking import FileLock
 from claude_swap.models import Platform, get_timestamp
 
 if TYPE_CHECKING:
@@ -469,6 +469,8 @@ def _read_import_envelope(source: str) -> dict[str, Any]:
 def _normalize_import_accounts(
     switcher: ClaudeAccountSwitcher, accounts: list[Any]
 ) -> list[dict[str, Any]]:
+    # Pass 1: validate every account before any writes. A malformed account
+    # later in the list must not leave earlier accounts half-imported.
     normalized: list[dict[str, Any]] = []
     seen_keys: set[tuple[str, str]] = set()
     for raw in accounts:
@@ -478,6 +480,8 @@ def _normalize_import_accounts(
         config_obj = raw.get("config")
         if not isinstance(config_obj, dict):
             raise TransferError(f"config for {email} must be a JSON object")
+        # API-key accounts carry the credential as a raw string; OAuth accounts
+        # carry a JSON object.
         is_api_key = raw.get("kind") == "api_key" or (
             isinstance(creds_obj, str) and looks_like_api_key(creds_obj)
         )
@@ -692,6 +696,11 @@ def _import_one_entry(
 def _finalize_import_active_slot(
     switcher: ClaudeAccountSwitcher, resolved_active_slot: str | None
 ) -> None:
+    # Migration UX: if the destination has no recorded active account
+    # (clean home, no prior preference), seed activeAccountNumber from the
+    # *resolved* slot of the envelope's active account — not the envelope's
+    # raw slot number, which may already be occupied locally by an unrelated
+    # account. If the user already has an active selection locally, leave it.
     final = switcher._get_sequence_data()
     if (
         final is not None
@@ -723,6 +732,8 @@ def import_accounts(
     envelope = _read_import_envelope(source)
     normalized = _normalize_import_accounts(switcher, envelope["accounts"])
 
+    # Pass 2: writes. Validation is complete; remaining failures (disk I/O,
+    # keyring) are environmental and don't reflect on the file's integrity.
     switcher._setup_directories()
     switcher._init_sequence_file()
 
@@ -730,6 +741,10 @@ def import_accounts(
     skipped = 0
     overwritten = 0
 
+    # Track where the envelope's active account ended up locally. We can't
+    # just look up envelope_active in the final account map afterwards: the
+    # destination may already have an unrelated account at that slot number,
+    # while the envelope's active account got allocated to a different slot.
     envelope_active = envelope.get("activeAccountNumber")
     envelope_active_str = (
         str(envelope_active) if isinstance(envelope_active, int) else None
