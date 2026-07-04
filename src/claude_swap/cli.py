@@ -16,6 +16,76 @@ from claude_swap.printer import dimmed, error, muted
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 
+def _prog_name() -> str:
+    """The command name to show in usage/help.
+
+    argparse otherwise defaults to ``os.path.basename(sys.argv[0])``, which for
+    an installed entry-point shim renders as an ugly absolute path (e.g.
+    ``python.exe C:\\Users\\me\\.local\\bin\\cswap``). We strip that down to the
+    bare command the user typed (``cswap`` / ``claude-swap``), falling back to
+    ``cswap`` for ``python -m claude_swap`` and odd launchers.
+    """
+    name = os.path.basename(sys.argv[0] or "")
+    for ext in (".exe", ".pyw", ".py"):
+        if name.lower().endswith(ext):
+            name = name[: -len(ext)]
+            break
+    if not name or name in {"__main__", "python", "python3", "py"}:
+        return "cswap"
+    return name
+
+
+# Memorable subcommand aliases → the long-standing flags they expand to. Lets
+# users type `cswap list`, `cswap status`, `cswap add`, etc. instead of `--list`
+# / `--status` / `--add-account`, which all still work. `switch` is special-cased
+# below (a bare `switch` rotates; `switch <target>` jumps to one account) and
+# `run`/`auto` keep their own pre-dispatch parsers, so none of those are listed here.
+_SUBCOMMAND_FLAGS = {
+    "help": "--help",
+    "list": "--list",
+    "ls": "--list",
+    "status": "--status",
+    "add": "--add-account",
+    "add-token": "--add-token",
+    "remove": "--remove-account",
+    "rm": "--remove-account",
+    "export": "--export",
+    "import": "--import",
+    "purge": "--purge",
+    "upgrade": "--upgrade",
+    "update": "--upgrade",
+    "tui": "--tui",
+}
+
+
+def _translate_subcommand(argv: list[str]) -> list[str]:
+    """Rewrite a leading memorable subcommand into the equivalent flag argv.
+
+    ``argv`` is the args after the program name. The rewrite only fires when the
+    first token is a recognized verb (which never starts with '-'), so the
+    established ``--flag`` interface — and every existing test that drives it —
+    is left untouched. Tokens after the verb pass through verbatim, so flags
+    like ``--json``, ``--strategy``, ``--slot``, and ``--force`` keep combining
+    exactly as before (e.g. ``cswap switch --strategy best``, ``cswap list --json``).
+    """
+    if not argv:
+        return argv
+
+    verb, rest = argv[0], argv[1:]
+
+    if verb == "switch":
+        # Bare `switch` rotates; `switch <num|email>` jumps to that account.
+        if rest and not rest[0].startswith("-"):
+            return ["--switch-to", *rest]
+        return ["--switch", *rest]
+
+    flag = _SUBCOMMAND_FLAGS.get(verb)
+    if flag is not None:
+        return [flag, *rest]
+
+    return argv
+
+
 def _run_command(argv: list[str]) -> None:
     """Handle `cswap run NUM|EMAIL [--no-share] [-- <claude args>]`.
 
@@ -37,7 +107,7 @@ def _run_command(argv: list[str]) -> None:
         head, tail = argv, []
 
     parser = argparse.ArgumentParser(
-        prog="cswap run",
+        prog=f"{_prog_name()} run",
         description=(
             "[EXPERIMENTAL] Launch Claude Code as a stored account in this "
             "terminal only (the default login and other terminals are "
@@ -276,6 +346,151 @@ Defaults live in settings.json in the backup root; flags override them.
         sys.exit(130)
 
 
+def _config_command(argv: list[str]) -> None:
+    """Handle `cswap config [list|get KEY|set KEY VALUE|unset KEY|path]`.
+
+    Pre-dispatched before the main parser is built, like `run` and `auto`
+    (same limitation: `config` must be the first argument). Edits
+    settings.json in the backup root with strict validation — unlike loading,
+    which forgivingly clamps — so a typo'd key or out-of-range value errors
+    loudly here instead of silently degrading at `cswap auto` time.
+    """
+    from claude_swap.settings import (
+        SETTING_SPECS,
+        effective_settings,
+        format_setting_value,
+        set_setting,
+        setting_spec,
+        settings_path,
+        unset_setting,
+    )
+
+    key_lines = "\n".join(
+        f"  {spec.dotted:<34}{spec.help} (default {format_setting_value(spec.default)})"
+        for spec in SETTING_SPECS.values()
+    )
+    parser = argparse.ArgumentParser(
+        prog="cswap config",
+        description=(
+            "Read and edit claude-swap settings (settings.json in the "
+            "backup root)."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=f"""
+Keys:
+{key_lines}
+
+Examples:
+  cswap config                              # list effective settings
+  cswap config get autoswitch.threshold
+  cswap config set autoswitch.threshold 80
+  cswap config unset autoswitch.threshold   # back to the default
+  cswap config path                         # where settings.json lives
+        """,
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON to stdout (with list or get)",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug logging",
+    )
+    sub = parser.add_subparsers(dest="action", metavar="{list,get,set,unset,path}")
+
+    p_list = sub.add_parser("list", help="Show all effective settings (the default)")
+    p_get = sub.add_parser("get", help="Print one setting's effective value")
+    p_get.add_argument("key", metavar="KEY", help="Dotted key, e.g. autoswitch.threshold")
+    for p in (p_list, p_get):
+        # SUPPRESS: without it the subparser's False default would clobber a
+        # pre-verb `cswap config --json` in the shared namespace.
+        p.add_argument(
+            "--json",
+            action="store_true",
+            default=argparse.SUPPRESS,
+            help="Emit machine-readable JSON to stdout",
+        )
+    p_set = sub.add_parser("set", help="Validate and persist one setting")
+    p_set.add_argument("key", metavar="KEY")
+    p_set.add_argument("value", metavar="VALUE")
+    p_unset = sub.add_parser("unset", help="Remove one setting (revert to the default)")
+    p_unset.add_argument("key", metavar="KEY")
+    sub.add_parser("path", help="Print the settings.json location")
+
+    args = parser.parse_args(argv)
+    json_mode = bool(getattr(args, "json", False))
+    action = args.action or "list"
+    if json_mode and action not in ("list", "get"):
+        parser.error("--json can only be used with list or get")
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        if sys.platform != "win32":
+            if os.geteuid() == 0 and not switcher._is_running_in_container():
+                error("Error: Do not run this script as root (unless running in a container)")
+                sys.exit(1)
+        root = switcher.backup_dir
+
+        if action == "path":
+            print(settings_path(root))
+        elif action == "list":
+            rows = effective_settings(root)
+            if json_mode:
+                payload = {
+                    "schemaVersion": 1,
+                    "path": str(settings_path(root)),
+                    "settings": [
+                        {"key": spec.dotted, "value": value, "isSet": is_set}
+                        for spec, value, is_set in rows
+                    ],
+                }
+                print(json.dumps(payload, indent=2))
+            else:
+                key_w = max(len(spec.dotted) for spec, _, _ in rows)
+                val_w = max(len(format_setting_value(v)) for _, v, _ in rows)
+                for spec, value, is_set in rows:
+                    line = f"{spec.dotted:<{key_w}}  {format_setting_value(value):<{val_w}}"
+                    print(line if is_set else f"{line}  {dimmed('(default)')}")
+        elif action == "get":
+            spec = setting_spec(args.key)
+            value, is_set = next(
+                (v, s) for sp, v, s in effective_settings(root) if sp is spec
+            )
+            if json_mode:
+                payload = {
+                    "schemaVersion": 1,
+                    "key": spec.dotted,
+                    "value": value,
+                    "isSet": is_set,
+                }
+                print(json.dumps(payload, indent=2))
+            else:
+                print(format_setting_value(value))
+        elif action == "set":
+            value = set_setting(root, args.key, args.value)
+            print(f"{args.key} = {format_setting_value(value)}")
+        elif action == "unset":
+            if unset_setting(root, args.key):
+                default = setting_spec(args.key).default
+                print(f"{args.key} unset (default: {format_setting_value(default)})")
+            else:
+                print(muted(f"{args.key} is not set; nothing to do"), file=sys.stderr)
+    except ClaudeSwitchError as e:
+        if json_mode:
+            print(json.dumps(error_envelope(e), indent=2))
+        else:
+            error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(
+            f"\n{dimmed('Operation cancelled')}",
+            file=sys.stderr if json_mode else sys.stdout,
+        )
+        sys.exit(130)
+
+
 def _use_native_tls() -> None:
     """Route TLS trust decisions through the OS-native verifier.
 
@@ -382,6 +597,7 @@ Examples:
 _SUBCOMMANDS = {
     "run": "_run_command",
     "auto": "_auto_command",
+    "config": "_config_command",
     "service": "_service_command",
 }
 
@@ -389,35 +605,43 @@ _SUBCOMMANDS = {
 def _build_parser() -> argparse.ArgumentParser:
     """Construct the top-level flag parser (the bare-flag, non-subcommand UI)."""
     parser = argparse.ArgumentParser(
+        prog=_prog_name(),
         description="Multi-Account Switcher for Claude Code",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Examples:
-  %(prog)s --add-account
-  %(prog)s --add-token sk-ant-oat01-...           # OAuth setup-token
-  %(prog)s --add-token sk-ant-api03-...           # managed API key
-  %(prog)s --add-token sk-ant-oat01-... --slot 3
-  %(prog)s --add-token sk-ant-oat01-... --email me@example.com
-  %(prog)s --add-token - --slot 3
-  %(prog)s --list
-  %(prog)s --health
-  %(prog)s --switch
-  %(prog)s --switch --strategy best             # switch to the account with most quota left
-  %(prog)s --switch --strategy next-available   # rotate, skipping rate-limited accounts
-  %(prog)s --switch-to 2
-  %(prog)s --switch-to user@example.com
-  %(prog)s run 2                            # run account 2 in this terminal only
-  %(prog)s run 2 -- --resume                # forward args after '--' to claude
-  %(prog)s auto                             # auto-switch when nearing rate limits
-  %(prog)s auto --once                      # single auto-switch tick (cron-friendly)
-  %(prog)s --remove-account user@example.com
-  %(prog)s --status
-  %(prog)s --purge
-  %(prog)s --export backup.cswap
-  %(prog)s --import backup.cswap
-  %(prog)s --tui                              # interactive arrow-key menu
-  %(prog)s service install                    # background auto-switch engine
-  %(prog)s --upgrade                          # self-upgrade to latest version
+Commands:
+  %(prog)s help                       show this help
+  %(prog)s list                       list managed accounts
+  %(prog)s status                     show current account
+  %(prog)s switch                     rotate to the next account
+  %(prog)s switch <num|email>         switch to a specific account
+  %(prog)s add                        add the current account
+  %(prog)s add-token [TOKEN|-]        register a setup-token or API key
+  %(prog)s remove <num|email>         remove an account
+  %(prog)s run <num|email> [-- ...]   run as an account, this terminal only
+  %(prog)s auto                       auto-switch when nearing rate limits
+  %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
+  %(prog)s service install            background auto-switch engine at login
+  %(prog)s export <path>              export accounts
+  %(prog)s import <path>              import accounts
+  %(prog)s tui                        interactive arrow-key menu
+  %(prog)s upgrade                    self-upgrade to latest
+  %(prog)s purge                      remove all claude-swap data
+
+Aliases: ls=list  rm=remove  update=upgrade
+
+Flags combine with subcommands:
+  %(prog)s switch --strategy best           # pick the account with most quota left
+  %(prog)s switch --strategy next-available # rotate, skipping rate-limited accounts
+  %(prog)s switch user@example.com
+  %(prog)s list --json
+  %(prog)s add --slot 3                      # add to a specific slot
+  %(prog)s add-token sk-ant-oat01-... --email me@example.com
+  %(prog)s run 2 -- --resume                 # forward args after '--' to claude
+  %(prog)s auto --once                       # single auto-switch tick (cron-friendly)
+  %(prog)s config set autoswitch.threshold 80
+
+The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep working.
         """,
     )
 
@@ -648,12 +872,9 @@ def _dispatch_action(
     elif args.health:
         switcher.list_accounts(show_token_status=True, show_health=True)
     elif args.switch:
+        payload = switcher.switch(strategy=args.strategy, json_output=args.json)
         if args.json:
-            return cast(
-                dict[str, Any],
-                switcher.switch(strategy=args.strategy, json_output=True),
-            )
-        switcher.switch(strategy=args.strategy)
+            return cast("dict[str, Any]", payload)
     elif args.switch_to:
         return switcher.switch_to(
             args.switch_to, json_output=args.json, force=args.force
@@ -682,8 +903,13 @@ def main() -> None:
         globals()[_SUBCOMMANDS[sys.argv[1]]](sys.argv[2:])
         return
 
+    # Memorable subcommands (`cswap switch <email>`, `cswap list`, ...) are
+    # rewritten to the equivalent flags so the original `--flag` interface
+    # keeps working unchanged.
+    argv = _translate_subcommand(sys.argv[1:])
+
     parser = _build_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     _validate_args(parser, args)
 
     # Self-upgrade runs before switcher init so we don't touch config/keychain

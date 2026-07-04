@@ -5,10 +5,10 @@ view — it never imports ``switcher``. "Read-only" means switch state:
 listing never changes which account is active, but it is where opportunistic
 credential maintenance happens (live-rotation sync-back, inactive-token
 refresh, parked-rotation recovery), because a usage fetch can consume a
-single-use refresh token (claude-code#24317). Usage resolution is cache-first
-through the shared per-slot cache (``usage_cache``): a fully fresh cache
-renders without any network; otherwise slots are fetched in parallel and
-merged back, so the monitor plans from the same view this list rendered.
+single-use refresh token (claude-code#24317). Usage resolution goes through
+the shared per-account :class:`~claude_swap.usage_store.UsageStore`
+(stale-on-error, failure backoff, staggered fetches), so ``--list``, the TUI,
+and ``cswap auto`` all learn from each other's fetches.
 """
 
 from __future__ import annotations
@@ -17,10 +17,9 @@ import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 from claude_swap import oauth
-from claude_swap.cache import read_cache_data, read_cache_with_timestamp
 from claude_swap.claude_locks import claude_config_lock, claude_credentials_lock
 from claude_swap.credential_refresh import (
     park_rotated_credential,
@@ -32,13 +31,10 @@ from claude_swap.json_output import (
     USAGE_KEYCHAIN_UNAVAILABLE,
     USAGE_NO_CREDENTIALS,
     USAGE_TOKEN_EXPIRED,
-    UsageEntry,
-    _KNOWN_USAGE_SENTINELS,
     _slot_for_identity,
     empty_list_payload,
     list_payload,
     status_payload,
-    usage_display_line,
 )
 from claude_swap.exceptions import LockError
 from claude_swap.locking import FileLock
@@ -49,18 +45,24 @@ from claude_swap.printer import (
     bolded,
     dimmed,
     entrypoint_label,
+    format_age,
     ide_short_name,
     muted,
 )
 from claude_swap.process_detection import get_running_instances
-from claude_swap.usage_cache import (
-    _merge_usage_with_previous,
-    _usage_from_cache,
-    _usage_slot_trusted,
-)
+from claude_swap.usage_store import FetchRecord, UsageEntry, with_sentinel
 
 if TYPE_CHECKING:
     from claude_swap.protocols import ListHost
+
+# Delay between successive usage-request launches in one collect pass, so N
+# accounts never burst the shared usage endpoint from one IP in the same
+# instant (request hygiene; see upstream issue #85).
+_FETCH_STAGGER_S = 0.25
+
+# Show an age note on displayed usage older than this. Below it the data is
+# essentially current (auto refreshes every tick; --list on demand).
+_USAGE_AGE_NOTE_S = 90.0
 
 # How long a persist of a just-rotated OAuth credential may wait for the file
 # lock. Anthropic refresh tokens are single-use (claude-code#24317): by the
@@ -122,6 +124,61 @@ def _format_usage_lines(usage: dict[str, Any]) -> list[str]:
     return [f"{label + ':':<{width}} {body}" for label, body in rows]
 
 
+# Human notes for sentinel usage states (fallback: the raw sentinel string).
+_SENTINEL_NOTES = {
+    USAGE_TOKEN_EXPIRED: "token expired — Claude Code refreshes the active account",
+    USAGE_API_KEY: "API key (no quota)",
+    USAGE_KEYCHAIN_UNAVAILABLE: "keychain unavailable — locked or in use; try again",
+}
+
+
+def _last_seen_note(entry: UsageEntry) -> str | None:
+    """"last seen 53% used · 12m ago" from an entry's last-good measurement."""
+    if entry.last_good is None or entry.fetched_at is None:
+        return None
+    headroom = oauth.account_headroom(entry.last_good)
+    if headroom is None:
+        return None
+    return (
+        f"last seen {100 - headroom:.0f}% used · "
+        f"{format_age(int(entry.fetched_at * 1000))}"
+    )
+
+
+def _usage_entry_lines(entry: UsageEntry) -> list[str]:
+    """Styled usage lines (sans indent) for one account's entry.
+
+    Sentinel states render their note first, with a supplementary "last seen"
+    line when an older measurement exists. Measurements render as usual, age-
+    annotated once older than ``_USAGE_AGE_NOTE_S`` (stale-served); an account
+    with no measurement at all shows "usage unavailable" plus the last fetch
+    error, so a failing endpoint is visible instead of a silent blank.
+    """
+    if entry.sentinel is not None:
+        out = [dimmed(_SENTINEL_NOTES.get(entry.sentinel, entry.sentinel))]
+        last_seen = _last_seen_note(entry)
+        if last_seen is not None and entry.sentinel != USAGE_API_KEY:
+            out.append(f"{dimmed('└')} {muted(last_seen)}")
+        return out
+    if entry.last_good is not None:
+        lines = _format_usage_lines(entry.last_good)
+        if (
+            lines
+            and entry.age_s is not None
+            and entry.age_s > _USAGE_AGE_NOTE_S
+            and entry.fetched_at is not None
+        ):
+            lines[-1] += f" · {format_age(int(entry.fetched_at * 1000))}"
+        return [
+            f"{dimmed('└' if j == len(lines) - 1 else '├')} {muted(line)}"
+            for j, line in enumerate(lines)
+        ]
+    detail = "usage unavailable"
+    if entry.last_error:
+        detail += f" ({entry.last_error})"
+    return [dimmed(detail)]
+
+
 def run_list(
     host: ListHost,
     *,
@@ -163,10 +220,6 @@ class ListReporter:
         return self._host.lock_file
 
     @property
-    def usage_cache_path(self) -> Path:
-        return self._host.usage_cache_path
-
-    @property
     def _logger(self) -> logging.Logger:
         return self._host._logger
 
@@ -188,8 +241,8 @@ class ListReporter:
                 ce, ou = current_identity
                 active_num = _slot_for_identity(data.get("accounts", {}), ce, ou)
             accounts_info, _ = self.collect_accounts_info(data, active_num)
-            usages, _ = self.resolve_usages(accounts_info)
-            return self.build_list_payload(accounts_info, usages)
+            entries = self.resolve_usages(accounts_info)
+            return self.build_list_payload(accounts_info, entries)
         if not self.sequence_file.exists():
             print(dimmed("No accounts are managed yet."))
             self._host._first_run_setup()
@@ -205,11 +258,10 @@ class ListReporter:
             )
 
         accounts_info, health_notes = self.collect_accounts_info(data, active_num)
-        usages, usage_notes = self.resolve_usages(accounts_info)
+        entries = self.resolve_usages(accounts_info)
         self.print_account_rows(
             accounts_info,
-            usages,
-            usage_notes,
+            entries,
             health_notes,
             show_health=show_health,
             show_token_status=show_token_status,
@@ -253,7 +305,6 @@ class ListReporter:
             print(f"  {dimmed(f'Total managed accounts: {total}')}")
             active = self._host._read_active_credentials()
             creds = active.value or ""
-            active_keychain_unavailable = active.keychain_unavailable
             if creds and not active.degraded:
                 # A degraded read (Keychain failed, plaintext file covered it)
                 # may hold ANOTHER account's leftover credentials; syncing it
@@ -264,27 +315,11 @@ class ListReporter:
                     current_email,
                     creds,
                 )
-            usage, usage_note = self.resolve_active_usage_entry(
-                account_num, current_email, creds=creds,
-                keychain_unavailable=active_keychain_unavailable,
-                degraded=active.degraded,
+            entry = self.active_usage_entry(
+                account_num, current_email, current_org_uuid
             )
-            if isinstance(usage, dict):
-                lines = _format_usage_lines(usage)
-                for j, line in enumerate(lines):
-                    connector = "└" if j == len(lines) - 1 else "├"
-                    print(f"  {dimmed(connector)} {muted(line)}")
-            else:
-                display_line = usage_display_line(usage)
-                if display_line:
-                    print(f"  {dimmed(display_line)}")
-                elif usage is None:
-                    print(f"  {dimmed('usage unavailable')}")
-            if isinstance(usage_note, oauth.UsageFetchError):
-                print(
-                    f"  {dimmed('•')} "
-                    f"{muted(f'cached; live fetch {oauth.describe_usage_error(usage_note)}')}"
-                )
+            for line in _usage_entry_lines(entry):
+                print(f"  {line}")
         else:
             print(f"{bolded('Status:')} {current_email} {dimmed('(not managed)')}")
         return None
@@ -363,56 +398,124 @@ class ListReporter:
             accounts_info.append((num, email, org_name, org_uuid, is_active, creds))
         return accounts_info
 
-    def resolve_usages(
-        self, accounts_info: list[tuple[int, str, str, str, bool, str]],
-    ) -> tuple[list[UsageEntry], list[oauth.UsageFetchError | None]]:
-        """Return (usages, usage_notes): the fresh cache when trusted, else a
-        live fetch that is merged back into the cache."""
-        cached_data, _ = read_cache_with_timestamp(self.usage_cache_path)
-        previous_cached = cached_data if cached_data is not None else {}
-        account_keys = {str(info[0]) for info in accounts_info}
-        if self._host._usage_cache_fresh(previous_cached, account_keys):
-            cached_data = previous_cached
-            usages = [
-                cast(UsageEntry, _usage_from_cache(cached_data.get(str(info[0]))))
-                for info in accounts_info
-            ]
-            usage_notes: list[oauth.UsageFetchError | None] = [
-                None for _ in accounts_info
-            ]
-        else:
-            with ThreadPoolExecutor() as executor:
-                usages = list(executor.map(self.fetch_account_usage, accounts_info))
-            usage_notes = []
-            updates: dict[str, object] = {}
-            for info, usage in zip(accounts_info, usages):
-                key = str(info[0])
-                previous = previous_cached.get(key)
-                _, note = _merge_usage_with_previous(usage, previous)
-                usage_notes.append(note)
-                updates[key] = usage
-            self._host._merge_usage_cache(updates)
-            merged_raw = read_cache_data(self.usage_cache_path, default={}) or {}
-            merged: dict[str, Any] = (
-                merged_raw if isinstance(merged_raw, dict) else {}
-            )
-            usages = [
-                cast(UsageEntry, _usage_from_cache(merged.get(str(info[0]))))
-                for info in accounts_info
-            ]
-        return usages, usage_notes
-
-    def fetch_account_usage(
+    def _static_usage_sentinel(
         self, account_info: tuple[int, str, str, str, bool, str],
-    ) -> UsageEntry:
-        """Fetch live usage for one account row (used by the thread pool)."""
+    ) -> str | None:
+        """Sentinel state derivable without any network call, or ``None``.
+
+        Re-derived on every collect pass (never persisted), so it can't
+        outlive the condition that produced it.
+        """
         num, email, _, _, is_active, creds = account_info
         if looks_like_api_key(creds):
+            # Managed API-key account: no subscription quota to fetch.
             return USAGE_API_KEY
         if not creds or not oauth.extract_access_token(creds):
             if is_active and self._active_keychain_unavailable:
                 return USAGE_KEYCHAIN_UNAVAILABLE
             return USAGE_NO_CREDENTIALS
+        if is_active:
+            # Owned + locally expired must be visible even when the fetch is
+            # gated (fresh entry, failure backoff, concurrent claim) — the
+            # auto engine's idle-hold keys on this sentinel, and it is provable
+            # locally: only an owner (Claude Code / live session) may refresh
+            # this credential, and it hasn't. The expiry check gates the
+            # process scan, so the common non-expired path pays nothing.
+            oauth_data = oauth.extract_oauth_data(creds)
+            if (
+                oauth_data
+                and oauth.is_oauth_token_expired(oauth_data.get("expiresAt"))
+                and (
+                    self._active_cc_running()
+                    or self._host._live_session_pids(str(num), email)
+                )
+            ):
+                return USAGE_TOKEN_EXPIRED
+        return None
+
+    def _run_usage_fetches(
+        self, infos: list[tuple[int, str, str, str, bool, str]],
+    ) -> dict[str, FetchRecord]:
+        """Fetch the given accounts in parallel, staggering request starts so
+        N accounts never hit the endpoint in the same instant."""
+        def fetch_one(
+            idx_info: tuple[int, tuple[int, str, str, str, bool, str]],
+        ) -> tuple[str, FetchRecord]:
+            idx, info = idx_info
+            if idx and _FETCH_STAGGER_S:
+                time.sleep(idx * _FETCH_STAGGER_S)
+            return str(info[0]), self.fetch_account_usage(info)
+
+        with ThreadPoolExecutor() as executor:
+            return dict(executor.map(fetch_one, enumerate(infos)))
+
+    def collect_usage_entries(
+        self,
+        accounts_info: list[tuple[int, str, str, str, bool, str]],
+        fetch: set[str] | None = None,
+    ) -> dict[str, UsageEntry]:
+        """Store-backed usage collection: one :class:`UsageEntry` per account.
+
+        ``fetch=None`` (on-demand callers: ``--list``/``--status``/switch
+        strategies) makes every account eligible; the auto engine passes an
+        explicit set to restrict which accounts *may* be fetched this pass.
+        Either way an account is skipped — its stored entry served instead —
+        when a sentinel state applies, its entry is fresh (≤ ``SERVE_TTL_S``),
+        it is inside failure backoff, or another collector claimed it moments
+        ago. A failed fetch only updates the entry's error/backoff fields, so
+        the last-good measurement keeps being served (stale-on-error).
+        """
+        store = self._host._usage_store
+        now = store.clock()
+        identities = {
+            str(num): (email, org_uuid or "")
+            for num, email, _org_name, org_uuid, _active, _creds in accounts_info
+        }
+        info_by_num = {str(info[0]): info for info in accounts_info}
+        sentinels: dict[str, str] = {}
+        for num, info in info_by_num.items():
+            static = self._static_usage_sentinel(info)
+            if static is not None:
+                sentinels[num] = static
+
+        entries = store.entries(identities)
+        to_fetch = [
+            num
+            for num in info_by_num
+            if num not in sentinels
+            and (fetch is None or num in fetch)
+            and not entries[num].fresh(now)
+            and not entries[num].in_backoff(now)
+            and not entries[num].claimed(now)
+        ]
+
+        if to_fetch:
+            store.claim(to_fetch, identities)
+            records = self._run_usage_fetches(
+                [info_by_num[num] for num in to_fetch]
+            )
+            store.record(records, identities)
+            for num, record in records.items():
+                if record.sentinel is not None:
+                    sentinels[num] = record.sentinel
+            entries = store.entries(identities)
+
+        return {
+            num: with_sentinel(entries[num], sentinels.get(num))
+            for num in info_by_num
+        }
+
+    def resolve_usages(
+        self, accounts_info: list[tuple[int, str, str, str, bool, str]],
+    ) -> dict[str, UsageEntry]:
+        """Store-backed entries for every row (every stale account eligible)."""
+        return self.collect_usage_entries(accounts_info)
+
+    def fetch_account_usage(
+        self, account_info: tuple[int, str, str, str, bool, str],
+    ) -> FetchRecord:
+        """One network fetch for one account. Never raises."""
+        num, email, _, _, is_active, creds = account_info
         if is_active:
             return self.fetch_active_usage(
                 str(num), email, creds, degraded=self._active_degraded,
@@ -484,22 +587,25 @@ class ListReporter:
 
         has_live_session = bool(self._host._live_session_pids(str(num), email))
 
-        result = oauth.fetch_usage_for_account(
+        outcome = oauth.try_fetch_usage_for_account(
             str(num), email, creds,
             is_active=is_active or has_live_session,
             persist_credentials=persist,
         )
-        if isinstance(result, oauth.UsageFetchError):
-            self._log_usage_fetch_error(num, email, is_active, result)
-        return result
+        return FetchRecord(
+            usage=outcome.usage,
+            error=outcome.error,
+            retry_after_s=outcome.retry_after_s,
+        )
 
     def fetch_active_usage(
         self, account_num: str, email: str, creds: str, *, degraded: bool = False,
-    ) -> UsageEntry:
-        """Usage for the active/default account, refreshing its token only when safe."""
+    ) -> FetchRecord:
+        """Usage fetch for the active/default account, refreshing its token only
+        when safe."""
         oauth_data = oauth.extract_oauth_data(creds)
         if not oauth_data or not oauth_data.get("accessToken"):
-            return USAGE_NO_CREDENTIALS
+            return FetchRecord(sentinel=USAGE_NO_CREDENTIALS)
 
         # A degraded active read (Keychain failed; a leftover plaintext file
         # covered it) may hold another account's credentials: fetching usage
@@ -510,14 +616,23 @@ class ListReporter:
             self._host._live_session_pids(account_num, email)
         )
         if owned:
-            usage = oauth.fetch_usage_for_account(
+            if oauth.is_oauth_token_expired(oauth_data.get("expiresAt")):
+                # The request would just 401 (an owned credential may not be
+                # refreshed), so skip it — Claude Code's own /usage does the
+                # same on a locally-expired token.
+                return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
+            outcome = oauth.try_fetch_usage_for_account(
                 account_num, email, creds, is_active=True,
             )
-            if isinstance(usage, oauth.UsageFetchError):
-                self._log_usage_fetch_error(account_num, email, True, usage)
-            if usage is None and oauth.is_oauth_token_expired(oauth_data.get("expiresAt")):
-                return USAGE_TOKEN_EXPIRED
-            return usage
+            if outcome.usage is None and oauth.is_oauth_token_expired(
+                oauth_data.get("expiresAt")
+            ):
+                return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
+            return FetchRecord(
+                usage=outcome.usage,
+                error=outcome.error,
+                retry_after_s=outcome.retry_after_s,
+            )
 
         original_refresh = oauth_data.get("refreshToken")
         persist_skipped = False
@@ -584,75 +699,48 @@ class ListReporter:
                     persist_skipped = True
                 raise
 
-        usage = oauth.fetch_usage_for_account(
+        outcome = oauth.try_fetch_usage_for_account(
             account_num, email, creds,
             is_active=False, persist_credentials=persist_active,
         )
-        if isinstance(usage, oauth.UsageFetchError):
-            self._log_usage_fetch_error(account_num, email, True, usage)
         if persist_skipped:
-            return USAGE_TOKEN_EXPIRED
-        if usage is None and oauth.is_oauth_token_expired(oauth_data.get("expiresAt")):
-            return USAGE_TOKEN_EXPIRED
-        return usage
+            return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
+        if outcome.usage is None and oauth.is_oauth_token_expired(
+            oauth_data.get("expiresAt")
+        ):
+            return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
+        return FetchRecord(
+            usage=outcome.usage,
+            error=outcome.error,
+            retry_after_s=outcome.retry_after_s,
+        )
 
-    def resolve_active_usage_entry(
+    def active_usage_entry(
         self,
         account_num: str,
-        email: str,
-        *,
-        creds: str | None = None,
-        keychain_unavailable: bool = False,
-        degraded: bool = False,
-    ) -> tuple[UsageEntry, oauth.UsageFetchError | None]:
-        """Usage entry for the active account (cache-first, owner-aware refresh)."""
-        if creds is None:
-            active = self._host._read_active_credentials()
-            creds = active.value or ""
-            keychain_unavailable = active.keychain_unavailable
-            degraded = active.degraded
-        if looks_like_api_key(creds):
-            return USAGE_API_KEY, None
-        if not creds or not oauth.extract_access_token(creds):
-            if keychain_unavailable:
-                return USAGE_KEYCHAIN_UNAVAILABLE, None
-            return USAGE_NO_CREDENTIALS, None
+        current_email: str,
+        org_uuid: str = "",
+    ) -> UsageEntry:
+        """Store-backed usage entry for just the active account.
 
-        cached_data, _ = read_cache_with_timestamp(self.usage_cache_path)
-        previous_cached = cached_data if cached_data is not None else {}
-        if account_num in previous_cached:
-            usage = _usage_from_cache(previous_cached[account_num])
-            if isinstance(usage, str) and usage in _KNOWN_USAGE_SENTINELS:
-                return usage, None
-            if isinstance(usage, dict) and _usage_slot_trusted(usage, time.time()):
-                return usage, None
-
-        fetched = self.fetch_active_usage(account_num, email, creds, degraded=degraded)
-        previous = previous_cached.get(account_num)
-        display, note = _merge_usage_with_previous(fetched, previous)
-        self._host._merge_usage_cache({account_num: fetched})
-        if isinstance(display, dict):
-            return display, note
-        if isinstance(display, (str, oauth.UsageFetchError)):
-            return display, note
-        cached: UsageEntry = cast(UsageEntry, _usage_from_cache(display))
-        return cached, note
-
-    def active_account_usage(
-        self, account_num: str, current_email: str,
-    ) -> dict[str, Any] | str | oauth.UsageFetchError | None:
-        """Usage for the active account via the shared per-slot usage cache."""
-        usage, _ = self.resolve_active_usage_entry(account_num, current_email)
-        if isinstance(usage, oauth.UsageFetchError):
-            return usage
-        return usage
+        Builds a single-account info row instead of the full accounts list
+        (``--status`` touches one slot) and runs it through the shared
+        collector, so freshness/backoff/claim gating and the shared
+        ``cache/usage.json`` table behave exactly as in ``--list``.
+        """
+        active = self._host._read_active_credentials()
+        creds = active.value or ""
+        self._active_keychain_unavailable = active.keychain_unavailable
+        self._active_degraded = active.degraded
+        info = (int(account_num), current_email, "", org_uuid or "", True, creds)
+        return self.collect_usage_entries([info])[str(account_num)]
 
     def build_list_payload(
         self,
         accounts_info: list[tuple[int, str, str, str, bool, str]],
-        usages: list[UsageEntry],
+        entries: dict[str, UsageEntry],
     ) -> dict[str, Any]:
-        return list_payload(accounts_info, usages)
+        return list_payload(accounts_info, entries)
 
     def build_status_payload(self) -> dict[str, Any]:
         identity = self._host._get_current_account()
@@ -683,19 +771,21 @@ class ListReporter:
                 usage_entry=None,
             )
         acct = data["accounts"][account_num]
+        org_uuid = acct.get("organizationUuid", "") or ""
         return status_payload(
             identity=identity,
             account_num=account_num,
             account_record=acct,
-            usage_entry=self.active_account_usage(account_num, current_email),
+            usage_entry=self.active_usage_entry(
+                account_num, current_email, org_uuid
+            ),
             total_managed=len(data.get("accounts", {})),
         )
 
     def print_account_rows(
         self,
         accounts_info: list[tuple[int, str, str, str, bool, str]],
-        usages: list[UsageEntry],
-        usage_notes: list[oauth.UsageFetchError | None],
+        entries: dict[str, UsageEntry],
         health_notes: dict[str, list[str]],
         *,
         show_health: bool,
@@ -703,40 +793,35 @@ class ListReporter:
     ) -> None:
         """Render the per-account usage/health/token block."""
         print(bolded("Accounts:"))
-        for i, ((num, email, org_name, org_uuid, is_active, _), usage) in enumerate(
-            zip(accounts_info, usages),
+        for i, (num, email, org_name, org_uuid, is_active, _) in enumerate(
+            accounts_info,
         ):
             tag = self._host._get_display_tag(email, org_name, org_uuid)
+            # NOTE: the TUI watch view (tui._watch_account_rows) parses this
+            # output to map rows to accounts for quick-switch: it relies on the
+            # uncolored ``  {num}: `` prefix and the ``(active)`` marker below.
+            # Keep them intact when tweaking this line, or update that parser.
             if is_active:
                 marker = f" {bold_accent('(active)')}"
                 print(f"  {num}: {email} {muted(f'[{tag}]')}{marker}")
             else:
                 print(f"  {num}: {email} {muted(f'[{tag}]')}")
-            if isinstance(usage, str):
-                line = usage_display_line(usage) or usage
-                print(f"     {dimmed(line)}")
-                health_notes.setdefault(str(num), []).append(line)
-            elif isinstance(usage, oauth.UsageFetchError):
-                print(f"     {dimmed(oauth.describe_usage_error(usage))}")
-                health_notes.setdefault(str(num), []).append(usage.reason)
-            elif usage is None:
-                print(f"     {dimmed('usage unavailable')}")
-                health_notes.setdefault(str(num), []).append("usage unavailable")
-            else:
-                lines = _format_usage_lines(usage)
-                for j, line in enumerate(lines):
-                    connector = "└" if j == len(lines) - 1 else "├"
-                    print(f"     {dimmed(connector)} {muted(line)}")
+            entry = entries[str(num)]
+            for line in _usage_entry_lines(entry):
+                print(f"     {line}")
+            if entry.sentinel is not None:
+                health_notes.setdefault(str(num), []).append(
+                    _SENTINEL_NOTES.get(entry.sentinel, entry.sentinel)
+                )
+            elif entry.last_good is None:
+                note = "usage unavailable"
+                if entry.last_error:
+                    note += f" ({entry.last_error})"
+                health_notes.setdefault(str(num), []).append(note)
             if show_health:
                 notes = health_notes.get(str(num), [])
                 health = "ok" if not notes else ", ".join(notes)
                 print(f"     {dimmed('•')} {muted(f'health: {health}')}")
-            note = usage_notes[i]
-            if isinstance(note, oauth.UsageFetchError):
-                print(
-                    f"     {dimmed('•')} "
-                    f"{muted(f'cached; live fetch {oauth.describe_usage_error(note)}')}"
-                )
 
             if show_token_status:
                 token_status = oauth.build_token_status(accounts_info[i][5])
@@ -793,19 +878,3 @@ class ListReporter:
             # Fail closed: an undetectable owner means the live store may be
             # in use — never consume its single-use refresh token on a guess.
             return True
-
-    def _log_usage_fetch_error(
-        self,
-        account_num: str | int,
-        email: str,
-        active: bool,
-        result: oauth.UsageFetchError,
-    ) -> None:
-        self._logger.info(
-            "Usage fetch unavailable: account=%s email=%s active=%s reason=%s status=%s",
-            account_num,
-            email,
-            active,
-            result.reason,
-            result.status_code,
-        )

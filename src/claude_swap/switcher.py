@@ -8,7 +8,6 @@ import re
 import shutil
 import sys
 import tempfile
-import time
 from pathlib import Path
 
 from claude_swap import macos_keychain
@@ -21,14 +20,8 @@ from claude_swap.exceptions import (
     SwitchError,
     ValidationError,
 )
-from claude_swap import oauth
-from claude_swap.cache import (
-    read_cache_data,
-    write_cache,
-)
 from claude_swap.claude_locks import claude_config_lock, claude_credentials_lock
 from claude_swap.json_output import (
-    _KNOWN_USAGE_SENTINELS,
     _slot_for_identity,
     account_ref,
     switch_noop,
@@ -69,14 +62,8 @@ from claude_swap.sequence_store import (
     SequenceData,
     SequenceStore,
 )
-from claude_swap.usage_cache import (
-    _persist_usage_cache_entry,
-    _usage_from_cache,
-    _usage_slot_trusted,
-)
-from claude_swap.usage_policy import (
-    headroom,
-)
+from claude_swap.usage_policy import headroom
+from claude_swap.usage_store import UsageEntry, UsageStore
 from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
@@ -142,6 +129,7 @@ class ClaudeAccountSwitcher:
         self.credentials_dir = self.backup_dir / "credentials"
         self.lock_file = self.backup_dir / ".lock"
         self._logger = setup_logging(self.backup_dir, debug=debug)
+        self._usage_store = UsageStore(self.backup_dir / "cache")
 
         # The credential storage layer (active + per-account backup stores, macOS
         # Keychain-vs-file routing, the per-process capability cache). Reads its
@@ -163,11 +151,6 @@ class ClaudeAccountSwitcher:
             read_json=lambda p: self._read_json(p),
             write_json=lambda p, d: self._write_json(p, d),
         )
-        # Fetch note from the last _resolve_active_usage call: non-None when a
-        # trusted prior cache row masked a failed fetch (the displayed pct may
-        # be arbitrarily old). Read via active_usage_is_masked_failure().
-        self._active_usage_note: oauth.UsageFetchError | None = None
-
         # Run any pending one-time data migrations (e.g. relocating Windows
         # backup credentials out of Credential Manager into files). Imported
         # lazily to avoid a circular import, and self-contained so it never
@@ -175,10 +158,6 @@ class ClaudeAccountSwitcher:
         from claude_swap.migrations import run_migrations
 
         run_migrations(self)
-
-    @property
-    def usage_cache_path(self) -> Path:
-        return self.backup_dir / "cache" / "usage.json"
 
     def _is_running_in_container(self) -> bool:
         """Check if running inside a container."""
@@ -411,60 +390,6 @@ class ClaudeAccountSwitcher:
             return False
         return True
 
-    def _usage_cache_fresh(
-        self,
-        cached: dict[str, Any],
-        account_keys: set[str],
-    ) -> bool:
-        """True when every account row is within the shared per-slot TTL.
-
-        Subset check on purpose: rows of since-removed slots may linger in the
-        cache until the next merge sweeps them (``_merge_usage_cache``), and an
-        orphan row must not mark the whole cache stale — that would defeat the
-        TTL for every remaining slot on every list/status until the sweep.
-        """
-        if not isinstance(cached, dict) or not account_keys <= set(cached):
-            return False
-        now = time.time()
-        for key in account_keys:
-            entry = cached.get(key)
-            usage = _usage_from_cache(entry)
-            if isinstance(usage, str):
-                if usage in _KNOWN_USAGE_SENTINELS:
-                    continue
-                return False
-            if not isinstance(usage, dict) or not _usage_slot_trusted(usage, now):
-                return False
-        return True
-
-    def _merge_usage_cache(self, updates: dict[str, object]) -> None:
-        """Merge per-slot fetch results into usage.json under the file lock.
-
-        Also reclaims rows of slots that are no longer managed:
-        ``remove_account`` never rewrites the cache, so orphaned rows would
-        otherwise accumulate forever (the file only ever grows) and shadow a
-        re-added slot number with another account's stale usage.
-        """
-        if not updates:
-            return
-        with FileLock(self.lock_file):
-            existing = read_cache_data(self.usage_cache_path, default={})
-            if not isinstance(existing, dict):
-                existing = {}
-            data = self._get_sequence_data()
-            if data is not None:
-                managed = {str(num) for num in data.get("accounts", {})}
-                existing = {
-                    key: row
-                    for key, row in existing.items()
-                    if key in managed or key in updates
-                }
-            for key, current in updates.items():
-                _persist_usage_cache_entry(
-                    existing, key, current, existing.get(key),
-                )
-            write_cache(self.usage_cache_path, existing)
-
     def _write_account_config(
         self, account_num: str, email: str, config: str
     ) -> None:
@@ -527,9 +452,42 @@ class ClaudeAccountSwitcher:
 
     def usage_by_account(
         self,
-    ) -> dict[str, dict[str, Any] | str | oauth.UsageFetchError | None]:
-        """Public wrapper: account number → usage entry (cache-first)."""
+    ) -> dict[str, dict[str, Any] | str | None]:
+        """Public wrapper: account number → decision-grade usage value.
+
+        Each value is a usage dict (last-good, trusted while ≤
+        ``usage_store.STALE_OK_S`` old), a sentinel string, or ``None``
+        (unknown).
+        """
         return self._usage_by_account()
+
+    def usage_entries_by_account(
+        self, fetch: set[str] | None = None
+    ) -> dict[str, UsageEntry]:
+        """Store-backed usage entries (ages, errors, poll state) per account.
+
+        ``fetch`` restricts which accounts *may* be fetched this pass (the
+        auto engine's scheduler); ``None`` means every stale account is
+        eligible (on-demand callers).
+        """
+        reporter = self._list_reporter()
+        accounts_info = reporter.build_accounts_info()
+        return reporter.collect_usage_entries(accounts_info, fetch=fetch)
+
+    def set_usage_poll_plan(
+        self, plans: dict[str, tuple[float | None, float | None]]
+    ) -> None:
+        """Persist the auto engine's per-slot ``(nextPollAt, pollIntervalS)``."""
+        data = self._get_sequence_data() or {}
+        accounts = data.get("accounts", {})
+        identities = {
+            num: (
+                accounts.get(num, {}).get("email", ""),
+                accounts.get(num, {}).get("organizationUuid", "") or "",
+            )
+            for num in plans
+        }
+        self._usage_store.set_poll_plan(plans, identities)
 
     def switchable_account_numbers(self) -> list[str]:
         """Account numbers in rotation order that have usable stored backups."""
@@ -1348,19 +1306,12 @@ class ClaudeAccountSwitcher:
             self._reporter = ListReporter(self)
         return self._reporter
 
-    def _active_account_usage(
-        self, account_num: str, current_email: str,
-    ) -> dict[str, Any] | str | oauth.UsageFetchError | None:
-        return self._list_reporter().active_account_usage(account_num, current_email)
-
-    def _usage_by_account(self) -> dict[str, dict[str, Any] | str | oauth.UsageFetchError | None]:
-        """Map account number → usage entry (per-slot cache) for managed accounts."""
+    def _usage_by_account(self) -> dict[str, dict[str, Any] | str | None]:
+        """Map account number → decision-grade usage value for managed accounts."""
         reporter = self._list_reporter()
         accounts_info = reporter.build_accounts_info()
-        usages, _ = reporter.resolve_usages(accounts_info)
-        return {
-            str(info[0]): usage for info, usage in zip(accounts_info, usages)
-        }
+        entries = reporter.collect_usage_entries(accounts_info)
+        return {num: entry.decision_value() for num, entry in entries.items()}
 
     def _select_best_switchable(
         self, current_num: str | None

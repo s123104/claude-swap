@@ -79,7 +79,7 @@ class TestWriteVerifiedLiveDriftHandling:
         monkeypatch.setattr(switcher, "_write_account_credentials", write_acct)
         monkeypatch.setattr(switcher, "_read_account_credentials", read_acct)
         monkeypatch.setattr(switcher, "_read_credentials", read_live)
-        monkeypatch.setattr("claude_swap.switcher.time.sleep", lambda *_: None)
+        monkeypatch.setattr("claude_swap.credential_refresh.time.sleep", lambda *_: None)
 
         caplog.set_level(logging.WARNING, logger="claude-swap")
 
@@ -126,7 +126,7 @@ class TestWriteVerifiedLiveDriftHandling:
         )
         stable_live = self._creds("stable")
         monkeypatch.setattr(switcher, "_read_credentials", lambda: stable_live)
-        monkeypatch.setattr("claude_swap.switcher.time.sleep", lambda *_: None)
+        monkeypatch.setattr("claude_swap.credential_refresh.time.sleep", lambda *_: None)
 
         with pytest.raises(CredentialWriteError, match="did not match"):
             switcher._write_verified_live_account_credentials(

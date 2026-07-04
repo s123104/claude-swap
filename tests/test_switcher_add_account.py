@@ -493,7 +493,7 @@ class TestAddAccountSlot:
                 "_write_account_credentials",
             ) as write_creds,
             patch(
-                "claude_swap.switcher.time.sleep",
+                "claude_swap.credential_refresh.time.sleep",
             ),
         ):
             switcher.add_account(slot=1)
@@ -532,7 +532,7 @@ class TestAddAccountSlot:
                 "_write_account_credentials",
             ),
             patch(
-                "claude_swap.switcher.time.sleep",
+                "claude_swap.credential_refresh.time.sleep",
             ),
             pytest.raises(
                 CredentialWriteError,

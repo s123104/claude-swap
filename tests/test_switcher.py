@@ -10,16 +10,17 @@ from unittest.mock import patch
 
 import pytest
 
+from claude_swap import oauth
 from claude_swap.exceptions import (
     ConfigError,
 )
+from claude_swap.usage_store import FetchRecord, UsageStore
 from claude_swap.models import Platform
 
 from claude_swap.credentials import ActiveCredentials
 from claude_swap.sequence_store import AccountRecord
 from claude_swap.switcher import ClaudeAccountSwitcher
 
-from tests.conftest import usage_payload as _usage_payload
 
 
 class TestEmailValidation:
@@ -493,11 +494,7 @@ class TestStatusCache:
     def test_status_uses_cached_usage(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys
     ):
-        """A fresh cache entry for the active account skips the API call."""
-        import time
-
-        from claude_swap.cache import write_cache
-
+        """A fresh store entry for the active account skips the API call."""
         sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
         active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
 
@@ -505,22 +502,17 @@ class TestStatusCache:
         switcher._setup_directories()
         switcher._write_json(switcher.sequence_file, sample_sequence_data)
 
-        # Production cache rows carry a per-row ``_cached_at`` (via
-        # usage_cache._usage_to_cache); include it so the row is trusted.
-        cached_usage = {
-            "1": {
+        UsageStore(switcher.backup_dir / "cache").record(
+            {"1": FetchRecord(usage={
                 "five_hour": {"pct": 25, "clock": "Jan 1 03:00", "countdown": "1h"},
                 "seven_day": {"pct": 60, "clock": "Jan 2 03:00", "countdown": "2d"},
-                "_cached_at": time.time(),
-            },
-        }
-        write_cache(switcher.backup_dir / "cache" / "usage.json", cached_usage)
+            })},
+            {"1": ("test@example.com", "")},
+        )
 
-        with (
-            patch.object(switcher, "_read_active_credentials",
-                         return_value=ActiveCredentials(active_creds, False)),
-            patch("claude_swap.oauth.fetch_usage_for_account") as mock_fetch,
-        ):
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(active_creds, False)), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account") as mock_fetch:
             switcher.status()
 
         mock_fetch.assert_not_called()
@@ -528,59 +520,10 @@ class TestStatusCache:
         assert "25%" in output
         assert "60%" in output
 
-    def test_status_fetches_on_cache_miss_with_is_active_true(
-        self,
-        temp_home: Path,
-        mock_claude_config: Path,
-        sample_sequence_data: dict,
-        capsys,
-    ):
-        """On cache miss, fetch with is_active=True (never refresh active creds) and write back."""
-        from claude_swap.cache import read_cache, MISSING
-
-        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
-        active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
-
-        switcher = ClaudeAccountSwitcher()
-        switcher._setup_directories()
-        switcher._write_json(switcher.sequence_file, sample_sequence_data)
-
-        usage_result = {
-            "five_hour": {"pct": 10, "clock": "Jan 1 03:00", "countdown": "0m"},
-            "seven_day": {"pct": 50, "clock": "Jan 2 03:00", "countdown": "0m"},
-        }
-
-        with (
-            patch.object(switcher, "_read_active_credentials",
-                         return_value=ActiveCredentials(active_creds, False)),
-            patch(
-                "claude_swap.list_reporter.ListReporter._active_cc_running",
-                return_value=True,
-            ),
-            patch(
-                "claude_swap.oauth.fetch_usage_for_account", return_value=usage_result
-            ) as mock_fetch,
-        ):
-            switcher.status()
-
-        mock_fetch.assert_called_once()
-        assert mock_fetch.call_args.kwargs.get("is_active") is True
-
-        output = capsys.readouterr().out
-        assert "10%" in output
-
-        cache_path = switcher.backup_dir / "cache" / "usage.json"
-        cached = read_cache(cache_path, 300)
-        assert cached is not MISSING
-        assert _usage_payload(cached["1"]) == usage_result
-        assert "_cached_at" in cached["1"]
-
     def test_status_fetches_with_is_active_true_when_cc_running(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys
     ):
         """When Claude Code is running, fetch with is_active=True (never refresh live creds)."""
-        from claude_swap.cache import read_cache, MISSING
-
         sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
         active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
 
@@ -593,17 +536,14 @@ class TestStatusCache:
             "seven_day": {"pct": 50, "clock": "Jan 2 03:00", "countdown": "0m"},
         }
 
-        with (
-            patch.object(switcher, "_read_active_credentials",
-                         return_value=ActiveCredentials(active_creds, False)),
-            patch(
-                "claude_swap.list_reporter.ListReporter._active_cc_running",
-                return_value=True,
-            ),
-            patch(
-                "claude_swap.oauth.fetch_usage_for_account", return_value=usage_result
-            ) as mock_fetch,
-        ):
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(active_creds, False)), \
+             patch(
+                 "claude_swap.list_reporter.ListReporter._active_cc_running",
+                 return_value=True,
+             ), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome(usage_result)) as mock_fetch:
             switcher.status()
 
         mock_fetch.assert_called_once()
@@ -612,17 +552,15 @@ class TestStatusCache:
         output = capsys.readouterr().out
         assert "10%" in output
 
-        cache_path = switcher.backup_dir / "cache" / "usage.json"
-        cached = read_cache(cache_path, 300)
-        assert cached is not MISSING
-        assert _usage_payload(cached["1"]) == usage_result
+        entry = UsageStore(switcher.backup_dir / "cache").entries(
+            {"1": ("test@example.com", "")}
+        )["1"]
+        assert entry.last_good == usage_result
 
     def test_status_preserves_other_accounts_in_cache(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
     ):
-        """A cache miss for the active account merges into existing entries instead of clobbering."""
-        from claude_swap.cache import read_cache, write_cache, MISSING
-
+        """Fetching the active account merges into the store without clobbering others."""
         sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
         active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
 
@@ -630,114 +568,23 @@ class TestStatusCache:
         switcher._setup_directories()
         switcher._write_json(switcher.sequence_file, sample_sequence_data)
 
-        # Cache has only account "2"; status() runs for account "1"
-        existing = {"2": {"five_hour": {"pct": 80}}}
-        cache_path = switcher.backup_dir / "cache" / "usage.json"
-        write_cache(cache_path, existing)
+        # Store has only account "2"; status() runs for account "1"
+        store = UsageStore(switcher.backup_dir / "cache")
+        store.record(
+            {"2": FetchRecord(usage={"five_hour": {"pct": 80}})},
+            {"2": ("account2@example.com", "")},
+        )
 
         usage_result = {"five_hour": {"pct": 10, "clock": "Jan 1 03:00", "countdown": "0m"}}
 
-        with (
-            patch.object(switcher, "_read_active_credentials",
-                         return_value=ActiveCredentials(active_creds, False)),
-            patch(
-                "claude_swap.oauth.fetch_usage_for_account", return_value=usage_result
-            ),
-        ):
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(active_creds, False)), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome(usage_result)):
             switcher.status()
 
-        cached = read_cache(cache_path, 300)
-        assert cached is not MISSING
-        assert _usage_payload(cached["1"]) == usage_result
-        assert cached["2"] == {"five_hour": {"pct": 80}}
-
-    def test_status_preserves_previous_cached_usage_when_fetch_returns_none(
-        self,
-        temp_home: Path,
-        mock_claude_config: Path,
-        sample_sequence_data: dict,
-        capsys,
-    ):
-        """Transient active-account fetch failures should keep the last known usage."""
-        from claude_swap.cache import read_cache, MISSING
-
-        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
-        active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
-
-        switcher = ClaudeAccountSwitcher()
-        switcher._setup_directories()
-        switcher._write_json(switcher.sequence_file, sample_sequence_data)
-
-        previous_usage = {
-            "1": {"five_hour": {"pct": 25, "clock": "Jan 1 03:00", "countdown": "1h"}},
-            "2": {"five_hour": {"pct": 80, "clock": "Jan 1 04:00", "countdown": "30m"}},
-        }
-        cache_path = switcher.backup_dir / "cache" / "usage.json"
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        cache_path.write_text(
-            json.dumps({"timestamp": 0, "data": previous_usage}),
-            encoding="utf-8",
+        entries = store.entries(
+            {"1": ("test@example.com", ""), "2": ("account2@example.com", "")}
         )
-
-        with (
-            patch.object(switcher, "_read_active_credentials",
-                         return_value=ActiveCredentials(active_creds, False)),
-            patch("claude_swap.oauth.fetch_usage_for_account", return_value=None),
-        ):
-            switcher.status()
-
-        output = capsys.readouterr().out
-        assert "25%" in output
-
-        cached = read_cache(cache_path, 300)
-        assert cached is not MISSING
-        assert _usage_payload(cached["1"]) == previous_usage["1"]
-        assert _usage_payload(cached["2"]) == previous_usage["2"]
-
-    def test_status_shows_cached_usage_with_rate_limit_note(
-        self,
-        temp_home: Path,
-        mock_claude_config: Path,
-        sample_sequence_data: dict,
-        capsys,
-    ):
-        """A rate-limited status call should surface the reason and keep stale usage visible."""
-        from claude_swap import oauth
-        from claude_swap.cache import read_cache, MISSING
-
-        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
-        active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
-
-        switcher = ClaudeAccountSwitcher()
-        switcher._setup_directories()
-        switcher._write_json(switcher.sequence_file, sample_sequence_data)
-
-        previous_usage = {
-            "1": {"five_hour": {"pct": 25, "clock": "Jan 1 03:00", "countdown": "1h"}},
-        }
-        cache_path = switcher.backup_dir / "cache" / "usage.json"
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        cache_path.write_text(
-            json.dumps({"timestamp": 0, "data": previous_usage}),
-            encoding="utf-8",
-        )
-
-        with (
-            patch.object(switcher, "_read_active_credentials",
-                         return_value=ActiveCredentials(active_creds, False)),
-            patch(
-                "claude_swap.oauth.fetch_usage_for_account",
-                return_value=oauth.UsageFetchError(
-                    reason="rate_limited", status_code=429
-                ),
-            ),
-        ):
-            switcher.status()
-
-        output = capsys.readouterr().out
-        assert "25%" in output
-        assert "cached; live fetch usage unavailable (rate limited)" in output
-
-        cached = read_cache(cache_path, 300)
-        assert cached is not MISSING
-        assert _usage_payload(cached["1"]) == previous_usage["1"]
+        assert entries["1"].last_good == usage_result
+        assert entries["2"].last_good == {"five_hour": {"pct": 80}}

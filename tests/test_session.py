@@ -12,6 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from claude_swap import oauth
 from claude_swap import session as session_mod
 from claude_swap.exceptions import AccountNotFoundError, SessionError
 from claude_swap.models import Platform
@@ -936,10 +937,10 @@ class TestGuards:
 
         def fake_fetch(num, email, creds, is_active=False, persist_credentials=None):
             seen[num] = is_active
-            return None
+            return oauth.UsageOutcome(None)
 
         monkeypatch.setattr(
-            "claude_swap.oauth.fetch_usage_for_account", fake_fetch
+            "claude_swap.oauth.try_fetch_usage_for_account", fake_fetch
         )
         seeded_switcher.list_accounts()
 

@@ -361,30 +361,24 @@ class TestUsageDisplay:
     def test_collect_usage_short_circuits(self, temp_home: Path):
         s = _linux_switcher()
         info = [(2, "api-key-2@token.local", "", "", False, API_KEY)]
-        usages, notes = s._list_reporter().resolve_usages(info)
-        assert usages == [USAGE_API_KEY]
-        assert notes == [None]
+        entries = s._list_reporter().collect_usage_entries(info)
+        assert entries["2"].sentinel == USAGE_API_KEY
+        assert entries["2"].decision_value() == USAGE_API_KEY
 
     def test_active_account_usage_short_circuits(self, temp_home: Path):
         s = _linux_switcher()
         get_global_config_path().write_text(
             json.dumps({"primaryApiKey": API_KEY}), encoding="utf-8"
         )
-        assert s._active_account_usage("2", "api-key-2@token.local") == USAGE_API_KEY
-
-
-def test_fetch_account_usage_api_key_no_quota(temp_home: Path):
-    s = _linux_switcher()
-    result = s._list_reporter().fetch_account_usage(
-        (1, "api-key-1@token.local", "", "", False, API_KEY)
-    )
-    assert result == USAGE_API_KEY
+        entry = s._list_reporter().active_usage_entry("2", "api-key-2@token.local", "")
+        assert entry.sentinel == USAGE_API_KEY
+        assert entry.decision_value() == USAGE_API_KEY
 
 
 def test_list_human_shows_api_key_no_quota(temp_home: Path, capsys):
     s = _linux_switcher()
     s.add_account_from_token(API_KEY)
-    with patch("claude_swap.oauth.fetch_usage_for_account") as mock_fetch:
+    with patch("claude_swap.oauth.try_fetch_usage_for_account") as mock_fetch:
         s.list_accounts()
     mock_fetch.assert_not_called()
     assert "API key (no quota)" in capsys.readouterr().out

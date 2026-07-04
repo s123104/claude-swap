@@ -23,68 +23,6 @@ _USER_AGENT = f"claude-swap/{__version__}"
 _logger = logging.getLogger("claude-swap")
 
 
-@dataclass(frozen=True)
-class UsageFetchError:
-    """Classified usage-fetch failure for user-visible diagnostics."""
-
-    reason: str
-    status_code: int | None = None
-    message: str = ""
-    retry_after: str | None = None
-
-
-def parse_retry_after_seconds(value: str | None) -> int | None:
-    """Parse a ``Retry-After`` header value into a positive number of seconds.
-
-    Anthropic sends the delta-seconds form (e.g. ``"60"``); the HTTP-date form
-    is not honored here. Returns ``None`` for absent, non-numeric, or
-    non-positive values so callers fall back to their own backoff.
-    """
-    if not value:
-        return None
-    try:
-        seconds = int(value)
-    except ValueError:
-        return None
-    return seconds if seconds > 0 else None
-
-
-def describe_usage_error(error: UsageFetchError) -> str:
-    """Return a concise user-facing description for a usage failure."""
-    if error.reason == "rate_limited":
-        suffix = f", retry after {error.retry_after}" if error.retry_after else ""
-        return f"usage unavailable (rate limited{suffix})"
-    if error.reason == "unauthorized":
-        return "usage unavailable (unauthorized)"
-    if error.reason == "network_error":
-        return "usage unavailable (network error)"
-    return "usage unavailable"
-
-
-def _usage_error_from_http_error(error: urllib.error.HTTPError) -> UsageFetchError:
-    retry_after = error.headers.get("Retry-After") if error.headers else None
-    try:
-        body = error.read().decode(errors="replace")
-        payload = json.loads(body) if body else {}
-        message = payload.get("error", {}).get("message", "")
-    except Exception:
-        message = ""
-
-    if error.code == 429:
-        reason = "rate_limited"
-    elif error.code == 401:
-        reason = "unauthorized"
-    else:
-        reason = "http_error"
-
-    return UsageFetchError(
-        reason=reason,
-        status_code=error.code,
-        message=message,
-        retry_after=retry_after,
-    )
-
-
 def extract_access_token(credentials: str) -> str | None:
     """Extract the OAuth access token from a credentials JSON string."""
     try:
@@ -258,6 +196,44 @@ def request_usage_data(access_token: str) -> dict[str, Any]:
         return cast(dict[str, Any], payload)
 
 
+def _classify_usage_error(e: Exception) -> tuple[str, float | None]:
+    """Map a usage-fetch exception to ``(kind, retry_after_s)``.
+
+    ``kind`` is a short stable token for logs and backoff decisions
+    (``"http-429"``, ``"timeout"``, ``"network"``, ``"bad-response"``, or the
+    exception type name as a fallback). ``retry_after_s`` is the parsed
+    ``Retry-After`` header when the server sent one (seconds form only — the
+    HTTP-date form is rare enough to ignore).
+    """
+    if isinstance(e, urllib.error.HTTPError):
+        retry_after = None
+        raw = e.headers.get("Retry-After") if e.headers else None
+        if raw:
+            try:
+                retry_after = max(0.0, float(raw.strip()))
+            except ValueError:
+                pass
+        return f"http-{e.code}", retry_after
+    if isinstance(e, TimeoutError):  # socket.timeout is an alias since 3.10
+        return "timeout", None
+    if isinstance(e, urllib.error.URLError):
+        if isinstance(e.reason, TimeoutError):
+            return "timeout", None
+        return "network", None
+    if isinstance(e, json.JSONDecodeError):
+        return "bad-response", None
+    return type(e).__name__, None
+
+
+def _log_usage_failure(context: str, e: Exception, kind: str) -> None:
+    """One WARNING line with the cause so it lands in the default log file
+    (issue #85 was undiagnosable with failures swallowed at DEBUG); the full
+    exception repr stays at DEBUG."""
+    where = f" {context}" if context else ""
+    _logger.warning("Usage fetch failed%s: %s", where, kind)
+    _logger.debug("Usage fetch failure detail%s: %r", where, e)
+
+
 
 def build_usage_result(data: dict[str, Any]) -> dict[str, Any] | None:
     """Normalize raw usage API data into the structure used by the CLI."""
@@ -355,17 +331,34 @@ def account_headroom(usage: dict[str, Any] | None) -> float | None:
     return usage_policy.headroom(usage)
 
 
+@dataclass(frozen=True)
+class UsageOutcome:
+    """Result of a usage-API fetch attempt.
+
+    ``usage`` is the normalized usage dict on success (it can also be ``None``
+    on a successful round trip whose response carried no window data).
+    ``error`` is ``None`` on success, else a ``_classify_usage_error`` kind
+    (plus ``"no-access-token"`` / ``"refresh-failed"`` for pre-request
+    failures). ``retry_after_s`` carries the server's Retry-After when sent.
+    """
+
+    usage: dict[str, Any] | None
+    error: str | None = None
+    retry_after_s: float | None = None
+
+
 def fetch_usage(access_token: str) -> dict[str, Any] | None:
     """Fetch 5-hour and 7-day utilization from the Anthropic usage API."""
     try:
         data = request_usage_data(access_token)
         return build_usage_result(data)
     except Exception as e:
-        _logger.debug("Usage fetch failed: %r", e)
+        kind, _ = _classify_usage_error(e)
+        _log_usage_failure("", e, kind)
         return None
 
 
-def fetch_usage_for_account(
+def try_fetch_usage_for_account(
     account_num: str,
     email: str,
     credentials: str,
@@ -373,17 +366,16 @@ def fetch_usage_for_account(
     persist_credentials: Callable[[str, str, str], None] | None = None,
     *,
     persist_mandatory: bool = False,
-) -> dict[str, Any] | UsageFetchError | None:
+) -> UsageOutcome:
     """Fetch usage for an account, refreshing expired tokens for inactive accounts only.
 
     Active accounts are never refreshed — Claude Code owns those credentials.
     """
+    context = f"for account {account_num} ({email})"
     oauth = extract_oauth_data(credentials)
-    if not oauth:
-        return None
-    access_token = oauth.get("accessToken")
-    if not access_token:
-        return None
+    access_token = oauth.get("accessToken") if oauth else None
+    if not oauth or not access_token:
+        return UsageOutcome(None, error="no-access-token")
 
     working_credentials = credentials
 
@@ -407,30 +399,23 @@ def fetch_usage_for_account(
 
     try:
         data = request_usage_data(access_token)
-        return build_usage_result(data)
+        return UsageOutcome(build_usage_result(data))
     except urllib.error.HTTPError as e:
-        usage_error = _usage_error_from_http_error(e)
-        _logger.debug(
-            "Usage fetch failed: account=%s email=%s active=%s reason=%s status=%s message=%r",
-            account_num,
-            email,
-            is_active,
-            usage_error.reason,
-            usage_error.status_code,
-            usage_error.message,
-        )
+        kind, retry_after = _classify_usage_error(e)
         if (
             e.code != 401
             or is_active
             or not oauth
             or not oauth.get("refreshToken")
         ):
-            return usage_error
+            _log_usage_failure(context, e, kind)
+            return UsageOutcome(None, error=kind, retry_after_s=retry_after)
 
         # Retry once after refreshing on 401 (inactive accounts only).
         refreshed = refresh_oauth_credentials(working_credentials)
         if not refreshed:
-            return usage_error
+            _log_usage_failure(context, e, kind)
+            return UsageOutcome(None, error="refresh-failed")
 
         working_credentials = refreshed
         _persist(
@@ -443,41 +428,39 @@ def fetch_usage_for_account(
         refreshed_oauth = extract_oauth_data(working_credentials)
         new_token = refreshed_oauth.get("accessToken") if refreshed_oauth else None
         if not new_token:
-            return None
+            return UsageOutcome(None, error="refresh-failed")
 
         try:
             data = request_usage_data(new_token)
-            return build_usage_result(data)
-        except urllib.error.HTTPError as retry_error:
-            usage_error = _usage_error_from_http_error(retry_error)
-            _logger.debug(
-                "Usage fetch failed after refresh: account=%s email=%s active=%s reason=%s status=%s message=%r",
-                account_num,
-                email,
-                is_active,
-                usage_error.reason,
-                usage_error.status_code,
-                usage_error.message,
-            )
-            return usage_error
+            return UsageOutcome(build_usage_result(data))
         except Exception as retry_error:
-            _logger.debug(
-                "Usage fetch failed after refresh: account=%s email=%s active=%s error=%r",
-                account_num,
-                email,
-                is_active,
-                retry_error,
-            )
-            return UsageFetchError(reason="network_error", message=str(retry_error))
+            kind, retry_after = _classify_usage_error(retry_error)
+            _log_usage_failure(context + " after refresh", retry_error, kind)
+            return UsageOutcome(None, error=kind, retry_after_s=retry_after)
     except Exception as e:
-        _logger.debug(
-            "Usage fetch failed: account=%s email=%s active=%s error=%r",
-            account_num,
-            email,
-            is_active,
-            e,
-        )
-        return UsageFetchError(reason="network_error", message=str(e))
+        kind, retry_after = _classify_usage_error(e)
+        _log_usage_failure(context, e, kind)
+        return UsageOutcome(None, error=kind, retry_after_s=retry_after)
+
+
+def fetch_usage_for_account(
+    account_num: str,
+    email: str,
+    credentials: str,
+    is_active: bool,
+    persist_credentials: Callable[[str, str, str], None] | None = None,
+    *,
+    persist_mandatory: bool = False,
+) -> dict[str, Any] | None:
+    """Usage dict or None (see try_fetch_usage_for_account for the cause)."""
+    return try_fetch_usage_for_account(
+        account_num,
+        email,
+        credentials,
+        is_active,
+        persist_credentials,
+        persist_mandatory=persist_mandatory,
+    ).usage
 
 
 def _persist(

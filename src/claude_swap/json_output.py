@@ -8,35 +8,31 @@ the single ``json.dumps`` (see cli.py).
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 
-from claude_swap import oauth
+from claude_swap.usage_store import UsageEntry as StoreUsageEntry
 
 # Bump only on a breaking change to any payload shape. Scripts key off this.
 SCHEMA_VERSION = 1
 
-# Sentinel entries that ``resolve_usages`` / ``resolve_active_usage_entry`` yield
-# in place of a usage dict. Kept here (the serialization hub) so the human renderer
-# and the JSON projection agree instead of scattering raw strings.
+# Sentinel entries the usage collectors yield in place of a usage dict. Kept
+# here (the serialization hub) so the human renderer and the JSON projection
+# agree instead of scattering raw strings. Human-facing wording for these
+# lives in ``list_reporter._SENTINEL_NOTES``.
 USAGE_NO_CREDENTIALS = "no credentials"
 USAGE_TOKEN_EXPIRED = "token expired"
 # API-key (``/login`` managed key) accounts have no subscription quota; usage is
 # reported as this sentinel instead of being fetched from the OAuth usage API.
 USAGE_API_KEY = "api key"
-USAGE_API_KEY_DISPLAY = "API key (no quota)"
 # The active account's macOS Keychain was unreadable (locked / denied / timeout)
 # with no plaintext fallback — distinct from a genuinely empty slot, so the user
 # isn't misled into an unnecessary re-login.
 USAGE_KEYCHAIN_UNAVAILABLE = "keychain unavailable"
-USAGE_KEYCHAIN_UNAVAILABLE_DISPLAY = (
-    "keychain unavailable — locked or in use; try again"
-)
-USAGE_TOKEN_EXPIRED_DISPLAY = (
-    "token expired — Claude Code refreshes the active account"
-)
-USAGE_NO_CREDENTIALS_DISPLAY = USAGE_NO_CREDENTIALS
 
-UsageEntry = dict[str, Any] | str | oauth.UsageFetchError | None
+# The decision-grade usage value a store entry projects to: a usage dict, a
+# sentinel string, or None (unknown). See usage_store.UsageEntry.decision_value.
+UsageValue = dict[str, Any] | str | None
 
 # Sentinel usage values that mean "no real quota figure" — shared SSOT for the
 # switcher and the list reporter so trust checks can never diverge.
@@ -113,15 +109,15 @@ def usage_to_json(usage: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def usage_fields(entry: UsageEntry) -> tuple[str, dict[str, Any] | None]:
+def usage_fields(entry: UsageValue) -> tuple[str, dict[str, Any] | None]:
     """Map a collected usage entry to ``(usageStatus, usage|None)``.
 
     A collected entry is one of: a usage dict, the ``USAGE_TOKEN_EXPIRED`` sentinel
     (active token expired while Claude Code owns it), the ``USAGE_API_KEY`` sentinel
     (managed API-key account, no subscription quota), the
     ``USAGE_KEYCHAIN_UNAVAILABLE`` sentinel (active Keychain unreadable), the
-    ``USAGE_NO_CREDENTIALS`` sentinel, a ``UsageFetchError`` (classified fetch
-    failure), or ``None`` (fetch failed without classification).
+    ``USAGE_NO_CREDENTIALS`` sentinel, or ``None`` (unknown — fetch failed or
+    the stored measurement is too old to act on).
     """
     if isinstance(entry, dict):
         return "ok", usage_to_json(entry)
@@ -133,38 +129,34 @@ def usage_fields(entry: UsageEntry) -> tuple[str, dict[str, Any] | None]:
         return "keychain_unavailable", None
     if entry == USAGE_NO_CREDENTIALS:
         return "no_credentials", None
-    if isinstance(entry, oauth.UsageFetchError):
-        reason: dict[str, Any] = {"reason": entry.reason}
-        if entry.status_code is not None:
-            reason["statusCode"] = entry.status_code
-        if entry.retry_after is not None:
-            reason["retryAfter"] = entry.retry_after
-        return "unavailable", reason
     if isinstance(entry, str):
         return "no_credentials", None
     return "unavailable", None
 
 
-def usage_display_line(entry: UsageEntry) -> str | None:
-    """Human-readable one-liner for a collected usage sentinel."""
-    if entry == USAGE_API_KEY:
-        return USAGE_API_KEY_DISPLAY
-    if entry == USAGE_KEYCHAIN_UNAVAILABLE:
-        return USAGE_KEYCHAIN_UNAVAILABLE_DISPLAY
-    if entry == USAGE_TOKEN_EXPIRED:
-        return USAGE_TOKEN_EXPIRED_DISPLAY
-    if entry == USAGE_NO_CREDENTIALS:
-        return USAGE_NO_CREDENTIALS_DISPLAY
-    if isinstance(entry, oauth.UsageFetchError):
-        return oauth.describe_usage_error(entry)
-    if isinstance(entry, str):
-        return entry
-    return None
-
-
 def account_ref(number: int | None, email: str) -> dict[str, Any]:
     """A minimal account reference, used for switch ``from``/``to``."""
     return {"number": number, "email": email}
+
+
+def usage_freshness_fields(
+    fetched_at: float | None, age_s: float | None
+) -> dict[str, Any]:
+    """Additive ``usageFetchedAt``/``usageAgeSeconds`` fields describing how
+    old the served ``usage`` measurement is (the store may serve last-good
+    data on fetch failure). Emitted only alongside a non-null ``usage``."""
+    if fetched_at is None:
+        return {}
+    fields: dict[str, Any] = {
+        "usageFetchedAt": (
+            datetime.fromtimestamp(fetched_at, tz=timezone.utc)
+            .isoformat(timespec="seconds")
+            .replace("+00:00", "Z")
+        )
+    }
+    if age_s is not None:
+        fields["usageAgeSeconds"] = round(age_s, 1)
+    return fields
 
 
 def account_row(
@@ -173,11 +165,14 @@ def account_row(
     org_name: str,
     org_uuid: str,
     active: bool,
-    usage_entry: UsageEntry,
+    usage_entry: UsageValue,
+    *,
+    usage_fetched_at: float | None = None,
+    usage_age_s: float | None = None,
 ) -> dict[str, Any]:
     """A full account row for ``--list``."""
     status, usage = usage_fields(usage_entry)
-    return {
+    row = {
         "number": number,
         "email": email,
         "organizationName": org_name,
@@ -187,6 +182,9 @@ def account_row(
         "usageStatus": status,
         "usage": usage,
     }
+    if usage is not None:
+        row.update(usage_freshness_fields(usage_fetched_at, usage_age_s))
+    return row
 
 
 def error_envelope(exc: Exception) -> dict[str, Any]:
@@ -208,18 +206,26 @@ def empty_list_payload() -> dict[str, Any]:
 
 def list_payload(
     accounts_info: list[tuple[int, str, str, str, bool, str]],
-    usages: list[UsageEntry],
+    entries: dict[str, StoreUsageEntry],
 ) -> dict[str, Any]:
     """Build the ``--list --json`` payload from gathered account + usage data."""
     active_num: int | None = None
     accounts = []
-    for (num, email, org_name, org_uuid, is_active, _), usage in zip(
-        accounts_info, usages
-    ):
+    for num, email, org_name, org_uuid, is_active, _ in accounts_info:
         if is_active:
             active_num = num
+        entry = entries[str(num)]
+        # JSON carries the decision-grade value: last-good only while it is
+        # recent enough to act on (≤ STALE_OK_S), else unavailable. Showing
+        # older measurements is a human-display affordance only — scripts
+        # keying on usageStatus == "ok" must not act on arbitrarily old data.
         accounts.append(
-            account_row(num, email, org_name, org_uuid, is_active, usage)
+            account_row(
+                num, email, org_name, org_uuid, is_active,
+                entry.decision_value(),
+                usage_fetched_at=entry.fetched_at,
+                usage_age_s=entry.age_s,
+            )
         )
     return {
         "schemaVersion": SCHEMA_VERSION,
@@ -284,7 +290,7 @@ def status_payload(
     identity: tuple[str, str] | None,
     account_num: str | None,
     account_record: dict[str, Any] | None,
-    usage_entry: UsageEntry,
+    usage_entry: StoreUsageEntry | None,
     total_managed: int | None = None,
 ) -> dict[str, Any]:
     """Build the ``--status --json`` payload."""
@@ -298,19 +304,25 @@ def status_payload(
         }
     org_name = account_record.get("organizationName", "") or ""
     org_uuid = account_record.get("organizationUuid", "") or ""
-    status, usage = usage_fields(usage_entry)
+    # Decision-grade projection, same rule as the --list payload: stale
+    # beyond STALE_OK_S reports unavailable, not "ok" with old numbers.
+    entry = usage_entry if usage_entry is not None else StoreUsageEntry()
+    status, usage = usage_fields(entry.decision_value())
+    active: dict[str, Any] = {
+        "number": int(account_num),
+        "email": current_email,
+        "organizationName": org_name,
+        "organizationUuid": org_uuid,
+        "isOrganization": bool(org_uuid),
+        "managed": True,
+        "usageStatus": status,
+        "usage": usage,
+    }
+    if usage is not None:
+        active.update(usage_freshness_fields(entry.fetched_at, entry.age_s))
     payload: dict[str, Any] = {
         "schemaVersion": SCHEMA_VERSION,
-        "active": {
-            "number": int(account_num),
-            "email": current_email,
-            "organizationName": org_name,
-            "organizationUuid": org_uuid,
-            "isOrganization": bool(org_uuid),
-            "managed": True,
-            "usageStatus": status,
-            "usage": usage,
-        },
+        "active": active,
     }
     if total_managed is not None:
         payload["totalManagedAccounts"] = total_managed

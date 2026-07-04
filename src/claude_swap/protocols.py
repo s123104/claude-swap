@@ -18,6 +18,7 @@ from claude_swap.models import (
     SwitchPreconditions,
 )
 from claude_swap.credentials import ActiveCredentials
+from claude_swap.usage_store import UsageStore
 
 ServiceState = Literal["not installed", "installed but not loaded", "loaded"]
 
@@ -72,9 +73,7 @@ class ListHost(Protocol):
     lock_file: Path
     credentials_dir: Path
     _logger: logging.Logger
-
-    @property
-    def usage_cache_path(self) -> Path: ...
+    _usage_store: UsageStore
 
     def _get_sequence_data_migrated(self) -> dict[str, Any] | None: ...
     def _get_current_account(self) -> tuple[str, str] | None: ...
@@ -99,10 +98,6 @@ class ListHost(Protocol):
         self, email: str, org_name: str, org_uuid: str,
     ) -> str: ...
     def _first_run_setup(self) -> None: ...
-    def _usage_cache_fresh(
-        self, cached: dict[str, Any], account_keys: set[str],
-    ) -> bool: ...
-    def _merge_usage_cache(self, updates: dict[str, object]) -> None: ...
 
 
 class SwitchCliHost(Protocol):
