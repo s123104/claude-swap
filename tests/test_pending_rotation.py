@@ -31,6 +31,7 @@ from claude_swap.credential_refresh import (
     recover_pending_rotation,
 )
 from claude_swap.credentials import pending_rotation_path
+from claude_swap.exceptions import CredentialWriteError
 from claude_swap.list_reporter import ListReporter
 from claude_swap.locking import FileLock
 from claude_swap.models import Platform
@@ -270,6 +271,74 @@ class TestProbe5Eradication:
 
         sw._delete_account_credentials("2", "b@example.com")
 
+        assert not pending_rotation_path(
+            sw.credentials_dir, "2", "b@example.com"
+        ).exists()
+
+
+class TestVerifyMismatchParking:
+    """A failed backup write verification must not cost the consumed rotation.
+
+    ``refresh_inactive_if_needed`` raises ``CredentialWriteError`` when the
+    read-back after persisting a refreshed token does not match — but the
+    network refresh has already consumed the single-use refresh token, so the
+    in-memory rotation is the slot's only working credential. It must be
+    parked durably (same recovery path as a wedged lock) before the loud
+    error surfaces.
+    """
+
+    def test_verify_mismatch_parks_the_rotation_instead_of_losing_it(
+        self, temp_home: Path
+    ):
+        sw = _seed_switcher(temp_home)
+        old = _oauth_creds("old", expired=True)
+        sw._write_account_credentials("2", "b@example.com", old)
+        rotated = _oauth_creds("rotated")
+
+        # Reads keep returning the stale credential even after the write,
+        # simulating a backup write that silently did not take (e.g. a
+        # Keychain ACL hiccup).
+        with (
+            patch(
+                "claude_swap.oauth.refresh_oauth_credentials",
+                return_value=rotated,
+            ),
+            patch.object(sw, "_read_account_credentials", return_value=old),
+            patch.object(sw, "_write_account_credentials"),
+            pytest.raises(CredentialWriteError),
+        ):
+            sw._refresh_inactive_credentials_if_needed("2", "b@example.com", old)
+
+        pending = pending_rotation_path(sw.credentials_dir, "2", "b@example.com")
+        assert pending.exists()
+        payload = json.loads(pending.read_text())
+        assert payload["credentials"] == rotated
+        assert payload["replaces"] == ["rt-old"]
+
+    def test_parked_verify_mismatch_recovers_on_the_next_list_pass(
+        self, temp_home: Path
+    ):
+        sw = _seed_switcher(temp_home)
+        old = _oauth_creds("old", expired=True)
+        sw._write_account_credentials("2", "b@example.com", old)
+        rotated = _oauth_creds("rotated")
+
+        with (
+            patch(
+                "claude_swap.oauth.refresh_oauth_credentials",
+                return_value=rotated,
+            ),
+            patch.object(sw, "_read_account_credentials", return_value=old),
+            patch.object(sw, "_write_account_credentials"),
+            pytest.raises(CredentialWriteError),
+        ):
+            sw._refresh_inactive_credentials_if_needed("2", "b@example.com", old)
+
+        # The next locked pass over the slot applies the parked rotation.
+        with patch.object(sw, "_live_session_pids", return_value=[]):
+            ListReporter(sw).build_accounts_info()
+
+        assert sw._read_account_credentials("2", "b@example.com") == rotated
         assert not pending_rotation_path(
             sw.credentials_dir, "2", "b@example.com"
         ).exists()

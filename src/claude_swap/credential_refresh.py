@@ -523,6 +523,33 @@ class CredentialRefresher:
                 )
                 return current, "token already fresh on disk"
 
-            self._persist_account_verified(account_num, email, refreshed)
+            try:
+                self._persist_account_verified(account_num, email, refreshed)
+            except CredentialWriteError:
+                # The network refresh above consumed the single-use refresh
+                # token, so the in-memory rotation is the slot's only working
+                # credential. Park it durably (same recovery path as a wedged
+                # lock) before surfacing the loud error, so the next locked
+                # pass over the slot can still apply it.
+                park_rotated_credential(
+                    self._sw.credentials_dir,
+                    account_num,
+                    email,
+                    refreshed,
+                    replaces=[
+                        t
+                        for t in dict.fromkeys((original_refresh, current_refresh))
+                        if isinstance(t, str)
+                    ],
+                )
+                self._sw._logger.warning(
+                    "Parked refreshed OAuth token for account %s (%s): backup "
+                    "write verification failed. It will be applied "
+                    "automatically by the next list/switch that touches the "
+                    "slot.",
+                    account_num,
+                    email,
+                )
+                raise
             self._sw._logger.info("Refreshed inactive credentials for account %s", account_num)
             return refreshed, "token refreshed"
