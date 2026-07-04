@@ -2698,49 +2698,52 @@ class ClaudeAccountSwitcher:
     def _purge_remove_account_credentials(
         self, data: dict[str, Any] | None, removed_items: list[str]
     ) -> None:
+        # On macOS backups may be in the Keychain and/or .enc files
+        # (auto-fallback), and the per-process capability cache says nothing
+        # about which backend *past* runs wrote — clean both unconditionally
+        # rather than route through it. Linux/WSL/Windows are file-only.
         if not data:
             return
         for account_num, account_info in data.get("accounts", {}).items():
             email = account_info.get("email", "")
-            if self._uses_file_backup_backend():
-                cred_files = [
-                    self.credentials_dir / f".creds-{account_num}-{email}.enc"
-                ]
-                if str(account_num) != "None":
-                    cred_files.append(
-                        self.credentials_dir / f".creds-None-{email}.enc"
-                    )
-                for cred_file in cred_files:
-                    try:
-                        if cred_file.exists():
-                            cred_file.unlink()
-                            removed_items.append(f"Credential file: {cred_file.name}")
-                    except Exception:
-                        pass
-                if self.platform == Platform.WINDOWS:
-                    usernames = [f"account-{account_num}-{email}"]
-                    if str(account_num) != "None":
-                        usernames.append(f"account-None-{email}")
-                    _sweep_legacy_keyring(usernames, removed_items)
-            else:
-                usernames = [f"account-{account_num}-{email}"]
-                if str(account_num) != "None":
-                    usernames.append(f"account-None-{email}")
+            nums = [account_num]
+            if str(account_num) != "None":
+                nums.append("None")
+            usernames = [f"account-{num}-{email}" for num in nums]
+
+            # .enc files (Linux/WSL/Windows always; macOS fallback copies).
+            for num in nums:
+                cred_file = self.credentials_dir / f".creds-{num}-{email}.enc"
+                try:
+                    if cred_file.exists():
+                        cred_file.unlink()
+                        removed_items.append(f"Credential file: {cred_file.name}")
+                except Exception:
+                    pass
+
+            # macOS Keychain items via `security` (current macOS backend).
+            if self.platform == Platform.MACOS:
                 for username in usernames:
                     try:
                         macos_keychain.delete_password(SECURITY_SERVICE, username)
                         removed_items.append(f"Credential: {username}")
                     except Exception:
                         pass
+
+            # Best-effort sweep of any pre-migration keyring / Credential
+            # Manager entries left behind by an incomplete migration.
+            # Linux/WSL never used a keyring backend.
+            if self.platform in (Platform.MACOS, Platform.WINDOWS):
                 _sweep_legacy_keyring(usernames, removed_items)
 
     def purge(self) -> None:
         """Remove all traces of claude-swap from the system.
 
         This removes:
-        - All stored account credentials (files on Linux/WSL/Windows, macOS
-          Keychain items via ``security`` on macOS), plus a best-effort sweep of
-          any pre-migration keyring / Windows Credential Manager entries left behind
+        - All stored account credentials (``.enc`` files on Linux/WSL/Windows; on
+          macOS both the Keychain items via ``security`` and any fallback ``.enc``
+          files), plus a best-effort sweep of any pre-migration keyring / Windows
+          Credential Manager entries left behind
         - The active backup directory (XDG path on Linux/WSL, ~/.claude-swap-backup elsewhere)
         - Any stale legacy ~/.claude-swap-backup directory left around from
           before the XDG migration
@@ -2753,10 +2756,10 @@ class ClaudeAccountSwitcher:
         print(f"  - Backup directory: {self.backup_dir}")
         if legacy_distinct and legacy.exists():
             print(f"  - Legacy backup directory: {legacy}")
-        if self._uses_file_backup_backend():
-            print("  - All stored account credential files")
+        if self.platform == Platform.MACOS:
+            print("  - All stored account credentials (macOS Keychain and/or files)")
         else:
-            print("  - All stored account credentials from the macOS Keychain")
+            print("  - All stored account credential files")
         if session_dirs:
             print("  - All session profiles and their Keychain entries")
         print()

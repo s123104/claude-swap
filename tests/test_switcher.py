@@ -3269,9 +3269,8 @@ class TestAddAccountFromToken:
 class TestPurge:
     """Tests for purge cleanup."""
 
-    def test_purge_removes_legacy_none_keychain_entry(self, temp_home):
-        """Purge should clean account-None-* entries from older buggy runs — from
-        the new security service and best-effort from the legacy keyring."""
+    @staticmethod
+    def _macos_switcher_with_one_account(temp_home) -> ClaudeAccountSwitcher:
         switcher = ClaudeAccountSwitcher()
         switcher.platform = Platform.MACOS
         switcher._setup_directories()
@@ -3289,6 +3288,12 @@ class TestPurge:
                 }
             },
         })
+        return switcher
+
+    def test_purge_removes_legacy_none_keychain_entry(self, temp_home):
+        """Purge should clean account-None-* entries from older buggy runs — from
+        the new security service and best-effort from the legacy keyring."""
+        switcher = self._macos_switcher_with_one_account(temp_home)
 
         mock_keyring = MagicMock()
         with patch("builtins.input", return_value="y"), \
@@ -3306,6 +3311,48 @@ class TestPurge:
             call("claude-code", "account-1-user@example.com"),
             call("claude-code", "account-None-user@example.com"),
         ])
+
+    def test_purge_in_file_fallback_mode_still_clears_macos_keychain(
+        self, temp_home
+    ):
+        """A Keychain flipped to file mode this process must not skip Keychain
+        cleanup: items written by earlier keychain-mode runs live outside
+        backup_dir, so nothing else removes them (upstream sweeps both)."""
+        switcher = self._macos_switcher_with_one_account(temp_home)
+        switcher._store._keychain_usable_cache = False
+
+        mock_keyring = MagicMock()
+        with patch("builtins.input", return_value="y"), \
+             patch("claude_swap.switcher.macos_keychain") as mock_kc, \
+             patch.dict(sys.modules, {"keyring": mock_keyring}):
+            switcher.purge()
+
+        mock_kc.delete_password.assert_has_calls([
+            call("claude-swap", "account-1-user@example.com"),
+            call("claude-swap", "account-None-user@example.com"),
+        ])
+        mock_keyring.delete_password.assert_has_calls([
+            call("claude-code", "account-1-user@example.com"),
+            call("claude-code", "account-None-user@example.com"),
+        ])
+
+    def test_purge_credential_sweep_removes_fallback_enc_in_keychain_mode(
+        self, temp_home
+    ):
+        """The credential sweep itself must unlink fallback .enc files even in
+        Keychain mode — reads are .enc-wins, so a leftover fallback file is a
+        live credential, not cruft, and the rmtree backstop can fail partway."""
+        switcher = self._macos_switcher_with_one_account(temp_home)
+        enc = switcher.credentials_dir / ".creds-1-user@example.com.enc"
+        enc.write_text("b64-credential-payload")
+
+        removed: list[str] = []
+        switcher._purge_remove_account_credentials(
+            switcher._get_sequence_data(), removed,
+        )
+
+        assert not enc.exists()
+        assert f"Credential file: {enc.name}" in removed
 
 
 # ---------------------------------------------------------------------------
