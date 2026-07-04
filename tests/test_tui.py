@@ -600,6 +600,61 @@ class TestWatch:
             tui._watch_loop(screen, switcher, interval=5)
         mock_switch.assert_not_called()
 
+    def test_active_index_finds_active_row(self):
+        body = ["Accounts:", "  1: a [x]", "  2: b [x] (active)", "  3: c [x]"]
+        rows = tui._watch_account_rows(body)
+        assert tui._watch_active_index(rows, body) == 1  # row for account 2
+
+    def test_active_index_defaults_to_zero(self):
+        body = ["Accounts:", "  1: a [x]", "  2: b [x]"]
+        rows = tui._watch_account_rows(body)
+        assert tui._watch_active_index(rows, body) == 0
+
+    def test_selection_starts_on_active_row(self, temp_home: Path):
+        _make_seq(temp_home, [("1", "a@x.com"), ("2", "b@x.com")])
+        switcher = ClaudeAccountSwitcher()
+        screen = _stub_screen()
+
+        def _print_accounts():
+            print("Accounts:")
+            print("  1: a@x.com [personal]")
+            print("  2: b@x.com [personal] (active)")  # account 2 is active
+
+        # s → select starts on the active row (account 2), Enter → switch to 2.
+        screen.getch.side_effect = [ord("s"), 10, ord("q")]
+        with patch.object(switcher, "list_accounts", side_effect=_print_accounts), \
+             patch.object(switcher, "switch_to") as mock_switch, \
+             patch("claude_swap.tui.time.monotonic", return_value=100.0):
+            tui._watch_loop(screen, switcher, interval=5)
+        mock_switch.assert_called_once_with("2")
+
+    def test_capture_has_error(self):
+        assert tui._capture_has_error("Error: could not acquire lock\n")
+        assert not tui._capture_has_error("Switched to Account-2 (b@x.com)\n")
+        assert not tui._capture_has_error("")
+
+    def test_switch_failure_surfaces_in_pager(self, temp_home: Path):
+        _make_seq(temp_home, [("1", "a@x.com"), ("2", "b@x.com")])
+        switcher = ClaudeAccountSwitcher()
+        screen = _stub_screen()
+
+        def _print_accounts():
+            print("Accounts:")
+            print("  1: a@x.com [personal] (active)")
+            print("  2: b@x.com [personal]")
+
+        # s → select, Enter → switch fails → its error is paged (not swallowed).
+        screen.getch.side_effect = [ord("s"), 10, ord("q")]
+        with patch.object(switcher, "list_accounts", side_effect=_print_accounts), \
+             patch.object(switcher, "switch_to",
+                          side_effect=ClaudeSwitchError("lock timeout")), \
+             patch("claude_swap.tui._pager") as mock_pager, \
+             patch("claude_swap.tui.time.monotonic", return_value=100.0):
+            tui._watch_loop(screen, switcher, interval=5)
+        mock_pager.assert_called_once()
+        paged_lines = mock_pager.call_args.args[2]
+        assert any("lock timeout" in line for line in paged_lines)
+
 
 class TestInitColors:
     def test_initializes_pairs_when_color_supported(self):
