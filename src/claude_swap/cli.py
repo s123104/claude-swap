@@ -11,9 +11,8 @@ from typing import Any, cast
 from claude_swap import __version__
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import error_envelope
-from claude_swap.printer import bolded, dimmed, error, muted
-from claude_swap.sequence_store import AutoSwitchConfig
-from claude_swap.switcher import ClaudeAccountSwitcher, auto_switch_display
+from claude_swap.printer import dimmed, error, muted
+from claude_swap.switcher import ClaudeAccountSwitcher
 
 
 def _run_command(argv: list[str]) -> None:
@@ -318,9 +317,9 @@ def _service_command(argv: list[str]) -> None:
     parser = argparse.ArgumentParser(
         prog="cswap service",
         description=(
-            "Manage the background auto-switch monitor (launchd on macOS, "
+            "Manage the background auto-switch engine (launchd on macOS, "
             "systemd --user on Linux/WSL, Task Scheduler on Windows). "
-            "Runs `cswap --monitor` at login and restarts it on failure."
+            "Runs `cswap auto` at login and restarts it on failure."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
@@ -362,82 +361,12 @@ Examples:
         sys.exit(130)
 
 
-def _print_auto_switch_config(config: AutoSwitchConfig) -> None:
-    _enabled, threshold, on_off, _state = auto_switch_display(config)
-    print(f"{bolded('Auto-switch:')} {on_off} {muted(f'(threshold {threshold}%)')}")
-
-
-def _auto_switch_command(argv: list[str]) -> None:
-    """Handle `cswap auto-switch status|enable|disable|set-threshold N`."""
-    parser = argparse.ArgumentParser(
-        prog="cswap auto-switch",
-        description="Manage persisted auto-switch configuration.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  cswap auto-switch status
-  cswap auto-switch enable
-  cswap auto-switch disable
-  cswap auto-switch set-threshold 95
-        """,
-    )
-    parser.add_argument(
-        "action",
-        choices=("status", "enable", "disable", "set-threshold"),
-        help="status | enable | disable | set-threshold",
-    )
-    parser.add_argument(
-        "threshold",
-        nargs="?",
-        type=int,
-        metavar="NUM",
-        help="Threshold percentage (required for set-threshold)",
-    )
-    parser.add_argument(
-        "--debug",
-        action="store_true",
-        help="Enable debug logging",
-    )
-    args = parser.parse_args(argv)
-
-    if args.action == "set-threshold" and args.threshold is None:
-        parser.error("set-threshold requires NUM")
-    if args.action != "set-threshold" and args.threshold is not None:
-        parser.error("threshold is only accepted with set-threshold")
-
-    try:
-        switcher = ClaudeAccountSwitcher(debug=args.debug)
-
-        if sys.platform != "win32":
-            if os.geteuid() == 0 and not switcher._is_running_in_container():
-                error("Error: Do not run this script as root (unless running in a container)")
-                sys.exit(1)
-
-        if args.action == "status":
-            config = switcher.get_auto_switch_config()
-        elif args.action == "enable":
-            config = switcher.set_auto_switch_config(enabled=True)
-        elif args.action == "disable":
-            config = switcher.set_auto_switch_config(enabled=False)
-        else:
-            config = switcher.set_auto_switch_config(threshold=args.threshold)
-
-        _print_auto_switch_config(config)
-    except ClaudeSwitchError as e:
-        error(f"Error: {e}")
-        sys.exit(1)
-    except KeyboardInterrupt:
-        print(f"\n{dimmed('Operation cancelled')}")
-        sys.exit(130)
-
-
 # Map subcommand -> handler name; resolved via globals() at call time so tests
 # can monkeypatch the module-level handler (e.g. cli._service_command).
 _SUBCOMMANDS = {
     "run": "_run_command",
     "auto": "_auto_command",
     "service": "_service_command",
-    "auto-switch": "_auto_switch_command",
 }
 
 
@@ -471,8 +400,7 @@ Examples:
   %(prog)s --export backup.cswap
   %(prog)s --import backup.cswap
   %(prog)s --tui                              # interactive arrow-key menu
-  %(prog)s --monitor                          # foreground auto-switch monitor
-  %(prog)s service install                    # background auto-switch monitor
+  %(prog)s service install                    # background auto-switch engine
   %(prog)s --upgrade                          # self-upgrade to latest version
         """,
     )
@@ -605,11 +533,6 @@ Examples:
         help="Launch interactive arrow-key menu (single-level)",
     )
     group.add_argument(
-        "--monitor",
-        action="store_true",
-        help="Run the auto-switch monitor in the foreground",
-    )
-    group.add_argument(
         "--upgrade",
         action="store_true",
         help="Upgrade claude-swap to the latest version on PyPI",
@@ -624,15 +547,6 @@ Examples:
             "as a new account; the type is auto-detected. Pass '-' to read from "
             "stdin or omit the value to be prompted securely."
         ),
-    )
-    # Internal flag appended by the service backends to the supervised
-    # ``--monitor`` argv. Hidden from --help: users start the foreground
-    # monitor without it, and setting it changes only the PID-collision exit
-    # code (75 so the supervisor retries, instead of 0).
-    parser.add_argument(
-        "--service-monitor",
-        action="store_true",
-        help=argparse.SUPPRESS,
     )
     return parser
 
@@ -670,9 +584,6 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
     if args.full and not args.export:
         parser.error("--full can only be used with --export")
 
-    if args.service_monitor and not args.monitor:
-        parser.error("--service-monitor can only be used with --monitor")
-
 
 def _cmd_export(switcher: ClaudeAccountSwitcher, args: argparse.Namespace) -> None:
     from claude_swap.transfer import export_accounts
@@ -696,14 +607,6 @@ def _cmd_tui(switcher: ClaudeAccountSwitcher, args: argparse.Namespace) -> None:
         )
         sys.exit(1)
     sys.exit(tui_run(switcher))
-
-
-def _cmd_monitor(switcher: ClaudeAccountSwitcher, args: argparse.Namespace) -> None:
-    from claude_swap.monitor import run_cli_monitor
-
-    if args.service_monitor:
-        sys.exit(run_cli_monitor(switcher, service_mode=True))
-    sys.exit(run_cli_monitor(switcher))
 
 
 def _dispatch_action(
@@ -751,8 +654,6 @@ def _dispatch_action(
         _cmd_import(switcher, args)
     elif args.tui:
         _cmd_tui(switcher, args)
-    elif args.monitor:
-        _cmd_monitor(switcher, args)
     return None
 
 

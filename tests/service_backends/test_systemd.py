@@ -82,17 +82,16 @@ class TestBuildUnit:
         switcher = ClaudeAccountSwitcher()
         unit = systemd_backend._build_unit(switcher)
         assert f"ExecStart={sys.executable}" in unit.replace('"', "")
-        assert "claude_swap" in unit
-        assert "--monitor" in unit
+        assert "claude_swap auto" in unit.replace('"', "")
         assert "Restart=on-failure" in unit
         assert "RestartSec=30" in unit
         assert "WantedBy=default.target" in unit
-        assert "Description=Claude Swap auto-switch monitor" in unit
+        assert "Description=Claude Swap auto-switch engine" in unit
 
-    def test_exit_75_stays_in_the_restart_set(self, temp_home: Path):
-        # Regression guard: SuccessExitStatus=75 or RestartPreventExitStatus=75
-        # would stop Restart=on-failure from restarting after the monitor's
-        # retryable exit 75, silently disabling the service retry path.
+    def test_crash_stays_in_the_restart_set(self, temp_home: Path):
+        # Regression guard: SuccessExitStatus or RestartPreventExitStatus
+        # entries would stop Restart=on-failure from restarting after an
+        # engine crash, silently disabling the service retry path.
         switcher = ClaudeAccountSwitcher()
         unit = systemd_backend._build_unit(switcher)
         assert "Restart=on-failure" in unit
@@ -172,7 +171,7 @@ class TestInstall:
         assert unit_path.exists()
         text = unit_path.read_text(encoding="utf-8")
         assert "ExecStart=" in text
-        assert "--monitor" in text
+        assert "claude_swap auto" in text.replace('"', "")
         assert (switcher.backup_dir / "logs").is_dir()
 
         assert ["systemctl", "--user", "daemon-reload"] in calls

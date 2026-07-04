@@ -23,8 +23,7 @@ from tests.conftest import stub_screen  # noqa: E402
 
 from claude_swap import tui  # noqa: E402
 from claude_swap.exceptions import ClaudeSwitchError
-from claude_swap.sequence_store import AutoSwitchConfig
-from claude_swap.switcher import ClaudeAccountSwitcher, auto_switch_display
+from claude_swap.switcher import ClaudeAccountSwitcher
 
 
 # --------------------------------------------------------------------------- #
@@ -79,17 +78,6 @@ class TestStatusLine:
         line = tui._status_line(switcher)
         assert "u@example.com" in line
         assert "1 managed" in line
-
-    def test_auto_switch_label_uses_on_off(self, temp_home: Path):
-        _make_seq(temp_home, [("1", "u@example.com")])
-        switcher = ClaudeAccountSwitcher()
-        switcher.set_auto_switch_config(enabled=True, threshold=88)
-        _enabled, _threshold, on_off, _state = auto_switch_display(
-            switcher.get_auto_switch_config()
-        )
-        assert on_off == "ON"
-        assert f"auto-switch {on_off} (88%)" in tui._status_line(switcher)
-
 
 class TestAccountItems:
     def test_empty_when_no_accounts(self, temp_home: Path):
@@ -313,10 +301,7 @@ class TestMainLoopHealth:
     def test_health_entry_dispatches_with_flags(self, temp_home: Path):
         switcher = MagicMock(spec=ClaudeAccountSwitcher)
         # _status_line consults the switcher; keep it cheap and deterministic.
-        switcher.get_auto_switch_config.return_value = AutoSwitchConfig(
-            enabled=False, threshold=90,
-        )
-        switcher._get_sequence_data_migrated.return_value = None
+        switcher._get_sequence_data.return_value = None
         switcher._get_current_account.return_value = None
 
         screen = stub_screen(rows=40, cols=120)
@@ -344,10 +329,7 @@ class TestMainLoopHealth:
     def test_quick_list_entry_uses_no_flags(self, temp_home: Path):
         """Regression: the list entry stays flag-free."""
         switcher = MagicMock(spec=ClaudeAccountSwitcher)
-        switcher.get_auto_switch_config.return_value = AutoSwitchConfig(
-            enabled=False, threshold=90,
-        )
-        switcher._get_sequence_data_migrated.return_value = None
+        switcher._get_sequence_data.return_value = None
         switcher._get_current_account.return_value = None
 
         screen = stub_screen(rows=40, cols=120)
@@ -520,30 +502,22 @@ class TestPager:
 
 
 class TestAutoSwitchHandlers:
-    def test_auto_toggle_flips_enabled(self, temp_home: Path):
-        switcher = ClaudeAccountSwitcher()
-        screen = stub_screen()
-        tui._auto_toggle(
-            screen, switcher, AutoSwitchConfig(enabled=False, threshold=90),
-        )
-        assert switcher.get_auto_switch_config().enabled is True
-        tui._auto_toggle(
-            screen, switcher, AutoSwitchConfig(enabled=True, threshold=90),
-        )
-        assert switcher.get_auto_switch_config().enabled is False
-
     def test_auto_threshold_persists_valid_value(self, temp_home: Path):
+        from claude_swap.settings import load_settings
+
         switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
         screen = stub_screen()
         with (
             patch("claude_swap.tui._prompt_text", return_value="80"),
             patch("claude_swap.tui.curses.curs_set"),
         ):
             tui._auto_threshold(screen, switcher)
-        assert switcher.get_auto_switch_config().threshold == 80
+        assert load_settings(switcher.backup_dir).threshold == 80.0
 
-    def test_auto_threshold_rejects_non_integer(self, temp_home: Path):
+    def test_auto_threshold_rejects_non_number(self, temp_home: Path):
         switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
         screen = stub_screen()
         with (
             patch("claude_swap.tui._prompt_text", return_value="abc"),
@@ -552,10 +526,11 @@ class TestAutoSwitchHandlers:
         ):
             tui._auto_threshold(screen, switcher)
         mock_message.assert_called_once()
-        assert "whole number" in mock_message.call_args.args[1]
+        assert "must be a number" in mock_message.call_args.args[1]
 
-    def test_auto_threshold_surfaces_switcher_validation(self, temp_home: Path):
+    def test_auto_threshold_rejects_out_of_range(self, temp_home: Path):
         switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
         screen = stub_screen()
         with (
             patch("claude_swap.tui._prompt_text", return_value="101"),
@@ -564,7 +539,7 @@ class TestAutoSwitchHandlers:
         ):
             tui._auto_threshold(screen, switcher)
         mock_message.assert_called_once()
-        assert "Invalid threshold:" in mock_message.call_args.args[1]
+        assert "between" in mock_message.call_args.args[1]
 
 
 class TestRunInline:
@@ -669,46 +644,74 @@ class TestInitColors:
             tui._init_colors()  # must not raise
 
 
-class TestMonitorPidFacade:
-    """TUI re-exports public monitor pid helpers (switcher arg, not path)."""
+class TestRunAutoEngine:
+    """The TUI's foreground auto-switch runs the real engine loop."""
 
-    def test_run_auto_monitor_uses_public_acquire_release(self, temp_home: Path):
+    def _engine(self, mock_engine_cls: MagicMock) -> MagicMock:
+        engine = MagicMock()
+        engine.tick.return_value = MagicMock()
+        engine._next_delay.return_value = 60
+        mock_engine_cls.return_value = engine
+        return engine
+
+    def test_quits_on_q_after_one_tick(self, temp_home: Path):
         switcher = ClaudeAccountSwitcher()
         screen = stub_screen()
         screen.getch.side_effect = [ord("q")]
         with (
-            patch(
-                "claude_swap.tui.acquire_pid", return_value=None
-            ) as mock_acquire,
-            patch("claude_swap.tui.release_pid") as mock_release,
-            patch("claude_swap.tui.monitor_step") as mock_step,
-            patch("claude_swap.tui.get_logger") as mock_logger,
+            patch("claude_swap.tui.AutoSwitchEngine") as mock_engine_cls,
             patch("claude_swap.tui.curses.curs_set"),
         ):
-            mock_step.return_value = MagicMock(
-                threshold=95,
-                pct=10.0,
-                next_interval=60,
-                user_message="ok",
-            )
-            mock_logger.return_value = MagicMock()
-            tui._run_auto_monitor(screen, switcher, threshold=95)
-        mock_acquire.assert_called_once_with(switcher)
-        mock_release.assert_called_once_with(switcher)
+            engine = self._engine(mock_engine_cls)
+            tui._run_auto_engine(screen, switcher)
+        engine.tick.assert_called_once()
+        mock_engine_cls.assert_called_once()
+        assert mock_engine_cls.call_args.args[0] is switcher
 
-    def test_run_auto_monitor_blocks_when_acquire_returns_pid(self, temp_home: Path):
+    def test_s_key_forces_immediate_tick(self, temp_home: Path):
         switcher = ClaudeAccountSwitcher()
         screen = stub_screen()
+        screen.getch.side_effect = [ord("s"), ord("q")]
         with (
-            patch("claude_swap.tui.acquire_pid", return_value=9999),
-            patch("claude_swap.tui._show_message") as mock_message,
-            patch("claude_swap.tui.monitor_step") as mock_step,
+            patch("claude_swap.tui.AutoSwitchEngine") as mock_engine_cls,
             patch("claude_swap.tui.curses.curs_set"),
         ):
-            tui._run_auto_monitor(screen, switcher, threshold=95)
-        mock_step.assert_not_called()
-        mock_message.assert_called_once()
-        assert "9999" in mock_message.call_args.args[1]
+            engine = self._engine(mock_engine_cls)
+            tui._run_auto_engine(screen, switcher)
+        assert engine.tick.call_count == 2
+
+    def test_engine_events_reach_screen_and_log(self, temp_home: Path):
+        """The on_event callback appends to the visible feed and mirrors to
+        the decision log — the same surface the background service writes."""
+        switcher = ClaudeAccountSwitcher()
+        screen = stub_screen()
+        screen.getch.side_effect = [ord("q")]
+        drawn: list[list[str]] = []
+
+        def fake_draw(stdscr, threshold, events, seconds_to_next):
+            drawn.append(list(events))
+
+        event = MagicMock()
+        event.human.return_value = "poll a@x 10.0% headroom 90.0%"
+
+        with (
+            patch("claude_swap.tui.AutoSwitchEngine") as mock_engine_cls,
+            patch("claude_swap.tui._draw_engine", side_effect=fake_draw),
+            patch("claude_swap.tui.curses.curs_set"),
+            patch.object(switcher, "_logger") as mock_logger,
+        ):
+            engine = self._engine(mock_engine_cls)
+
+            def tick_with_event():
+                on_event = mock_engine_cls.call_args.args[2]
+                on_event(event)
+                return MagicMock()
+
+            engine.tick.side_effect = tick_with_event
+            tui._run_auto_engine(screen, switcher)
+
+        assert any("poll a@x" in line for frame in drawn for line in frame)
+        assert mock_logger.info.called
 
 
 class TestServiceStateCrossPlatform:

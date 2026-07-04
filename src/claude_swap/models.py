@@ -8,9 +8,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum, auto
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, ClassVar, Literal
-
-SwitchPlanOutcome = Literal["no_trusted_signal", "already_optimal", "chosen"]
+from typing import TYPE_CHECKING, Any, ClassVar
 
 if TYPE_CHECKING:
     from claude_swap.switcher import ClaudeAccountSwitcher
@@ -162,51 +160,11 @@ def get_timestamp() -> str:
 
 
 @dataclass(frozen=True)
-class AutoSwitchDecisionContext:
-    """Single poll-cycle snapshot for automated target planning."""
-
-    threshold: int
-    active_usage_pct: float | None
-    live_active_slot: str | None
-    sequence_active_slot: str | None
-    usage_by_slot: dict[str, object]
-
-
-@dataclass(frozen=True)
-class SwitchPlanResult:
-    """Explicit automated target-planning outcome."""
-
-    outcome: SwitchPlanOutcome
-    target: str | None = None
-    reason: str = ""
-
-
-@dataclass(frozen=True)
 class ManualSwitchIntent:
     """Interactive manual rotation (round-robin)."""
 
     quiet: ClassVar[bool] = False
     force_refresh: ClassVar[bool] = False
-
-
-@dataclass(frozen=True)
-class InteractiveAutoSwitchIntent:
-    """TUI monitor: user-visible automated switch."""
-
-    decision: AutoSwitchDecisionContext
-
-    quiet: ClassVar[bool] = False
-    force_refresh: ClassVar[bool] = True
-
-
-@dataclass(frozen=True)
-class BackgroundAutoSwitchIntent:
-    """CLI / launchd monitor: quiet automated switch."""
-
-    decision: AutoSwitchDecisionContext
-
-    quiet: ClassVar[bool] = True
-    force_refresh: ClassVar[bool] = True
 
 
 @dataclass(frozen=True)
@@ -217,12 +175,7 @@ class CliSwitchIntent:
     force_refresh: bool = False
 
 
-SwitchIntent = (
-    ManualSwitchIntent
-    | InteractiveAutoSwitchIntent
-    | BackgroundAutoSwitchIntent
-    | CliSwitchIntent
-)
+SwitchIntent = ManualSwitchIntent | CliSwitchIntent
 
 
 class SwitchPreconditionKind(Enum):

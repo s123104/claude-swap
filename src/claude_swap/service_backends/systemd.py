@@ -96,16 +96,12 @@ def _build_unit(switcher: ServiceHost) -> str:
         f'Environment="{key}={_systemd_escape_value(value)}"'
         for key, value in service_spec.passthrough_env().items()
     ]
-    # Restart=on-failure is load-bearing for the exit-75 retry path: the
-    # monitor exits 75 (EX_TEMPFAIL) on a PID collision precisely so systemd
-    # restarts it after RestartSec. Do NOT add SuccessExitStatus=75 or
-    # RestartPreventExitStatus=75 — both reclassify 75 as a non-restart exit
-    # and would silently disable the retry, the inverse of the design.
+    # Restart=on-failure restarts a crashed engine after RestartSec.
     # RestartSec=30 also keeps every restart outside the default start-limit
     # window (10s/5 tries), so the unit retries indefinitely.
     lines = [
         "[Unit]",
-        "Description=Claude Swap auto-switch monitor",
+        "Description=Claude Swap auto-switch engine",
         "After=network.target",
         "",
         "[Service]",
@@ -234,10 +230,11 @@ class SystemdBackend:
             )
         if service_spec.is_wsl():
             _print_wsl_guidance()
+        command = service_spec.RUNNER_COMMAND_LABEL
         service_spec.print_install_success(
             switcher,
             artifact_path=unit_path,
-            run_hint="runs `cswap --monitor` at login; stdout/stderr → systemd journal",
+            run_hint=f"runs `{command}` at login; stdout/stderr → systemd journal",
         )
         return 0
 

@@ -8,35 +8,13 @@ from unittest.mock import patch
 
 import pytest
 
-from typing import TYPE_CHECKING
-
 from claude_swap.exceptions import CredentialReadError
 from claude_swap.models import Platform
-
-if TYPE_CHECKING:
-    from claude_swap.models import BackgroundAutoSwitchIntent
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 
 class TestPerformSwitchPostDisplay:
     """Regression tests for the post-switch display running outside the lock."""
-
-    @staticmethod
-    def _background_intent() -> "BackgroundAutoSwitchIntent":
-        from claude_swap.models import (
-            AutoSwitchDecisionContext,
-            BackgroundAutoSwitchIntent,
-        )
-
-        return BackgroundAutoSwitchIntent(
-            decision=AutoSwitchDecisionContext(
-                threshold=95,
-                active_usage_pct=None,
-                live_active_slot="1",
-                sequence_active_slot="1",
-                usage_by_slot={},
-            ),
-        )
 
     def _setup_two_accounts(
         self,
@@ -250,9 +228,10 @@ class TestPerformSwitchPostDisplay:
         sample_sequence_data: dict,
         capsys,
     ):
-        """BackgroundAutoSwitchIntent suppresses banners and followup:
-        launchd's stdout/stderr should not collect interactive banner text or
-        the platform-specific 'next message / 30s' followup line.
+        """The engine's ``switch_to(..., json_output=True)`` path suppresses
+        banners and followup: launchd's stdout/stderr should not collect
+        interactive banner text or the platform-specific 'next message / 30s'
+        followup line.
         """
         switcher, creds_store, configs_store = self._setup_two_accounts(
             temp_home,
@@ -283,12 +262,13 @@ class TestPerformSwitchPostDisplay:
                 ),
                 patch.object(switcher, "list_accounts") as mock_list,
             ):
-                switcher._perform_switch("2", intent=self._background_intent())
+                result = switcher.switch_to("2", json_output=True)
         finally:
             for p in patches:
                 p.stop()
 
         # Commit happened — sequence advanced.
+        assert result is not None and result["switched"] is True
         data = switcher._get_sequence_data()
         assert data is not None
         assert data["activeAccountNumber"] == 2
@@ -299,59 +279,6 @@ class TestPerformSwitchPostDisplay:
         assert "New account active" not in output
         assert "restart Claude Code" not in output
         mock_list.assert_not_called()
-
-    def test_force_refresh_threads_through_perform_switch(
-        self,
-        temp_home: Path,
-        mock_claude_config: Path,
-        sample_sequence_data: dict,
-    ):
-        """BackgroundAutoSwitchIntent must forward force_refresh to
-        _refresh_target_credentials_before_activation as force=True.
-        Otherwise the monitor's "fresh token after handoff" guarantee is broken.
-        """
-        switcher, creds_store, configs_store = self._setup_two_accounts(
-            temp_home,
-            sample_sequence_data,
-        )
-        live_state = {
-            "creds": json.dumps(
-                {
-                    "claudeAiOauth": {
-                        "accessToken": "sk-live-1",
-                        "refreshToken": "rt-live-1",
-                    },
-                }
-            )
-        }
-        patches = self._install_store_patches(
-            switcher,
-            creds_store,
-            configs_store,
-            live_state,
-        )
-
-        try:
-            with (
-                patch.object(
-                    switcher,
-                    "_refresh_target_credentials_before_activation",
-                    wraps=switcher._refresh_target_credentials_before_activation,
-                ) as spy,
-                patch(
-                    "claude_swap.oauth.refresh_oauth_credentials",
-                    return_value=creds_store[("2", "account2@example.com")],
-                ),
-                patch.object(switcher, "list_accounts"),
-            ):
-                switcher._perform_switch("2", intent=self._background_intent())
-        finally:
-            for p in patches:
-                p.stop()
-
-        # The spy should have seen force=True.
-        spy.assert_called_once()
-        assert spy.call_args.kwargs.get("force") is True
 
     def test_cli_json_switch_honors_intent_flags(
         self,
@@ -585,7 +512,7 @@ class TestPerformSwitchPostDisplay:
                 ),
                 patch.object(switcher, "list_accounts"),
             ):
-                switcher._perform_switch("2", intent=self._background_intent())
+                switcher.switch_to("2", json_output=True)
         finally:
             for p in patches:
                 p.stop()
@@ -647,7 +574,7 @@ class TestPerformSwitchPostDisplay:
                 ),
                 patch.object(switcher, "list_accounts"),
             ):
-                switcher._perform_switch("2", intent=self._background_intent())
+                switcher.switch_to("2", json_output=True)
         finally:
             for p in patches:
                 p.stop()

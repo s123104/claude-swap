@@ -1,4 +1,4 @@
-"""Cross-platform background-service facade for the auto-switch monitor.
+"""Cross-platform background-service facade for the auto-switch engine.
 
 Thin facade over platform-native ``ServiceBackend`` implementations (launchd on
 macOS, systemd --user on Linux/WSL, Task Scheduler on Windows), chosen by
@@ -6,8 +6,8 @@ macOS, systemd --user on Linux/WSL, Task Scheduler on Windows), chosen by
 ``service_state`` / ``status`` / ``logs``) is stable for CLI and TUI callers;
 each manager's specifics live in ``service_backends``.
 
-The service shells out via ``[sys.executable, "-m", "claude_swap", "--monitor"]``
-so monitor-loop changes never require edits here.
+The service shells out via ``[sys.executable, "-m", "claude_swap", "auto"]``
+so engine changes never require edits here.
 """
 
 from __future__ import annotations
@@ -24,12 +24,12 @@ def _require_supported_platform() -> None:
         return
     raise ClaudeSwitchError(
         "cswap service is not supported on this platform yet. "
-        "Use `cswap --monitor` in the foreground."
+        "Use `cswap auto` in the foreground."
     )
 
 
 def install(switcher: ServiceHost) -> int:
-    """Register the monitor with the platform's per-user service manager."""
+    """Register the ``cswap auto`` engine with the per-user service manager."""
     _require_supported_platform()
     return select_backend().install(switcher)
 
@@ -53,6 +53,6 @@ def status(switcher: ServiceHost) -> int:
 
 
 def logs(switcher: ServiceHost, lines: int = 40) -> int:
-    """Tail monitor log surfaces: structured log, then the backend's stderr/stdout."""
+    """Tail engine log surfaces: structured log, then the backend's stderr/stdout."""
     _require_supported_platform()
     return select_backend().logs(switcher, lines=lines)

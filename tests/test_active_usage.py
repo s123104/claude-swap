@@ -376,7 +376,6 @@ class TestListAccountsUsage:
     ):
         """list-JSON, list-human, and strategy paths classify accounts identically."""
         from claude_swap.json_output import (
-            USAGE_API_KEY,
             usage_fields,
             usage_display_line,
         )
@@ -706,7 +705,6 @@ class TestListAccountsUsage:
         caplog,
     ):
         """A classified rate-limit failure should be visible without debug logs."""
-        from claude_swap import oauth
         from claude_swap.cache import read_cache, MISSING
 
         sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
@@ -757,7 +755,6 @@ class TestListAccountsUsage:
         capsys,
     ):
         """Stale usage should remain visible when a live refresh is rate-limited."""
-        from claude_swap import oauth
 
         sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
         active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
@@ -1238,7 +1235,7 @@ class TestActiveAccountRefresh:
             patch.object(switcher, "_write_account_credentials"),
             patch("claude_swap.oauth.fetch_usage_for_account", side_effect=mock_fetch),
         ):
-            usage, note = switcher._resolve_active_usage_entry(
+            usage, note = switcher._list_reporter().resolve_active_usage_entry(
                 "1",
                 "test@example.com",
                 creds=self._EXPIRED,
@@ -1353,58 +1350,17 @@ class TestActiveAccountRefresh:
 
 
 class TestSchemaDriftWarning:
-    """When the usage API returns a dict that lacks the expected rate-limit
-    windows, log a structured WARNING — distinguishes schema-break from
-    transient network failure (general-purpose review HIGH).
+    """When the usage API answers but nothing in the payload is recognized,
+    log a structured WARNING — distinguishes schema-break from transient
+    network failure (general-purpose review HIGH). Lives in
+    ``build_usage_result`` so every consumer (engine, list, TUI) is covered.
     """
 
     def test_logs_warning_when_no_window_keys(self, temp_home: Path, caplog):
+        from claude_swap.oauth import build_usage_result
 
-        s = ClaudeAccountSwitcher()
-        s._setup_directories()
-        (temp_home / ".claude.json").write_text(
-            json.dumps(
-                {
-                    "oauthAccount": {
-                        "emailAddress": "u@example.com",
-                        "accountUuid": "uuid-x",
-                    }
-                }
-            )
-        )
-        s._write_json(
-            s.sequence_file,
-            {
-                "accounts": {"1": {"email": "u@example.com", "organizationUuid": ""}},
-                "sequence": [1],
-                "activeAccountNumber": 1,
-            },
-        )
         caplog.set_level(logging.WARNING, logger="claude-swap")
-
-        # Empty usage dict reaches max_usage_pct → None, but our drift
-        # detector should fire a WARNING first.
-        with (
-            patch.object(
-                s,
-                "_read_active_credentials",
-                return_value=ActiveCredentials(
-                    '{"claudeAiOauth":{"accessToken":"sk-abc"}}', False,
-                ),
-            ),
-            patch("claude_swap.oauth.extract_access_token", return_value="sk-abc"),
-            patch(
-                "claude_swap.list_reporter.ListReporter._active_cc_running",
-                return_value=True,
-            ),
-            patch(
-                "claude_swap.oauth.fetch_usage_for_account",
-                return_value={"new_unexpected_key": 42},
-            ),
-        ):
-            result = s.get_active_usage_pct()
-
-        assert result is None
+        assert build_usage_result({"new_unexpected_key": 42}) is None
         warnings = [
             r.getMessage()
             for r in caplog.records
@@ -1414,6 +1370,20 @@ class TestSchemaDriftWarning:
             "no recognized rate-limit windows" in m and "new_unexpected_key" in m
             for m in warnings
         ), warnings
+
+    def test_no_warning_for_recognized_or_empty_payloads(
+        self, temp_home: Path, caplog
+    ):
+        from claude_swap.oauth import build_usage_result
+
+        caplog.set_level(logging.WARNING, logger="claude-swap")
+        assert build_usage_result({"five_hour": {"utilization": 10}}) is not None
+        assert build_usage_result({}) is None
+        assert not [
+            r
+            for r in caplog.records
+            if r.name == "claude-swap" and r.levelno == logging.WARNING
+        ]
 
 
 class TestUsageCacheFreshness:
@@ -1472,274 +1442,7 @@ class TestUsageCacheFreshness:
         merged = read_cache_data(s.usage_cache_path, default={})
         assert set(merged) == {"1"}
 
-    def test_legacy_entry_without_cached_at_is_untrusted(
-        self,
-        temp_home: Path,
-    ):
-        # Per-row trust: a legacy row without ``_cached_at`` is treated as
-        # untrusted so an unrelated cache write cannot extend its TTL. The
-        # planner refreshes rather than acting on possibly-stale data.
-        import json
-
-        s = ClaudeAccountSwitcher()
-        s._setup_directories()
-        data = {
-            "accounts": {
-                "1": {"email": "a1@example.com"},
-                "2": {"email": "a2@example.com"},
-            },
-            "sequence": [1, 2],
-            "activeAccountNumber": 1,
-        }
-        s._write_json(s.sequence_file, data)
-        cache_path = s.backup_dir / "cache" / "usage.json"
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        cache_path.write_text(
-            json.dumps(
-                {
-                    "timestamp": time.time(),
-                    "data": {
-                        "1": {"five_hour": {"pct": 30}},
-                        "2": {"five_hour": {"pct": 40}},
-                    },
-                }
-            ),
-            encoding="utf-8",
-        )
-
-        with patch.object(s, "_account_is_switchable", return_value=True):
-            snapshots = s._trusted_usage_snapshots()
-
-        assert snapshots == {}
-
-    def test_stale_slot_excluded_fresh_slot_retained(
-        self,
-        temp_home: Path,
-    ):
-        # A stale per-row slot is excluded; a fresh sibling is still returned
-        # (partial trusted subset), so one stale slot can't block planning.
-        import json
-
-        s = ClaudeAccountSwitcher()
-        s._setup_directories()
-        data = {
-            "accounts": {
-                "1": {"email": "a1@example.com"},
-                "2": {"email": "a2@example.com"},
-            },
-            "sequence": [1, 2],
-            "activeAccountNumber": 1,
-        }
-        s._write_json(s.sequence_file, data)
-        cache_path = s.backup_dir / "cache" / "usage.json"
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        cache_path.write_text(
-            json.dumps(
-                {
-                    "timestamp": time.time(),
-                    "data": {
-                        "1": {
-                            "five_hour": {"pct": 99},
-                            "_cached_at": time.time() - 9999,
-                        },
-                        "2": {
-                            "five_hour": {"pct": 40},
-                            "_cached_at": time.time(),
-                        },
-                    },
-                }
-            ),
-            encoding="utf-8",
-        )
-
-        with patch.object(s, "_account_is_switchable", return_value=True):
-            assert s._trusted_usage_snapshots() == {"2": {"five_hour": {"pct": 40}}}
-
-    def test_get_active_usage_pct_honors_per_slot_freshness(
-        self,
-        temp_home: Path,
-    ):
-        import json
-
-        s = ClaudeAccountSwitcher()
-        s._setup_directories()
-        (temp_home / ".claude.json").write_text(
-            json.dumps(
-                {
-                    "oauthAccount": {
-                        "emailAddress": "a1@example.com",
-                        "accountUuid": "uuid-1",
-                    },
-                }
-            )
-        )
-        data = {
-            "accounts": {
-                "1": {"email": "a1@example.com", "organizationUuid": "uuid-1"},
-            },
-            "sequence": [1],
-            "activeAccountNumber": 1,
-        }
-        s._write_json(s.sequence_file, data)
-        creds = json.dumps({"claudeAiOauth": {"accessToken": "tok"}})
-        cache_path = s.backup_dir / "cache" / "usage.json"
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        cache_path.write_text(
-            json.dumps(
-                {
-                    "timestamp": time.time(),
-                    "data": {
-                        "1": {
-                            "five_hour": {"pct": 50},
-                            "_cached_at": time.time() - 9999,
-                        },
-                    },
-                }
-            )
-        )
-        live_usage = {"five_hour": {"pct": 96}, "seven_day": {"pct": 20}}
-
-        with (
-            patch.object(s, "_read_active_credentials",
-                         return_value=ActiveCredentials(creds, False)),
-            patch("claude_swap.oauth.extract_access_token", return_value="tok"),
-            patch(
-                "claude_swap.oauth.fetch_usage_for_account",
-                return_value=live_usage,
-            ) as mock_fetch,
-        ):
-            assert s.get_active_usage_pct() == 96.0
-
-        mock_fetch.assert_called_once()
-
-    def test_masked_fetch_failure_is_flagged_for_the_monitor(
-        self,
-        temp_home: Path,
-    ):
-        """When a prior cache row masks a failed fetch, the stale pct is
-        still displayed but ``active_usage_is_masked_failure`` must flag it
-        so the monitor refuses to treat it as a switch trigger; a successful
-        fresh fetch clears the flag."""
-        s = ClaudeAccountSwitcher()
-        s._setup_directories()
-        (temp_home / ".claude.json").write_text(
-            json.dumps(
-                {
-                    "oauthAccount": {
-                        "emailAddress": "a1@example.com",
-                        "accountUuid": "uuid-1",
-                    },
-                }
-            )
-        )
-        data = {
-            "accounts": {
-                "1": {"email": "a1@example.com", "organizationUuid": "uuid-1"},
-            },
-            "sequence": [1],
-            "activeAccountNumber": 1,
-        }
-        s._write_json(s.sequence_file, data)
-        creds = json.dumps({"claudeAiOauth": {"accessToken": "tok"}})
-        cache_path = s.backup_dir / "cache" / "usage.json"
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        cache_path.write_text(
-            json.dumps(
-                {
-                    "timestamp": time.time(),
-                    "data": {
-                        "1": {
-                            "five_hour": {"pct": 96},
-                            "_cached_at": time.time() - 9999,
-                        },
-                    },
-                }
-            )
-        )
-
-        with (
-            patch.object(s, "_read_active_credentials",
-                         return_value=ActiveCredentials(creds, False)),
-            patch("claude_swap.oauth.extract_access_token", return_value="tok"),
-            patch(
-                "claude_swap.oauth.fetch_usage_for_account",
-                return_value=oauth.UsageFetchError(
-                    reason="network_error", message="down",
-                ),
-            ),
-        ):
-            assert s.get_active_usage_pct() == 96.0
-            assert s.active_usage_is_masked_failure() is True
-
-        with (
-            patch.object(s, "_read_active_credentials",
-                         return_value=ActiveCredentials(creds, False)),
-            patch("claude_swap.oauth.extract_access_token", return_value="tok"),
-            patch(
-                "claude_swap.oauth.fetch_usage_for_account",
-                return_value={"five_hour": {"pct": 97}},
-            ),
-        ):
-            assert s.get_active_usage_pct() == 97.0
-            assert s.active_usage_is_masked_failure() is False
-
-    def test_get_active_usage_breakdown_returns_per_window(
-        self,
-        temp_home: Path,
-    ):
-        """Breakdown exposes each window separately so the monitor
-        can track 5h velocity independently of a flat 7d, and stays a strict
-        superset of get_active_usage_pct (max of the same values)."""
-        import json
-
-        s = ClaudeAccountSwitcher()
-        s._setup_directories()
-        (temp_home / ".claude.json").write_text(
-            json.dumps(
-                {
-                    "oauthAccount": {
-                        "emailAddress": "a1@example.com",
-                        "accountUuid": "uuid-1",
-                    },
-                }
-            )
-        )
-        data = {
-            "accounts": {
-                "1": {"email": "a1@example.com", "organizationUuid": "uuid-1"},
-            },
-            "sequence": [1],
-            "activeAccountNumber": 1,
-        }
-        s._write_json(s.sequence_file, data)
-        creds = json.dumps({"claudeAiOauth": {"accessToken": "tok"}})
-        live_usage = {"five_hour": {"pct": 72}, "seven_day": {"pct": 87}}
-
-        with (
-            patch.object(s, "_read_active_credentials",
-                         return_value=ActiveCredentials(creds, False)),
-            patch("claude_swap.oauth.extract_access_token", return_value="tok"),
-            patch(
-                "claude_swap.oauth.fetch_usage_for_account",
-                return_value=live_usage,
-            ),
-        ):
-            breakdown = s.get_active_usage_breakdown()
-
-        assert breakdown == {"five_hour": 72.0, "seven_day": 87.0}
-        assert max(breakdown.values()) == 87.0  # equals get_active_usage_pct
-
-    def test_get_active_usage_breakdown_none_when_unavailable(
-        self,
-        temp_home: Path,
-    ):
-        s = ClaudeAccountSwitcher()
-        s._setup_directories()
-        with patch.object(s, "_get_current_account", return_value=None):
-            assert s.get_active_usage_breakdown() is None
-
     def test_fetch_failure_does_not_restamp_stale_entry(self, temp_home: Path):
-        from claude_swap import oauth
         from claude_swap.switcher import _persist_usage_cache_entry
 
         old_ts = time.time() - 9999
@@ -1756,114 +1459,6 @@ class TestUsageCacheFreshness:
             previous,
         )
         assert existing["1"]["_cached_at"] == old_ts
-
-    def test_refresh_triggers_when_snapshots_incomplete(self, temp_home: Path):
-        s = ClaudeAccountSwitcher()
-        s._setup_directories()
-        data = {
-            "accounts": {
-                "1": {"email": "a1@example.com"},
-                "2": {"email": "a2@example.com"},
-            },
-            "sequence": [1, 2],
-            "activeAccountNumber": 1,
-        }
-        s._write_json(s.sequence_file, data)
-
-        with (
-            patch.object(s, "_account_is_switchable", return_value=True),
-            patch.object(
-                s, "_trusted_usage_snapshots", side_effect=[{}, {"1": {}, "2": {}}]
-            ),
-            patch.object(s, "_refresh_switchable_usage_cache") as mock_refresh,
-        ):
-            s.build_auto_switch_decision(95, 99.0)
-
-        mock_refresh.assert_called_once()
-
-    def test_refresh_triggers_when_only_active_snapshot_is_trusted(
-        self,
-        temp_home: Path,
-    ):
-        s = ClaudeAccountSwitcher()
-        s._setup_directories()
-        data = {
-            "accounts": {
-                "1": {"email": "a1@example.com"},
-                "2": {"email": "a2@example.com"},
-            },
-            "sequence": [1, 2],
-            "activeAccountNumber": 1,
-        }
-        s._write_json(s.sequence_file, data)
-
-        active_only = {"1": {"five_hour": {"pct": 96}}}
-        refreshed = {
-            "1": {"five_hour": {"pct": 96}},
-            "2": {"five_hour": {"pct": 10}},
-        }
-
-        with (
-            patch.object(s, "_account_is_switchable", return_value=True),
-            patch.object(
-                s,
-                "_trusted_usage_snapshots",
-                side_effect=[active_only, refreshed],
-            ),
-            patch.object(s, "_refresh_switchable_usage_cache") as mock_refresh,
-        ):
-            decision = s.build_auto_switch_decision(95, 96.0)
-            plan = s.plan_automated_switch(decision)
-
-        mock_refresh.assert_called_once()
-        assert plan.outcome == "chosen"
-        assert plan.target == "2"
-
-    def test_failed_refresh_leaves_expired_snapshots_untrusted(self, temp_home: Path):
-        import json
-
-        s = ClaudeAccountSwitcher()
-        s._setup_directories()
-        data = {
-            "accounts": {
-                "1": {"email": "a1@example.com"},
-                "2": {"email": "a2@example.com"},
-            },
-            "sequence": [1, 2],
-            "activeAccountNumber": 1,
-        }
-        s._write_json(s.sequence_file, data)
-        cache_path = s.backup_dir / "cache" / "usage.json"
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        cache_path.write_text(
-            json.dumps(
-                {
-                    "timestamp": time.time(),
-                    "data": {
-                        "1": {
-                            "five_hour": {"pct": 30},
-                            "_cached_at": time.time() - 9999,
-                        },
-                        "2": {
-                            "five_hour": {"pct": 40},
-                            "_cached_at": time.time() - 9999,
-                        },
-                    },
-                }
-            ),
-            encoding="utf-8",
-        )
-
-        with (
-            patch.object(s, "_account_is_switchable", return_value=True),
-            patch(
-                "claude_swap.oauth.fetch_usage_for_account",
-                return_value=None,
-            ),
-        ):
-            s._refresh_switchable_usage_cache()
-
-        assert s._trusted_usage_snapshots() == {}
 
 
 class TestListReporterKeychainFlag:
@@ -1909,155 +1504,6 @@ class TestListReporterKeychainFlag:
     def test_list_reporter_instance_is_reused(self, temp_home: Path):
         s = ClaudeAccountSwitcher()
         assert s._list_reporter() is s._list_reporter()
-
-
-class TestRefreshGateResolvedSlots:
-    """Peers that can never yield a trusted row must not refetch every cycle.
-
-    The refresh gate treats a cache row that is a known usage sentinel, or an
-    error row within the per-slot TTL, as already answered. Only slots with a
-    missing or expired row trigger a network refresh.
-    """
-
-    def _switcher_with_peer(self, temp_home: Path) -> ClaudeAccountSwitcher:
-        s = ClaudeAccountSwitcher()
-        s._setup_directories()
-        data = {
-            "accounts": {
-                "1": {"email": "a1@example.com"},
-                "2": {"email": "a2@example.com"},
-            },
-            "sequence": [1, 2],
-            "activeAccountNumber": 1,
-        }
-        s._write_json(s.sequence_file, data)
-        (temp_home / ".claude.json").write_text(
-            json.dumps(
-                {
-                    "oauthAccount": {
-                        "emailAddress": "a1@example.com",
-                        "accountUuid": "u1",
-                    }
-                }
-            )
-        )
-        return s
-
-    def _seed_usage_cache(self, s: ClaudeAccountSwitcher, rows: dict) -> None:
-        cache_path = s.backup_dir / "cache" / "usage.json"
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        cache_path.write_text(
-            json.dumps({"timestamp": time.time(), "data": rows}),
-            encoding="utf-8",
-        )
-
-    def _counting_refresh(self, s: ClaudeAccountSwitcher):
-        calls: list[int] = []
-        real_refresh = s._refresh_switchable_usage_cache
-
-        def refresh() -> None:
-            calls.append(1)
-            real_refresh()
-
-        return calls, refresh
-
-    def test_api_key_peer_refetches_once_then_stays_quiet(self, temp_home: Path):
-        """An API-key peer resolves to a sentinel and stops the refetch loop."""
-        s = self._switcher_with_peer(temp_home)
-        active_creds = json.dumps({"claudeAiOauth": {"accessToken": "tok"}})
-        live_usage = {"five_hour": {"pct": 96}, "seven_day": {"pct": 50}}
-        calls, refresh = self._counting_refresh(s)
-
-        with (
-            patch.object(s, "_account_is_switchable", return_value=True),
-            patch.object(s, "_read_credentials", return_value=active_creds),
-            patch.object(
-                s, "_read_account_credentials", return_value="sk-ant-api03-peer"
-            ),
-            patch(
-                "claude_swap.oauth.fetch_usage_for_account",
-                return_value=live_usage,
-            ),
-            patch.object(s, "_refresh_switchable_usage_cache", side_effect=refresh),
-        ):
-            s.build_auto_switch_decision(95, 96.0)
-            assert calls == [1]
-            # The single refresh persisted the API-key sentinel for the peer.
-            cached = s._read_json(s.usage_cache_path) or {}
-            assert cached.get("data", {}).get("2") == USAGE_API_KEY
-            s.build_auto_switch_decision(95, 96.0)
-
-        assert calls == [1]
-
-    def test_error_row_within_ttl_suppresses_refetch(self, temp_home: Path):
-        s = self._switcher_with_peer(temp_home)
-        now = time.time()
-        self._seed_usage_cache(
-            s,
-            {
-                "1": {"five_hour": {"pct": 96}, "_cached_at": now},
-                "2": {
-                    "_type": "usage_fetch_error",
-                    "reason": "network_error",
-                    "status_code": None,
-                    "message": "boom",
-                    "retry_after": None,
-                    "_cached_at": now,
-                },
-            },
-        )
-
-        with (
-            patch.object(s, "_account_is_switchable", return_value=True),
-            patch.object(s, "_refresh_switchable_usage_cache") as refresh,
-        ):
-            s.build_auto_switch_decision(95, 96.0)
-
-        refresh.assert_not_called()
-
-    def test_error_row_past_ttl_refetches_exactly_once(self, temp_home: Path):
-        """An expired error row triggers one refetch, whose re-stamped error
-        row answers the following cycle."""
-        s = self._switcher_with_peer(temp_home)
-        now = time.time()
-        self._seed_usage_cache(
-            s,
-            {
-                "1": {"five_hour": {"pct": 96}, "_cached_at": now},
-                "2": {
-                    "_type": "usage_fetch_error",
-                    "reason": "network_error",
-                    "status_code": None,
-                    "message": "boom",
-                    "retry_after": None,
-                    "_cached_at": now - 9999,
-                },
-            },
-        )
-        active_creds = json.dumps({"claudeAiOauth": {"accessToken": "tok"}})
-        peer_creds = json.dumps({"claudeAiOauth": {"accessToken": "tok2"}})
-        calls, refresh = self._counting_refresh(s)
-
-        def read_backup(num: str, email: str) -> str:
-            return peer_creds
-
-        with (
-            patch.object(s, "_account_is_switchable", return_value=True),
-            patch.object(s, "_read_credentials", return_value=active_creds),
-            patch.object(s, "_read_account_credentials", side_effect=read_backup),
-            patch(
-                "claude_swap.oauth.fetch_usage_for_account",
-                return_value=oauth.UsageFetchError(
-                    reason="network_error", message="still down"
-                ),
-            ),
-            patch.object(s, "_refresh_switchable_usage_cache", side_effect=refresh),
-        ):
-            s.build_auto_switch_decision(95, 96.0)
-            assert calls == [1]
-            s.build_auto_switch_decision(95, 96.0)
-
-        assert calls == [1]
 
 
 class TestRefreshInactiveCredentialsIfNeeded:

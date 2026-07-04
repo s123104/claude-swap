@@ -14,52 +14,12 @@ from pathlib import Path
 from typing import Any, Literal, Protocol
 
 from claude_swap.models import (
-    AutoSwitchDecisionContext,
     SwitchIntent,
-    SwitchPlanResult,
     SwitchPreconditions,
 )
 from claude_swap.credentials import ActiveCredentials
-from claude_swap.sequence_store import AutoSwitchConfig, SequenceData
 
 ServiceState = Literal["not installed", "installed but not loaded", "loaded"]
-
-
-class MonitorHost(Protocol):
-    """Switch surface the auto-switch monitor reads and plans against."""
-
-    backup_dir: Path
-    _logger: logging.Logger
-
-    def get_auto_switch_config(self) -> AutoSwitchConfig: ...
-    def ensure_auto_switch_enabled(self) -> AutoSwitchConfig: ...
-    def get_active_usage_pct(self) -> float | None: ...
-    def get_active_usage_breakdown(self) -> dict[str, float] | None: ...
-    def get_active_usage_retry_after(self) -> int | None: ...
-    def active_usage_is_masked_failure(self) -> bool: ...
-    def active_account_is_api_key(self) -> bool: ...
-    def build_auto_switch_decision(
-        self,
-        threshold: int,
-        active_usage_pct: float | None,
-    ) -> AutoSwitchDecisionContext: ...
-    def plan_automated_switch(
-        self,
-        decision: AutoSwitchDecisionContext,
-    ) -> SwitchPlanResult: ...
-    def switch(
-        self,
-        intent: SwitchIntent | None = None,
-        *,
-        strategy: str | None = None,
-        json_output: bool = False,
-    ) -> dict[str, Any] | bool | None: ...
-
-    def _live_default_mode_claude_pids(self) -> list[int]: ...
-    def _get_sequence_view(self) -> SequenceData | None: ...
-    def _account_is_switchable(self, account_num: str) -> bool: ...
-    def _trusted_usage_snapshots(self) -> dict[str, dict[str, Any]]: ...
-    def _refresh_switchable_usage_cache(self) -> None: ...
 
 
 class RefreshHost(Protocol):
@@ -88,7 +48,7 @@ class ServiceHost(Protocol):
 
 
 class ServiceBackend(Protocol):
-    """Platform-native supervisor for the auto-switch monitor.
+    """Platform-native supervisor for the auto-switch engine.
 
     Methods take a ``ServiceHost`` (not the concrete switcher); the underscore is
     not relevant here — this is the public supervisor contract.

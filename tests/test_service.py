@@ -57,14 +57,16 @@ class TestBuildPlist:
         assert plist["ProcessType"] == "Background"
         assert plist["LowPriorityIO"] is True
 
-    def test_program_arguments_invoke_monitor(self, temp_home: Path):
+    def test_program_arguments_invoke_engine(self, temp_home: Path):
+        # The service supervises the auto engine; its stdout events land in
+        # the launchd log files.
         switcher = ClaudeAccountSwitcher()
         plist = launchd._build_plist(switcher)
         argv = plist["ProgramArguments"]
-        assert argv[0] == sys.executable
-        assert "--monitor" in argv
-        assert argv[-1] == "--service-monitor"
-        assert "claude_swap" in argv
+        assert argv == [sys.executable, "-m", "claude_swap", "auto"]
+        log_dir = switcher.backup_dir / "logs"
+        assert plist["StandardOutPath"] == str(log_dir / "monitor.out")
+        assert plist["StandardErrorPath"] == str(log_dir / "monitor.err")
 
     def test_log_paths_under_backup_dir(self, temp_home: Path):
         switcher = ClaudeAccountSwitcher()
@@ -116,8 +118,7 @@ class TestInstall:
         with plist_path.open("rb") as fh:
             loaded = plistlib.load(fh)
         assert loaded["Label"] == service_spec.SERVICE_LABEL
-        assert loaded["ProgramArguments"][-1] == "--service-monitor"
-        assert "--monitor" in loaded["ProgramArguments"]
+        assert loaded["ProgramArguments"][-1] == "auto"
         # The launchd log dir was created.
         assert (switcher.backup_dir / "logs").is_dir()
 
@@ -631,6 +632,24 @@ class TestCliRouting:
         err = capsys.readouterr().err
         assert "action" in err or "required" in err.lower()
 
+    def test_install_reaches_service_install(
+        self, monkeypatch: pytest.MonkeyPatch, temp_home: Path
+    ):
+        from claude_swap import service
+
+        calls: list[int] = []
+
+        def fake_install(switcher):
+            calls.append(1)
+            return 0
+
+        monkeypatch.setattr(service, "install", fake_install)
+        monkeypatch.setattr(sys, "argv", ["cswap", "service", "install"])
+        with pytest.raises(SystemExit) as excinfo:
+            cli.main()
+        assert excinfo.value.code == 0
+        assert calls == [1]
+
     def test_service_help_exits_zero(
         self, capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch
     ):
@@ -665,15 +684,15 @@ class TestCliRouting:
 # --------------------------------------------------------------------------- #
 
 
-class TestNoMonitorImport:
-    def test_module_does_not_import_monitor(self):
+class TestNoEngineImport:
+    def test_module_does_not_import_engine(self):
         """Plan invariant: the service is a thin supervisor — it shells out via
-        ``cswap --monitor`` rather than calling monitor internals. Future changes
-        to the monitor loop must require no changes here.
+        ``cswap auto`` rather than calling engine internals. Future changes to
+        the engine loop must require no changes here.
         """
         source = Path(service.__file__).read_text(encoding="utf-8")
-        assert "from claude_swap.monitor" not in source
-        assert "run_cli_monitor" not in source
+        assert "from claude_swap.autoswitch" not in source
+        assert "AutoSwitchEngine" not in source
 
 
 # --------------------------------------------------------------------------- #
@@ -682,14 +701,18 @@ class TestNoMonitorImport:
 
 
 class TestServiceSpec:
-    def test_program_arguments_invoke_monitor_module(self):
+    def test_program_arguments_invoke_engine(self):
+        # The engine has no PID-file retry contract: concurrent engines
+        # serialize through the autoswitch state lock.
         from claude_swap import service_spec
 
         argv = service_spec.program_arguments()
-        assert argv[0] == sys.executable
-        assert "--monitor" in argv
-        assert argv[-1] == "--service-monitor"
-        assert "claude_swap" in argv
+        assert argv == [sys.executable, "-m", "claude_swap", "auto"]
+
+    def test_runner_command_label(self):
+        from claude_swap import service_spec
+
+        assert service_spec.RUNNER_COMMAND_LABEL == "cswap auto"
 
     def test_passthrough_env_stamps_installed_version(self):
         from claude_swap import __version__
@@ -697,9 +720,6 @@ class TestServiceSpec:
 
         env = service_spec.passthrough_env()
         assert env[service_spec.VERSION_ENV_KEY] == __version__
-        # Service mode travels on argv (Task Scheduler cannot set per-task
-        # environment variables), so the env map must not carry the legacy key.
-        assert service_spec.SERVICE_MONITOR_ENV_KEY not in env
 
     def test_log_dir_under_backup(self, temp_home: Path):
         from claude_swap import service_spec

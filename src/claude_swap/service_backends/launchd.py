@@ -166,10 +166,11 @@ class LaunchdBackend:
         _launchctl("bootout", _launchd_service_target(), check=False)
         _bootstrap(plist_path)
         log_path = service_spec.log_dir(switcher)
+        command = service_spec.RUNNER_COMMAND_LABEL
         service_spec.print_install_success(
             switcher,
             artifact_path=plist_path,
-            run_hint=f"runs `cswap --monitor` at login; launchd output → {log_path}",
+            run_hint=f"runs `{command}` at login; launchd output → {log_path}",
         )
         return 0
 

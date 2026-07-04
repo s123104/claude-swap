@@ -1,4 +1,4 @@
-"""Structural Protocol satisfaction for monitor and credential refresh hosts."""
+"""Structural Protocol satisfaction for credential refresh and switch CLI hosts."""
 
 from __future__ import annotations
 
@@ -8,50 +8,10 @@ from types import SimpleNamespace
 
 from claude_swap.credential_refresh import CredentialRefresher
 from claude_swap.models import (
-    AutoSwitchDecisionContext,
-    SwitchPlanResult,
     SwitchPreconditionKind,
     SwitchPreconditions,
 )
-from claude_swap.monitor import MonitorRuntimeState, monitor_step
-from claude_swap.sequence_store import AutoSwitchConfig, SequenceData
 from claude_swap.switch_cli import run_switch_cli
-
-
-def _monitor_host(tmp_path: Path) -> SimpleNamespace:
-    return SimpleNamespace(
-        backup_dir=tmp_path,
-        _logger=logging.getLogger("test.monitor_host"),
-        # The config seam is typed: hosts hand the monitor an AutoSwitchConfig,
-        # not a raw dict (monitor reads .enabled/.threshold attributes).
-        get_auto_switch_config=lambda: AutoSwitchConfig(enabled=False, threshold=95),
-        ensure_auto_switch_enabled=lambda: AutoSwitchConfig(enabled=True, threshold=95),
-        get_active_usage_pct=lambda: None,
-        get_active_usage_breakdown=lambda: None,
-        active_account_is_api_key=lambda: False,
-        build_auto_switch_decision=lambda threshold, pct: AutoSwitchDecisionContext(
-            threshold=threshold,
-            active_usage_pct=pct,
-            live_active_slot=None,
-            sequence_active_slot=None,
-            usage_by_slot={},
-        ),
-        plan_automated_switch=lambda decision: SwitchPlanResult(
-            outcome="already_optimal",
-        ),
-        switch=lambda *args, **kwargs: False,
-        _live_default_mode_claude_pids=lambda: [],
-        _get_sequence_view=lambda: SequenceData({"sequence": []}),
-        _account_is_switchable=lambda num: True,
-        _trusted_usage_snapshots=lambda: {},
-        _refresh_switchable_usage_cache=lambda: None,
-    )
-
-
-def test_monitor_step_accepts_minimal_monitor_host(tmp_path: Path):
-    host = _monitor_host(tmp_path)
-    result = monitor_step(host, MonitorRuntimeState(), poll_seconds=60)
-    assert result.kind == "disabled"
 
 
 def test_credential_refresher_accepts_minimal_refresh_host(tmp_path: Path):

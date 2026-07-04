@@ -87,12 +87,12 @@ class TestBuildTaskXml:
         monkeypatch.setattr(
             ts_backend,
             "_program_arguments",
-            lambda: [r"C:\venv\Scripts\pythonw.exe", "-m", "claude_swap", "--monitor"],
+            lambda: [r"C:\venv\Scripts\pythonw.exe", "-m", "claude_swap", "auto"],
         )
         switcher = ClaudeAccountSwitcher()
         xml = ts_backend._build_task_xml(switcher)
         assert "<Command>C:\\venv\\Scripts\\pythonw.exe</Command>" in xml
-        assert "<Arguments>-m claude_swap --monitor</Arguments>" in xml
+        assert "<Arguments>-m claude_swap auto</Arguments>" in xml
 
     def test_logon_trigger_repeats_as_watchdog(self, temp_home: Path):
         # Task Scheduler's RestartOnFailure ignores exit codes (it only fires
@@ -134,11 +134,6 @@ class TestBuildTaskXml:
         assert "<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>" in xml
         assert "<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>" in xml
 
-    def test_arguments_carry_service_monitor_flag(self, temp_home: Path):
-        switcher = ClaudeAccountSwitcher()
-        xml = ts_backend._build_task_xml(switcher)
-        assert "--monitor --service-monitor" in xml
-
     def test_no_environment_variables_element(self, temp_home: Path):
         # The Task Scheduler XML schema only allows Command / Arguments /
         # WorkingDirectory under Exec; an EnvironmentVariables node makes
@@ -159,7 +154,7 @@ class TestBuildTaskXml:
                 r"C:\Program Files\py & co\pythonw.exe",
                 "-m",
                 "claude_swap",
-                "--monitor",
+                "auto",
             ],
         )
         switcher = ClaudeAccountSwitcher()
@@ -245,7 +240,7 @@ class TestInstall:
         assert xml_path.exists()
         text = xml_path.read_text(encoding="utf-8")
         assert "<LogonTrigger>" in text
-        assert "--monitor" in text
+        assert "claude_swap auto" in text
         assert (switcher.backup_dir / "logs").is_dir()
 
         ps_calls = [c for c in calls if c and c[0] == _POWERSHELL]

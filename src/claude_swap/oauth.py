@@ -330,6 +330,15 @@ def build_usage_result(data: dict[str, Any]) -> dict[str, Any] | None:
         if scoped:
             result["scoped"] = scoped
 
+    if not result and data:
+        # Distinguishes a schema break from a transient network failure: the
+        # API answered, but nothing in the payload was recognized.
+        _logger.warning(
+            "usage API returned no recognized rate-limit windows "
+            "(keys: %s) — possible schema change",
+            sorted(data.keys()),
+        )
+
     return result if result else None
 
 

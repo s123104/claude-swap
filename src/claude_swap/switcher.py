@@ -9,7 +9,6 @@ import shutil
 import sys
 import tempfile
 import time
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from claude_swap import macos_keychain
@@ -25,7 +24,6 @@ from claude_swap.exceptions import (
 from claude_swap import oauth
 from claude_swap.cache import (
     read_cache_data,
-    read_cache_with_timestamp,
     write_cache,
 )
 from claude_swap.claude_locks import claude_config_lock, claude_credentials_lock
@@ -45,13 +43,9 @@ from claude_swap.credentials import (
 from claude_swap.locking import FileLock
 from claude_swap.logging_config import setup_logging
 from claude_swap.models import (
-    AutoSwitchDecisionContext,
-    BackgroundAutoSwitchIntent,
-    InteractiveAutoSwitchIntent,
     ManualSwitchIntent,
     Platform,
     SwitchIntent,
-    SwitchPlanResult,
     SwitchPreconditionKind,
     SwitchPreconditions,
     SwitchTransaction,
@@ -70,13 +64,8 @@ from claude_swap.paths import (
     migrate_legacy_backup_dir,
 )
 from claude_swap.credential_refresh import CredentialRefresher
-# ``DEFAULT_AUTO_SWITCH_THRESHOLD`` is re-exported (``as`` alias) so
-# ``from claude_swap.switcher import DEFAULT_AUTO_SWITCH_THRESHOLD`` keeps working
-# for existing callers/tests; the SSOT lives in sequence_store.
 from claude_swap.sequence_store import (
-    DEFAULT_AUTO_SWITCH_THRESHOLD as DEFAULT_AUTO_SWITCH_THRESHOLD,
     AccountRecord,
-    AutoSwitchConfig,
     SequenceData,
     SequenceStore,
 )
@@ -84,15 +73,11 @@ from claude_swap.usage_cache import (
     _persist_usage_cache_entry,
     _usage_from_cache,
     _usage_slot_trusted,
-    extract_retry_after,
 )
 from claude_swap.usage_policy import (
-    binding_pct as max_usage_pct,
     headroom,
-    pick_best_from_snapshots,
-    plan_automated_switch,
 )
-from typing import TYPE_CHECKING, Any, assert_never, cast
+from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
     from claude_swap.list_reporter import ListReporter
@@ -111,17 +96,6 @@ SETUP_TOKEN_SCOPES = ("user:inference",)
 _ONLY_ONE_ACCOUNT_MSG = (
     "Only one account is managed. Add more accounts to switch between."
 )
-
-# Auto-switch (Beta) threshold default lives in ``sequence_store`` (SSOT) and is
-# re-exported above so ``from claude_swap.switcher import
-# DEFAULT_AUTO_SWITCH_THRESHOLD`` keeps working for callers/tests.
-
-def auto_switch_display(cfg: AutoSwitchConfig) -> tuple[bool, int, str, str]:
-    """Normalized auto-switch fields for CLI/TUI status formatters."""
-    on_off = "ON" if cfg.enabled else "OFF"
-    enabled_disabled = "enabled" if cfg.enabled else "disabled"
-    return cfg.enabled, cfg.threshold, on_off, enabled_disabled
-
 
 def _sweep_legacy_keyring(usernames: list[str], removed_items: list[str]) -> None:
     """Best-effort purge of legacy ``KEYRING_SERVICE`` entries via ``keyring``.
@@ -437,33 +411,6 @@ class ClaudeAccountSwitcher:
             return False
         return True
 
-    def _switchable_slot_ids(self, data: dict[str, Any] | None = None) -> list[str]:
-        if data is None:
-            data = self._get_sequence_data() or {}
-        return [
-            str(num)
-            for num in data.get("sequence", [])
-            if self._account_is_switchable(str(num))
-        ]
-
-    def _resolve_active_slots(self) -> tuple[str | None, str | None]:
-        """Return ``(live_active_slot, sequence_active_slot)``."""
-        data = self._get_sequence_data() or {}
-        sequence_slot = data.get("activeAccountNumber")
-        sequence_slot_str = (
-            str(sequence_slot) if sequence_slot is not None else None
-        )
-
-        live_slot: str | None = None
-        identity = self._get_current_account()
-        if identity is not None:
-            current_email, current_org_uuid = identity
-            live_slot = _slot_for_identity(
-                data.get("accounts", {}), current_email, current_org_uuid,
-            )
-
-        return live_slot, sequence_slot_str
-
     def _usage_cache_fresh(
         self,
         cached: dict[str, Any],
@@ -489,41 +436,6 @@ class ClaudeAccountSwitcher:
             if not isinstance(usage, dict) or not _usage_slot_trusted(usage, now):
                 return False
         return True
-
-    def _trusted_usage_snapshots(self) -> dict[str, dict[str, Any]]:
-        """Trusted-only usage snapshots, safe for unattended planning.
-
-        Returns the subset of switchable slots whose cached usage is a fresh
-        (per-slot TTL) dict. Untrusted, missing, or non-dict slots are skipped
-        rather than poisoning the whole fleet — one permanently-broken slot
-        (e.g. expired creds not yet re-added) must not block auto-switch from
-        rotating among the accounts that ARE verifiable. The planner only ever
-        switches to a slot present here, so excluding a slot is fail-closed for
-        that slot. An empty result still means "no trusted signal — stay put".
-        """
-        cached, _ = read_cache_with_timestamp(self.usage_cache_path)
-        if cached is None:
-            return {}
-
-        data = self._get_sequence_data() or {}
-        switchable = self._switchable_slot_ids(data)
-        if not switchable:
-            return {}
-
-        now = time.time()
-        snapshots: dict[str, dict[str, Any]] = {}
-        for slot in switchable:
-            if slot not in cached:
-                continue
-            usage = _usage_from_cache(cached[slot])
-            if not isinstance(usage, dict):
-                continue
-            if not _usage_slot_trusted(usage, now):
-                continue
-            snapshots[slot] = {
-                k: v for k, v in usage.items() if k != "_cached_at"
-            }
-        return snapshots
 
     def _merge_usage_cache(self, updates: dict[str, object]) -> None:
         """Merge per-slot fetch results into usage.json under the file lock.
@@ -552,132 +464,6 @@ class ClaudeAccountSwitcher:
                     existing, key, current, existing.get(key),
                 )
             write_cache(self.usage_cache_path, existing)
-
-    def _refresh_switchable_usage_cache(self) -> None:
-        """Fetch usage for every switchable slot before automated planning.
-
-        Delegates each row to ``ListReporter.fetch_account_usage`` so the list
-        path and this refresh path share one fetch implementation: API-key and
-        credential-less slots persist their usage sentinels into the cache
-        instead of an unanswerable ``None`` (which could never become fresh),
-        and the active slot goes through the owner-aware refresh logic.
-        """
-        data = self._get_sequence_data_migrated() or {}
-        reporter = self._list_reporter()
-        accounts_info = [
-            info
-            for info in reporter.build_accounts_info(data)
-            if self._account_is_switchable(str(info[0]))
-        ]
-        if not accounts_info:
-            return
-
-        max_workers = min(4, len(accounts_info))
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            usages = list(executor.map(reporter.fetch_account_usage, accounts_info))
-
-        self._merge_usage_cache({
-            str(info[0]): usage for info, usage in zip(accounts_info, usages)
-        })
-
-    def _unresolved_slots(self, switchable: list[str]) -> list[str]:
-        """Switchable slots whose cached usage row answers nothing yet.
-
-        A slot is answered when its raw cache row is a known usage sentinel
-        (permanent conditions like API-key accounts) or any dict row — success
-        or serialized fetch error — still within the per-slot TTL. Only slots
-        with a missing, malformed, or expired row are worth a network refetch.
-        """
-        cached, _ = read_cache_with_timestamp(self.usage_cache_path)
-        if not isinstance(cached, dict):
-            return list(switchable)
-        now = time.time()
-        unresolved: list[str] = []
-        for slot in switchable:
-            row = cached.get(slot)
-            if isinstance(row, str) and row in _KNOWN_USAGE_SENTINELS:
-                continue
-            if _usage_slot_trusted(row, now):
-                continue
-            unresolved.append(slot)
-        return unresolved
-
-    def build_auto_switch_decision(
-        self,
-        threshold: int,
-        active_usage_pct: float | None,
-    ) -> AutoSwitchDecisionContext:
-        """Build the poll-cycle decision snapshot for automated switching."""
-        live_slot, sequence_slot = self._resolve_active_slots()
-        if (
-            live_slot
-            and sequence_slot
-            and live_slot != sequence_slot
-        ):
-            drift_key = (live_slot, sequence_slot)
-            if getattr(self, "_logged_active_drift", None) != drift_key:
-                self._logger.warning(
-                    "auto-switch active slot drift: live=Account-%s "
-                    "sequence=Account-%s — using live identity",
-                    live_slot,
-                    sequence_slot,
-                )
-                self._logged_active_drift = drift_key
-
-        data = self._get_sequence_data() or {}
-        switchable = self._switchable_slot_ids(data)
-        snapshots = self._trusted_usage_snapshots()
-        active_slot = live_slot or sequence_slot
-        has_trusted_peer = active_slot is not None and any(
-            slot != active_slot for slot in snapshots
-        )
-        # Refresh only when some peer slot is both untrusted and unanswered.
-        # A stale-peer fleet must not plan from a freshly re-stamped active
-        # row alone, but a peer whose cache row is a known sentinel or an
-        # error row within TTL has already answered — permanently unfetchable
-        # slots (API-key accounts, broken credentials) must not trigger a
-        # network refetch every poll cycle. One trusted peer likewise remains
-        # enough to avoid re-polling the rest of the fleet.
-        if not has_trusted_peer and any(
-            slot != active_slot for slot in self._unresolved_slots(switchable)
-        ):
-            self._refresh_switchable_usage_cache()
-            snapshots = self._trusted_usage_snapshots()
-
-        return AutoSwitchDecisionContext(
-            threshold=threshold,
-            active_usage_pct=active_usage_pct,
-            live_active_slot=live_slot,
-            sequence_active_slot=sequence_slot,
-            usage_by_slot=cast("dict[str, object]", snapshots),
-        )
-
-    def _pick_best_from_snapshots(
-        self,
-        threshold: int,
-        snapshots: dict[str, object],
-        *,
-        exclude: str | None = None,
-    ) -> str | None:
-        return pick_best_from_snapshots(
-            self._get_sequence_view,
-            self._account_is_switchable,
-            threshold,
-            snapshots,
-            exclude=exclude,
-        )
-
-    def plan_automated_switch(
-        self,
-        decision: AutoSwitchDecisionContext,
-    ) -> SwitchPlanResult:
-        """Return the automated target-planning outcome for a poll-cycle decision."""
-        return plan_automated_switch(
-            decision,
-            lambda threshold, snapshots, exclude: self._pick_best_from_snapshots(
-                threshold, snapshots, exclude=exclude
-            ),
-        )
 
     def _write_account_config(
         self, account_num: str, email: str, config: str
@@ -1562,17 +1348,6 @@ class ClaudeAccountSwitcher:
             self._reporter = ListReporter(self)
         return self._reporter
 
-    def _resolve_active_usage_entry(
-        self,
-        account_num: str,
-        email: str,
-        *,
-        creds: str | None = None,
-    ) -> tuple[dict[str, Any] | str | oauth.UsageFetchError | None, oauth.UsageFetchError | None]:
-        return self._list_reporter().resolve_active_usage_entry(
-            account_num, email, creds=creds,
-        )
-
     def _active_account_usage(
         self, account_num: str, current_email: str,
     ) -> dict[str, Any] | str | oauth.UsageFetchError | None:
@@ -1614,7 +1389,7 @@ class ClaudeAccountSwitcher:
         Ties (including current-vs-other) resolve in favor of staying put.
         Never raises on network failure.
         """
-        from claude_swap.usage_policy import rank_slots
+        from claude_swap.usage_policy import rank_headroom_best
 
         data = self._get_sequence_data() or {}
         others = [
@@ -1622,11 +1397,10 @@ class ClaudeAccountSwitcher:
             if str(n) != str(current_num) and self._account_is_switchable(str(n))
         ]
         usage = self._usage_by_account()
-        result = rank_slots(
+        result = rank_headroom_best(
             cast("dict[str, object]", usage),
-            mode="headroom_best",
             current=str(current_num) if current_num is not None else None,
-            candidates=others,
+            others=others,
         )
         return result.target, result.note or ""
 
@@ -1747,41 +1521,6 @@ class ClaudeAccountSwitcher:
             data=data,
             sequence=sequence,
         )
-
-    def _switch_automated_target(
-        self,
-        decision: AutoSwitchDecisionContext,
-        active_account: str | int | None,
-        *,
-        quiet: bool,
-    ) -> str | None:
-        """Return the automated target slot, or ``None`` when staying put."""
-        plan = self.plan_automated_switch(decision)
-        if plan.outcome == "chosen":
-            self._logger.info(
-                "switch: %s (active=%s threshold=%s)",
-                plan.reason,
-                active_account,
-                decision.threshold,
-            )
-            return plan.target
-        if plan.outcome == "already_optimal":
-            msg = f"{plan.reason}; waiting for cooldown."
-            if quiet:
-                self._logger.info("switch: %s", msg)
-            else:
-                print(dimmed(msg))
-            return None
-        msg = f"Cannot choose auto-switch target safely: {plan.reason}"
-        if plan.outcome == "no_trusted_signal":
-            if quiet:
-                self._logger.info("switch: %s", msg)
-                return None
-            print(dimmed(msg))
-            raise SwitchError(msg)
-        # Exhaustiveness guard: if a new SwitchPlanOutcome is added, mypy fails
-        # here rather than silently falling through to "stay put".
-        assert_never(plan.outcome)
 
     def _switch_unmanaged_notice(self, current_email: str) -> None:
         """Adopt the unmanaged active login and ask the user to re-run the switch."""
@@ -1977,191 +1716,6 @@ class ClaudeAccountSwitcher:
         from claude_swap.list_reporter import run_status
         return run_status(self, json_output=json_output)
 
-    def get_auto_switch_config(self) -> AutoSwitchConfig:
-        """Return the persisted auto-switch (Beta) settings.
-
-        Auto-switch is opt-in and stored in ``sequence.json`` under the
-        ``autoSwitch`` key. Defaults to disabled at
-        ``DEFAULT_AUTO_SWITCH_THRESHOLD``%.
-        """
-        return self._sequence_store.load_or_empty().auto_switch
-
-    def set_auto_switch_config(
-        self, *, enabled: bool | None = None, threshold: int | None = None
-    ) -> AutoSwitchConfig:
-        """Persist auto-switch (Beta) settings, returning the merged config.
-
-        Only the provided fields are updated; the rest keep their stored (or
-        default) values.
-
-        Raises:
-            ValidationError: if ``threshold`` is outside the 1-100 range.
-        """
-        self._setup_directories()
-        self._init_sequence_file()
-        if threshold is not None and not 1 <= int(threshold) <= 100:
-            raise ValidationError("Threshold must be between 1 and 100")
-        data = self._sequence_store.load_or_empty().with_auto_switch(
-            enabled=enabled, threshold=threshold
-        )
-        self._sequence_store.save(data)
-        return data.auto_switch
-
-    def ensure_auto_switch_enabled(self) -> AutoSwitchConfig:
-        """Return config, persisting ``enabled=True`` if currently disabled.
-
-        Foreground monitors (CLI ``--monitor``, TUI "Start monitor now")
-        treat starting as opt-in.
-        """
-        cfg = self.get_auto_switch_config()
-        if not cfg.enabled:
-            cfg = self.set_auto_switch_config(enabled=True)
-        return cfg
-
-    def _active_account_slot(self) -> tuple[str | None, str] | None:
-        """Resolve the active account's slot number and email.
-
-        Returns ``None`` when there is no active login, otherwise
-        ``(account_num, email)`` where ``account_num`` is ``None`` for a bare
-        active login with no numbered entry. Shared by usage resolution and the
-        rate-limit retry-after lookup so both derive the active slot identically.
-        """
-        identity = self._get_current_account()
-        if identity is None:
-            return None
-        current_email, current_org_uuid = identity
-
-        data = self._get_sequence_data() or {}
-        account_num = _slot_for_identity(
-            data.get("accounts", {}), current_email, current_org_uuid,
-        )
-        if account_num is None:
-            preferred = data.get("activeAccountNumber")
-            if preferred is not None:
-                account_num = str(preferred)
-        return account_num, current_email
-
-    def get_active_usage_retry_after(self) -> int | None:
-        """Server-supplied ``Retry-After`` (seconds) when the active account's
-        usage fetch was rate-limited, else ``None``.
-
-        The monitor honors this server-specified backoff window on HTTP 429
-        instead of guessing with its own exponential failure backoff. Reads the
-        cache-first usage entry, so it adds no extra network call after a poll.
-
-        Two cases yield a value: (1) the resolved entry *is* a rate-limited
-        ``UsageFetchError`` (no trusted cache row masked it); or (2) a trusted
-        prior usage row masked the active 429, in which case the server window
-        was stamped as a ``_last_rate_limit`` side field at write time and is
-        read back — decayed for elapsed time — via
-        ``usage_cache.extract_retry_after``.
-        """
-        slot = self._active_account_slot()
-        if slot is None:
-            return None
-        account_num, current_email = slot
-        if account_num is None:
-            return None
-        usage, _ = self._resolve_active_usage_entry(account_num, current_email)
-        if isinstance(usage, oauth.UsageFetchError) and usage.reason == "rate_limited":
-            return oauth.parse_retry_after_seconds(usage.retry_after)
-        # A trusted prior row can mask the active 429; the codec stamps the
-        # server Retry-After as a side field (usage_cache._persist_usage_cache_entry)
-        # which extract_retry_after reads back and decays against the clock.
-        return extract_retry_after(usage, time.time())
-
-    def _resolve_active_usage(self) -> dict[str, Any] | None:
-        """Return the active account's usage dict (cached or freshly fetched).
-
-        Returns ``None`` when there is no active login, no usable credentials,
-        or the usage API is unreachable / returned an error. Shared single
-        source for ``get_active_usage_pct`` and ``get_active_usage_breakdown``
-        so a monitor poll performs exactly one fetch.
-        """
-        self._active_usage_note = None
-        slot = self._active_account_slot()
-        if slot is None:
-            return None
-        account_num, current_email = slot
-
-        if account_num is not None:
-            usage, note = self._resolve_active_usage_entry(account_num, current_email)
-            self._active_usage_note = note
-            if not isinstance(usage, dict):
-                usage = None
-        else:
-            active = self._read_active_credentials()
-            creds = active.value or ""
-            if not creds or not oauth.extract_access_token(creds):
-                return None
-            fetched = self._list_reporter().fetch_active_usage(
-                "active", current_email, creds, degraded=active.degraded,
-            )
-            usage = fetched if isinstance(fetched, dict) else None
-
-        if (
-            isinstance(usage, dict)
-            and "five_hour" not in usage
-            and "seven_day" not in usage
-        ):
-            keys_seen = sorted(usage.keys())
-            self._logger.warning(
-                "usage API returned no recognized rate-limit windows "
-                "(keys: %s) — possible schema change",
-                keys_seen,
-            )
-
-        return usage if isinstance(usage, dict) else None
-
-    def get_active_usage_pct(self) -> float | None:
-        """Return the highest 5h/7d utilization pct for the active account.
-
-        Used by the auto-switch monitor and CLI/TUI. Returns ``None`` when no
-        usage is available. Thin ``max`` over ``get_active_usage_breakdown``'s
-        source so all callers share one fetch path.
-        """
-        return max_usage_pct(self._resolve_active_usage())
-
-    def get_active_usage_breakdown(self) -> dict[str, float] | None:
-        """Return per-window utilization for the active account.
-
-        ``{"five_hour": 72.0, "seven_day": 87.0}`` — windows without a usable
-        pct are omitted; returns ``None`` when no usage is available. Lets the
-        monitor track each window's velocity independently so a fast 5h climb
-        is not masked by a flat, higher 7d value.
-        """
-        usage = self._resolve_active_usage()
-        if not isinstance(usage, dict):
-            return None
-        out: dict[str, float] = {}
-        for key in ("five_hour", "seven_day"):
-            entry = usage.get(key)
-            if isinstance(entry, dict):
-                pct = entry.get("pct")
-                if isinstance(pct, (int, float)):
-                    out[key] = float(pct)
-        return out or None
-
-    def active_usage_is_masked_failure(self) -> bool:
-        """Whether the last resolved active usage masked a failed fetch.
-
-        True when the displayed value came from a trusted prior cache row
-        while this cycle's live fetch failed (``_merge_usage_with_previous``
-        surfaced a note): the reading may be arbitrarily old, so the monitor
-        must not treat it as a fresh switch-trigger signal. Reads the note
-        stashed by ``_resolve_active_usage`` — no extra network call.
-        """
-        return self._active_usage_note is not None
-
-    def active_account_is_api_key(self) -> bool:
-        """Whether the live active credential is a managed API key (no quota).
-
-        Lets the auto-switch monitor distinguish "API-key account, nothing to
-        monitor" (idle) from "usage fetch failed" (backoff) when usage is None.
-        A local credential read — does not touch the network usage API.
-        """
-        return looks_like_api_key(self._read_credentials() or "")
-
     def _first_run_setup(self) -> None:
         """First-run setup workflow."""
         identity = self._get_current_account()
@@ -2208,8 +1762,7 @@ class ClaudeAccountSwitcher:
 
         Pass an explicit intent:
           * ``ManualSwitchIntent()`` — interactive round-robin (default)
-          * ``InteractiveAutoSwitchIntent(decision=...)`` — TUI monitor
-          * ``BackgroundAutoSwitchIntent(decision=...)`` — CLI / launchd
+          * ``CliSwitchIntent(...)`` — CLI ``--switch`` (strategy / JSON)
         """
         if strategy is not None or json_output:
             from claude_swap.switch_cli import run_switch_cli
@@ -2220,14 +1773,7 @@ class ClaudeAccountSwitcher:
             if intent is None:
                 intent = ManualSwitchIntent()
 
-        if isinstance(intent, (InteractiveAutoSwitchIntent, BackgroundAutoSwitchIntent)):
-            quiet = intent.quiet
-            decision = intent.decision
-            automated = True
-        else:
-            quiet = intent.quiet
-            decision = None
-            automated = False
+        quiet = intent.quiet
 
         preconditions = self._classify_switch_preconditions()
 
@@ -2258,22 +1804,11 @@ class ClaudeAccountSwitcher:
             print(dimmed(_ONLY_ONE_ACCOUNT_MSG))
             return False
 
-        active_account = (
-            decision.live_active_slot
-            if automated and decision is not None and decision.live_active_slot
-            else data.get("activeAccountNumber")
-        )
+        active_account = data.get("activeAccountNumber")
 
-        if automated and decision is not None:
-            next_account = self._switch_automated_target(
-                decision, active_account, quiet=quiet,
-            )
-            if next_account is None:
-                return False
-        else:
-            next_account, _ = self._switch_manual_rotation_target(
-                sequence, active_account, quiet=quiet,
-            )
+        next_account, _ = self._switch_manual_rotation_target(
+            sequence, active_account, quiet=quiet,
+        )
 
         if next_account is None:
             msg = (

@@ -16,7 +16,7 @@ from claude_swap.protocols import ServiceHost
 
 _UNSUPPORTED_MSG = (
     "cswap service is not supported on this platform yet. "
-    "Use `cswap --monitor` in the foreground."
+    "Use `cswap auto` in the foreground."
 )
 
 

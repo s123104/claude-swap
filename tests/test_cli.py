@@ -9,14 +9,12 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
 from claude_swap import __version__
 from claude_swap import cli
-from claude_swap.sequence_store import AutoSwitchConfig
-from claude_swap.switcher import auto_switch_display
 
 # src layout: ensure subprocess can find claude_swap
 _SRC_DIR = str(Path(__file__).resolve().parent.parent / "src")
@@ -83,7 +81,6 @@ class TestCLI:
         assert "--switch" in result.stdout
         assert "--list" in result.stdout
         assert "--status" in result.stdout
-        assert "--monitor" in result.stdout
         assert "--health" in result.stdout
 
     def test_no_args_shows_error(self):
@@ -233,21 +230,6 @@ class TestCLI:
             show_token_status=True,
             show_health=True,
         )
-
-    def test_monitor_dispatches_to_run_cli_monitor(self):
-        """--monitor should start the plain CLI monitor."""
-        with (
-            patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls,
-            patch.object(sys, "argv", ["claude-swap", "--monitor"]),
-            patch("claude_swap.monitor.run_cli_monitor", return_value=0) as mock_run,
-            patch("os.geteuid", return_value=1000),
-            patch("claude_swap.update_check.check_for_update", return_value=None),
-        ):
-            with pytest.raises(SystemExit) as excinfo:
-                cli.main()
-
-        assert excinfo.value.code == 0
-        mock_run.assert_called_once_with(switcher_cls.return_value)
 
     def test_slot_flag_requires_add_account(self, capsys):
         """--slot should only be accepted alongside --add-account or --add-token."""
@@ -657,121 +639,6 @@ class TestRunCommand:
 
         assert excinfo.value.code == 1
         assert "boom" in capsys.readouterr().err
-
-
-class TestAutoSwitchCommand:
-    """`cswap auto-switch` pre-dispatch: config-only SSOT commands."""
-
-    def test_status_reads_persisted_config(self, capsys):
-        with (
-            patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls,
-            patch("os.geteuid", return_value=1000),
-            patch.object(sys, "argv", ["claude-swap", "auto-switch", "status"]),
-        ):
-            switcher_cls.return_value.get_auto_switch_config.return_value = (
-                AutoSwitchConfig(enabled=True, threshold=95)
-            )
-            cli.main()
-
-        switcher_cls.return_value.get_auto_switch_config.assert_called_once_with()
-        out = capsys.readouterr().out
-        assert "Auto-switch:" in out
-        assert "ON" in out
-        assert "95%" in out
-
-    def test_enable_persists_enabled_true(self, capsys):
-        with (
-            patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls,
-            patch("os.geteuid", return_value=1000),
-            patch.object(sys, "argv", ["claude-swap", "auto-switch", "enable"]),
-        ):
-            switcher_cls.return_value.set_auto_switch_config.return_value = (
-                AutoSwitchConfig(enabled=True, threshold=95)
-            )
-            cli.main()
-
-        switcher_cls.return_value.set_auto_switch_config.assert_called_once_with(
-            enabled=True
-        )
-        out = capsys.readouterr().out
-        assert "Auto-switch:" in out
-        assert "ON" in out
-
-    def test_disable_persists_enabled_false(self, capsys):
-        with (
-            patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls,
-            patch("os.geteuid", return_value=1000),
-            patch.object(sys, "argv", ["claude-swap", "auto-switch", "disable"]),
-        ):
-            switcher_cls.return_value.set_auto_switch_config.return_value = (
-                AutoSwitchConfig(enabled=False, threshold=95)
-            )
-            cli.main()
-
-        switcher_cls.return_value.set_auto_switch_config.assert_called_once_with(
-            enabled=False
-        )
-        out = capsys.readouterr().out
-        assert "Auto-switch:" in out
-        assert "OFF" in out
-
-    def test_set_threshold_persists_threshold(self, capsys):
-        with (
-            patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls,
-            patch("os.geteuid", return_value=1000),
-            patch.object(
-                sys,
-                "argv",
-                ["claude-swap", "auto-switch", "set-threshold", "95"],
-            ),
-        ):
-            switcher_cls.return_value.set_auto_switch_config.return_value = (
-                AutoSwitchConfig(enabled=False, threshold=95)
-            )
-            cli.main()
-
-        switcher_cls.return_value.set_auto_switch_config.assert_called_once_with(
-            threshold=95
-        )
-        out = capsys.readouterr().out
-        assert "Auto-switch:" in out
-        assert "95%" in out
-
-    def test_set_threshold_invalid_value_exits_cleanly(self, capsys):
-        from claude_swap.exceptions import ValidationError
-
-        with (
-            patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls,
-            patch("os.geteuid", return_value=1000),
-            patch.object(
-                sys,
-                "argv",
-                ["claude-swap", "auto-switch", "set-threshold", "101"],
-            ),
-        ):
-            switcher_cls.return_value.set_auto_switch_config.side_effect = (
-                ValidationError("Threshold must be between 1 and 100")
-            )
-            with pytest.raises(SystemExit) as excinfo:
-                cli.main()
-
-        assert excinfo.value.code == 1
-        assert "Threshold must be between 1 and 100" in capsys.readouterr().err
-
-    def test_status_label_matches_tui_on_off(self, capsys):
-        from claude_swap import tui
-
-        config = AutoSwitchConfig(enabled=True, threshold=88)
-        _enabled, _threshold, on_off, _state = auto_switch_display(config)
-
-        cli._print_auto_switch_config(config)
-        assert on_off in capsys.readouterr().out
-
-        switcher = MagicMock()
-        switcher.get_auto_switch_config.return_value = config
-        switcher._get_sequence_data.return_value = {"accounts": {"1": {}}}
-        switcher._get_current_account.return_value = None
-        assert f"auto-switch {on_off}" in tui._status_line(switcher)
 
 
 class TestJsonOutputCli:

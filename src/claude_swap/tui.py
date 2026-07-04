@@ -17,30 +17,25 @@ from __future__ import annotations
 
 import contextlib
 import curses
+import dataclasses
 import io
-import os
 import re
 import sys
 import time
+from collections import deque
 from datetime import datetime
-from typing import Any, Callable, cast
+from typing import Any, Callable
 
+from claude_swap.autoswitch import AutoSwitchEngine, AutoSwitchEvent
 from claude_swap.exceptions import ClaudeSwitchError
-from claude_swap.models import AutoSwitchDecisionContext, InteractiveAutoSwitchIntent
 from claude_swap import printer, service
-from claude_swap.monitor import (
-    MONITOR_POLL_SECONDS,
-    MONITOR_POLL_SECONDS_MIN,
-    MonitorRuntimeState,
-    SwitchCancelled,
-    active_usage_display,
-    acquire_pid,
-    get_logger,
-    monitor_step,
-    release_pid,
+from claude_swap.settings import (
+    THRESHOLD_MAX,
+    THRESHOLD_MIN,
+    load_settings,
+    save_settings,
 )
-from claude_swap.sequence_store import AutoSwitchConfig
-from claude_swap.switcher import ClaudeAccountSwitcher, auto_switch_display
+from claude_swap.switcher import ClaudeAccountSwitcher
 
 
 # Minimum terminal size we render in. Below this, we bail to plain CLI advice.
@@ -220,7 +215,7 @@ def _main_loop(stdscr: CursesWindow, switcher: ClaudeAccountSwitcher) -> int:
             ("Account health & usage", "health"),
             ("Status", "status"),
             ("Watch (live status + usage)", "watch"),
-            ("Auto-switch at limit (Beta)", "auto"),
+            ("Auto-switch at limit", "auto"),
             ("Quit", "quit"),
         ]
         choice = _select_from(
@@ -400,22 +395,26 @@ def _watch_loop(
 
 
 # Auto-switch flow
-def _auto_toggle(
-    stdscr: CursesWindow, switcher: ClaudeAccountSwitcher, cfg: AutoSwitchConfig,
-) -> None:
-    switcher.set_auto_switch_config(enabled=not cfg.enabled)
-
-
 def _auto_threshold(stdscr: CursesWindow, switcher: ClaudeAccountSwitcher) -> None:
     raw = _prompt_text(stdscr, "Switch when usage reaches (%): ")
     if not raw:
         return
     try:
-        switcher.set_auto_switch_config(threshold=int(raw))
+        value = float(raw)
     except ValueError:
-        _show_message(stdscr, "Threshold must be a whole number.", is_error=True)
-    except ClaudeSwitchError as e:
-        _show_message(stdscr, f"Invalid threshold: {e}", is_error=True)
+        _show_message(stdscr, "Threshold must be a number.", is_error=True)
+        return
+    if not (THRESHOLD_MIN <= value <= THRESHOLD_MAX):
+        _show_message(
+            stdscr,
+            f"Threshold must be between {THRESHOLD_MIN:g} and {THRESHOLD_MAX:g}.",
+            is_error=True,
+        )
+        return
+    settings = load_settings(switcher.backup_dir)
+    save_settings(
+        switcher.backup_dir, dataclasses.replace(settings, threshold=value)
+    )
 
 
 def _auto_service_toggle(
@@ -438,123 +437,81 @@ def _auto_service_status(
         _shell_out(stdscr, lambda: service.status(switcher))
 
 
-def _auto_start_monitor(stdscr: CursesWindow, switcher: ClaudeAccountSwitcher) -> None:
-    cfg = switcher.ensure_auto_switch_enabled()
-    _run_auto_monitor(stdscr, switcher, cfg.threshold)
-
-
 def _do_auto_switch(stdscr: CursesWindow, switcher: ClaudeAccountSwitcher) -> None:
-    """Settings + launcher for auto-switch (Beta).
+    """Settings + launcher for the auto-switch engine.
 
-    Lets the user enable cooldown-aware auto-switch when the active account's
-    5h/7d usage reaches a threshold, tune that threshold, and start the
-    foreground monitor. Settings persist in ``sequence.json``.
+    Lets the user tune the switch threshold (persisted in ``settings.json``),
+    manage the background service, and run the engine in the foreground.
 
-    No Claude Code restart is needed for the switch to take effect — on
+    No Claude Code restart is needed for a switch to take effect — on
     Linux/Windows the new credentials are picked up on the next message; on
-    macOS within Claude Code's ~30s Keychain cache TTL. For automated paths
-    (TUI monitor + launchd background service) the target's OAuth token is
-    force-refreshed before activation so the first API call against the new
-    account gets a freshly-issued token.
+    macOS within Claude Code's ~30s Keychain cache TTL. The engine refreshes
+    the target's OAuth token before activation when it is close to expiry.
     """
     while True:
-        cfg = switcher.get_auto_switch_config()
-        _enabled, threshold, on_off, _state = auto_switch_display(cfg)
+        settings = load_settings(switcher.backup_dir)
         # Local name deliberately differs from ``service.service_state`` (the
         # function used inside ``_service_state()``) so future readers don't
         # accidentally shadow the import.
         current_service_state = _service_state()
         subtitle = (
-            f"Rule {on_off} @ {threshold}%  ·  "
+            f"Switch at {settings.threshold:g}%  ·  "
             f"Background service {current_service_state}"
         )
         items: list[tuple[str, str | None]] = [
-            (f"Auto-switch: {'Disable' if cfg.enabled else 'Enable'}", "toggle"),
-            (f"Threshold: set to {cfg.threshold}%", "threshold"),
+            (f"Threshold: set to {settings.threshold:g}%", "threshold"),
             (_service_menu_label(current_service_state), "service-toggle"),
             ("Background service: Show status", "service-status"),
-            ("Start monitor now", "start"),
+            ("Run engine now (foreground)", "start"),
             ("-- Back --", None),
         ]
         choice = _select_from(
             stdscr,
-            "Auto-switch at limit (Beta)",
+            "Auto-switch at limit",
             items=items,
             subtitle=subtitle,
         )
         if choice is None:
             return
 
-        if choice == "toggle":
-            _auto_toggle(stdscr, switcher, cfg)
-        elif choice == "threshold":
+        if choice == "threshold":
             _auto_threshold(stdscr, switcher)
         elif choice == "service-toggle":
             _auto_service_toggle(stdscr, switcher, current_service_state)
         elif choice == "service-status":
             _auto_service_status(stdscr, switcher, current_service_state)
         elif choice == "start":
-            _auto_start_monitor(stdscr, switcher)
+            _run_auto_engine(stdscr, switcher)
 
 
-def _run_auto_monitor(
-    stdscr: CursesWindow, switcher: ClaudeAccountSwitcher, threshold: int,
-) -> None:
-    """Foreground watcher: TUI adapter over the shared monitor engine."""
-    running_pid = acquire_pid(switcher)
-    if running_pid is not None:
-        _show_message(
-            stdscr,
-            f"Auto-switch monitor already running (pid {running_pid}). "
-            "Stop the CLI monitor or background service first.",
-            is_error=True,
-        )
-        return
+def _run_auto_engine(stdscr: CursesWindow, switcher: ClaudeAccountSwitcher) -> None:
+    """Foreground engine run: a curses frontend over ``AutoSwitchEngine``.
 
+    The same decision core as ``cswap auto`` and the background service —
+    concurrent instances serialize through the engine's state lock, so this
+    is safe to run alongside an installed service (ticks that lose the race
+    simply observe the other instance's cooldown).
+    """
+    settings = load_settings(switcher.backup_dir)
+    events: deque[str] = deque(maxlen=100)
+    log = switcher._logger
+
+    def on_event(event: AutoSwitchEvent) -> None:
+        events.append(f"{datetime.now():%H:%M:%S}  {event.human()}")
+        log.info("auto: %s", event.human())
+
+    engine = AutoSwitchEngine(switcher, settings, on_event)
     curses.curs_set(0)
     stdscr.timeout(1000)
-    log = get_logger(switcher)
-    log.info(
-        "monitor start: threshold=%s adaptive=%s-%ss pid=%s",
-        threshold,
-        MONITOR_POLL_SECONDS_MIN,
-        MONITOR_POLL_SECONDS,
-        os.getpid(),
-    )
-    state = MonitorRuntimeState()
-    poll_ceiling = MONITOR_POLL_SECONDS
-    display_threshold = threshold
-    last_checked = "never"
-    message = "Monitoring started."
     seconds_to_next = 0
-    usage_display = "unavailable"
-
-    def perform_switch(decision: AutoSwitchDecisionContext) -> bool:
-        return _auto_perform_switch(stdscr, switcher, decision)
-
     try:
         while True:
             if seconds_to_next <= 0:
-                result = monitor_step(
-                    switcher,
-                    state,
-                    poll_seconds=poll_ceiling,
-                    perform_switch=perform_switch,
-                )
-                display_threshold = result.threshold
-                usage_display = active_usage_display(result, state)
-                last_checked = datetime.now().strftime("%H:%M:%S")
-                seconds_to_next = result.next_interval
-                message = result.user_message
-
-            _draw_monitor(
-                stdscr,
-                display_threshold,
-                usage_display,
-                last_checked,
-                seconds_to_next,
-                message,
-            )
+                # The switch pipeline prints; keep it off the curses screen.
+                with contextlib.redirect_stdout(io.StringIO()):
+                    outcome = engine.tick()
+                seconds_to_next = max(1, int(engine._next_delay(outcome)))
+            _draw_engine(stdscr, settings.threshold, list(events), seconds_to_next)
             key = stdscr.getch()
             if key in (27, ord("q"), ord("Q")):
                 return
@@ -563,71 +520,33 @@ def _run_auto_monitor(
                 continue
             seconds_to_next -= 1
     finally:
-        log.info("monitor stopped")
         stdscr.timeout(-1)
-        release_pid(switcher)
 
 
-def _auto_perform_switch(
+def _draw_engine(
     stdscr: CursesWindow,
-    switcher: ClaudeAccountSwitcher,
-    decision: AutoSwitchDecisionContext,
-) -> bool:
-    """Suspend curses, run automated ``switch()``, then resume."""
-    curses.def_prog_mode()
-    curses.endwin()
-    switched = False
-    try:
-        try:
-            switched = cast(
-                bool,
-                switcher.switch(
-                    InteractiveAutoSwitchIntent(decision=decision),
-                ),
-            )
-        except ClaudeSwitchError as e:
-            print(f"Auto-switch error: {e}")
-            raise
-        except KeyboardInterrupt:
-            print("\nOperation cancelled.")
-            raise SwitchCancelled from None
-        print()
-        time.sleep(2.5)  # brief pause so the output is readable
-    finally:
-        curses.reset_prog_mode()
-        stdscr.refresh()
-    return switched
-
-
-def _draw_monitor(
-    stdscr: CursesWindow,
-    threshold: int,
-    usage_display: str,
-    last_checked: str,
+    threshold: float,
+    events: list[str],
     seconds_to_next: int,
-    message: str,
 ) -> None:
-    """Render the auto-switch monitor screen."""
+    """Render the foreground engine screen: countdown + recent events."""
     stdscr.erase()
     rows, cols = stdscr.getmaxyx()
     _draw_header(
         stdscr,
-        "Auto-switch monitor (Beta)",
-        f"threshold {threshold}%  ·  adaptive {MONITOR_POLL_SECONDS_MIN}–{MONITOR_POLL_SECONDS}s",
+        "Auto-switch engine",
+        f"threshold {threshold:g}%",
         cols,
     )
-    lines = [
-        f"Active account usage : {usage_display}",
-        f"Last checked         : {last_checked}",
-        f"Next check in        : {max(0, seconds_to_next)}s",
-        "",
-        message,
-    ]
-    for i, line in enumerate(lines):
-        if 4 + i >= rows - 2:
+    stdscr.addstr(3, 2, f"Next check in: {max(0, seconds_to_next)}s"[: cols - 4])
+    body_top = 5
+    visible_rows = max(0, rows - 1 - body_top)
+    for i, line in enumerate(events[-visible_rows:]):
+        y = body_top + i
+        if y >= rows - 1:
             break
-        stdscr.addstr(4 + i, 2, line[: cols - 4])
-    footer = "[s] check now  [q/Esc] stop monitor"
+        stdscr.addstr(y, 2, line[: cols - 4])
+    footer = "[s] check now  [q/Esc] stop"
     stdscr.addstr(rows - 1, 2, footer[: cols - 4], curses.A_DIM)
     stdscr.refresh()
 
@@ -648,13 +567,7 @@ def _status_line(switcher: ClaudeAccountSwitcher) -> str:
         email, org = identity
         tag = "personal" if not org else org[:8]
         active = f"{email} [{tag}]"
-    line = f"Active: {active}  ·  {n} managed"
-    enabled, threshold, on_off, _state = auto_switch_display(
-        switcher.get_auto_switch_config()
-    )
-    if enabled:
-        line += f"  ·  auto-switch {on_off} ({threshold}%)"
-    return line
+    return f"Active: {active}  ·  {n} managed"
 
 
 def _service_state() -> str:

@@ -25,6 +25,10 @@ from typing import Any
 SETTINGS_SCHEMA_VERSION = 1
 SETTINGS_FILENAME = "settings.json"
 
+# Accepted threshold range; shared by the load-time clamp and UI validation.
+THRESHOLD_MIN = 50.0
+THRESHOLD_MAX = 99.9
+
 _logger = logging.getLogger("claude-swap")
 
 
@@ -82,7 +86,9 @@ def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
             settings.strategy,
         )
     return AutoSwitchSettings(
-        threshold=num(settings.threshold, defaults.threshold, 50.0, 99.9),
+        threshold=num(
+            settings.threshold, defaults.threshold, THRESHOLD_MIN, THRESHOLD_MAX
+        ),
         interval_seconds=num(
             settings.interval_seconds, defaults.interval_seconds, 15.0, 3600.0
         ),

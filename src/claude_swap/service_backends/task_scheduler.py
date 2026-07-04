@@ -52,20 +52,16 @@ def _resolve_python_executable() -> str:
 
 
 def _program_arguments() -> list[str]:
-    return [
-        _resolve_python_executable(),
-        "-m",
-        "claude_swap",
-        "--monitor",
-        service_spec.SERVICE_MONITOR_FLAG,
-    ]
+    # Same argv as service_spec.program_arguments, but through pythonw.exe so
+    # the hidden task never flashes a console window.
+    return [_resolve_python_executable(), *service_spec.program_arguments()[1:]]
 
 
 def _require_windows() -> None:
     if sys.platform != "win32":
         raise ClaudeSwitchError(
             "cswap service (Task Scheduler) requires Windows. "
-            "Use `cswap --monitor` in the foreground on this platform."
+            "Use `cswap auto` in the foreground on this platform."
         )
 
 
@@ -116,13 +112,13 @@ def _build_task_xml(switcher: ServiceHost) -> str:
     triggers = ET.SubElement(root, f"{{{_TASK_NS}}}Triggers")
     logon = ET.SubElement(triggers, f"{{{_TASK_NS}}}LogonTrigger")
     # Task Scheduler has no supervisor semantics for exit codes: once the
-    # process launched successfully, any exit status (including the monitor's
-    # retryable 75) counts as success and RestartOnFailure never fires — it
-    # only covers actions that failed to start at all. The standard watchdog
-    # pattern is a repeating trigger: re-fire every five minutes with no end,
-    # and let MultipleInstancesPolicy=IgnoreNew drop the re-fire while a
-    # monitor instance is still alive. Net effect: a dead monitor is back
-    # within five minutes; a healthy one is never disturbed.
+    # process launched successfully, any exit status counts as success and
+    # RestartOnFailure never fires — it only covers actions that failed to
+    # start at all. The standard watchdog pattern is a repeating trigger:
+    # re-fire every five minutes with no end, and let
+    # MultipleInstancesPolicy=IgnoreNew drop the re-fire while an engine
+    # instance is still alive. Net effect: a dead engine is back within
+    # five minutes; a healthy one is never disturbed.
     repetition = ET.SubElement(logon, f"{{{_TASK_NS}}}Repetition")
     ET.SubElement(repetition, f"{{{_TASK_NS}}}Interval").text = "PT5M"
     ET.SubElement(repetition, f"{{{_TASK_NS}}}StopAtDurationEnd").text = "false"
@@ -162,7 +158,7 @@ def _build_task_xml(switcher: ServiceHost) -> str:
     ET.SubElement(settings, f"{{{_TASK_NS}}}StartWhenAvailable").text = "true"
     ET.SubElement(settings, f"{{{_TASK_NS}}}Hidden").text = "true"
     ET.SubElement(settings, f"{{{_TASK_NS}}}Enabled").text = "true"
-    # The monitor is a resident process, so the schema defaults are hostile:
+    # The engine is a resident process, so the schema defaults are hostile:
     # ExecutionTimeLimit defaults to PT72H (task hard-killed after 72 hours)
     # and the battery settings default to true (never starts on battery,
     # killed when unplugging). PT0S means "no time limit".
@@ -170,8 +166,8 @@ def _build_task_xml(switcher: ServiceHost) -> str:
     ET.SubElement(settings, f"{{{_TASK_NS}}}DisallowStartIfOnBatteries").text = "false"
     ET.SubElement(settings, f"{{{_TASK_NS}}}StopIfGoingOnBatteries").text = "false"
     # RestartOnFailure only covers launch failures (bad credentials, ACLs);
-    # it does NOT react to exit codes, so it is not the exit-75 retry path —
-    # the repeating logon trigger above is. Kept for the launch-failure case.
+    # it does NOT react to exit codes — the repeating triggers above are the
+    # watchdog. Kept for the launch-failure case.
     restart = ET.SubElement(settings, f"{{{_TASK_NS}}}RestartOnFailure")
     ET.SubElement(restart, f"{{{_TASK_NS}}}Interval").text = "PT1M"
     ET.SubElement(restart, f"{{{_TASK_NS}}}Count").text = "3"
@@ -209,9 +205,9 @@ def _unregister_task(*, check: bool = False) -> subprocess.CompletedProcess[str]
     name = _task_name_literal()
     # Unregister-ScheduledTask does not stop a running instance (deleting a
     # task never interrupts its process). Without the Stop, uninstall leaves
-    # the old monitor alive until logoff and reinstall orphans it, so every
-    # new task launch exits 75 — parity with launchd bootout / systemd
-    # disable --now, which both kill the process.
+    # the old engine alive until logoff and reinstall orphans it — parity
+    # with launchd bootout / systemd disable --now, which both kill the
+    # process.
     script = (
         f"Stop-ScheduledTask -TaskName '{name}' -ErrorAction SilentlyContinue; "
         f"Unregister-ScheduledTask -TaskName '{name}' -Confirm:$false "
@@ -231,7 +227,7 @@ def _register_task(xml_path: Path) -> None:
 
 
 def _start_task() -> None:
-    """Best-effort immediate start so the monitor runs without waiting for the
+    """Best-effort immediate start so the engine runs without waiting for the
     next logon (parity with launchd ``bootstrap`` / systemd ``enable --now``).
 
     Non-fatal: the task is already registered with ``MultipleInstancesPolicy``
@@ -277,22 +273,23 @@ class TaskSchedulerBackend:
         _start_task()
         config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
         if config_dir:
-            # launchd/systemd forward CLAUDE_CONFIG_DIR to the monitor, but
+            # launchd/systemd forward CLAUDE_CONFIG_DIR to the engine, but
             # the task XML schema cannot carry environment variables — the
-            # monitor only sees what the user account's baseline environment
-            # holds, and with the default config dir it would watch an empty
-            # sessions directory and idle forever.
+            # engine only sees what the user account's baseline environment
+            # holds, and with the default config dir it would manage the
+            # wrong (empty) account set.
             warning(
                 "CLAUDE_CONFIG_DIR is set in this shell, but Task Scheduler "
-                "cannot forward it to the background monitor. Make it a "
+                "cannot forward it to the background engine. Make it a "
                 "user-level environment variable first:\n"
                 f'  setx CLAUDE_CONFIG_DIR "{config_dir}"\n'
                 "then run `cswap service install` again from a new shell."
             )
+        command = service_spec.RUNNER_COMMAND_LABEL
         service_spec.print_install_success(
             switcher,
             artifact_path=xml_path,
-            run_hint="runs `cswap --monitor` at logon via Task Scheduler (hidden, per-user)",
+            run_hint=f"runs `{command}` at logon via Task Scheduler (hidden, per-user)",
         )
         return 0
 
