@@ -242,17 +242,17 @@ class TestActiveUsagePct:
 
 
 class TestShouldSwitch:
-    def test_at_threshold_switches(self):
-        assert monitor.should_switch(95, 95) is True
-
-    def test_above_threshold_switches(self):
-        assert monitor.should_switch(99.5, 95) is True
-
-    def test_below_threshold_holds(self):
-        assert monitor.should_switch(94.9, 95) is False
-
-    def test_none_usage_holds(self):
-        assert monitor.should_switch(None, 95) is False
+    @pytest.mark.parametrize(
+        ("pct", "expected"),
+        [
+            pytest.param(95, True, id="at-threshold-switches"),
+            pytest.param(99.5, True, id="above-threshold-switches"),
+            pytest.param(94.9, False, id="below-threshold-holds"),
+            pytest.param(None, False, id="none-usage-holds"),
+        ],
+    )
+    def test_threshold_rule(self, pct: float | None, expected: bool):
+        assert monitor.should_switch(pct, 95) is expected
 
 
 # --------------------------------------------------------------------------- #
@@ -2723,25 +2723,32 @@ class TestRetryAfterBackoff:
             retry_after=retry_after,
         )
 
-    def test_none_falls_back_to_failure_backoff(self):
-        # No server hint → pure exponential backoff (first failure → BASE).
-        result = self._unavailable(None)
-        assert result.next_interval == monitor.MONITOR_FAILURE_BACKOFF_BASE
-
-    def test_retry_after_overrides_shorter_backoff(self):
-        # Server says wait 120s; that exceeds the failure backoff → honoured.
-        result = self._unavailable(120)
-        assert result.next_interval == 120
-
-    def test_retry_after_capped(self):
-        # A pathologically long Retry-After is clamped to the ceiling.
-        result = self._unavailable(99999)
-        assert result.next_interval == monitor.MONITOR_RETRY_AFTER_CAP
-
-    def test_failure_backoff_wins_when_larger(self):
-        # After many failures the backoff can exceed a tiny Retry-After.
-        result = self._unavailable(1, failures=20)
-        assert result.next_interval == monitor.MONITOR_POLL_SECONDS
+    @pytest.mark.parametrize(
+        ("retry_after", "failures", "expected"),
+        [
+            # No server hint → pure exponential backoff (first failure → BASE).
+            pytest.param(
+                None, 0, monitor.MONITOR_FAILURE_BACKOFF_BASE,
+                id="none-falls-back-to-failure-backoff",
+            ),
+            # Server says wait 120s; that exceeds the failure backoff → honoured.
+            pytest.param(120, 0, 120, id="retry-after-overrides-shorter-backoff"),
+            # A pathologically long Retry-After is clamped to the ceiling.
+            pytest.param(
+                99999, 0, monitor.MONITOR_RETRY_AFTER_CAP, id="retry-after-capped",
+            ),
+            # After many failures the backoff can exceed a tiny Retry-After.
+            pytest.param(
+                1, 20, monitor.MONITOR_POLL_SECONDS,
+                id="failure-backoff-wins-when-larger",
+            ),
+        ],
+    )
+    def test_backoff_interval(
+        self, retry_after: int | None, failures: int, expected: int
+    ):
+        result = self._unavailable(retry_after, failures=failures)
+        assert result.next_interval == expected
 
     def test_switcher_reads_retry_after_from_rate_limited_entry(self, temp_home: Path):
         switcher = ClaudeAccountSwitcher()
