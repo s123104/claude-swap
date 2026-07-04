@@ -646,6 +646,32 @@ class TestRunCommand:
         assert "boom" in capsys.readouterr().err
 
 
+class TestRetiredServiceArgvShim:
+    """Old installed services supervise `--monitor --service-monitor`; that
+    argv must exit 0 with a migration note, not argparse-error into a
+    supervisor restart loop (launchd SuccessfulExit:False / systemd
+    on-failure only restart on nonzero exits)."""
+
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ["claude-swap", "--monitor", "--service-monitor"],
+            ["claude-swap", "--monitor"],
+        ],
+    )
+    def test_retired_monitor_argv_exits_zero_with_note(self, argv, capsys):
+        with patch.object(sys, "argv", argv), pytest.raises(SystemExit) as exc:
+            cli.main()
+        assert exc.value.code == 0
+        err = capsys.readouterr().err
+        assert "cswap service install" in err
+        assert "cswap auto" in err
+
+    def test_normal_argv_is_not_intercepted(self):
+        cli._intercept_retired_service_argv(["--list"])
+        cli._intercept_retired_service_argv(["auto", "--once"])
+
+
 class TestSubcommandAliases:
     """Memorable subcommands (`cswap switch`, `cswap list`, ...) → classic flags."""
 

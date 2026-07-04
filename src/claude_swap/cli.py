@@ -894,10 +894,34 @@ def _dispatch_action(
     return None
 
 
+def _intercept_retired_service_argv(argv: list[str]) -> None:
+    """Exit 0 with a migration note when launched with the retired monitor argv.
+
+    Services installed by older fork versions supervise
+    ``python -m claude_swap --monitor --service-monitor``. After an upgrade
+    that argv would be an argparse error (exit 2), which every supervisor
+    treats as a crash: launchd (``SuccessfulExit: False``), systemd
+    (``Restart=on-failure``) and Task Scheduler would silently relaunch it
+    forever. Exiting 0 stops launchd/systemd restarts; Task Scheduler runs on
+    a schedule regardless, so each trigger just re-prints this note until the
+    user reinstalls.
+    """
+    if "--monitor" not in argv:
+        return
+    print(
+        "cswap: the --monitor loop was retired; the service now runs "
+        "`cswap auto`. Run `cswap service install` once to migrate the "
+        "installed service (or `cswap service uninstall` to remove it).",
+        file=sys.stderr,
+    )
+    sys.exit(0)
+
+
 def main() -> None:
     """Main entry point for the CLI."""
     _use_native_tls()
     _relax_redirected_stream_encoding()
+    _intercept_retired_service_argv(sys.argv[1:])
     if len(sys.argv) > 1 and sys.argv[1] in _SUBCOMMANDS:
         # Subcommands return only in tests where exec/sys.exit is mocked.
         globals()[_SUBCOMMANDS[sys.argv[1]]](sys.argv[2:])
