@@ -15,6 +15,7 @@ the actual ``switch(BackgroundAutoSwitchIntent(...))`` call. A PID file under
 
 from __future__ import annotations
 
+import csv
 import logging
 import os
 import signal
@@ -893,11 +894,16 @@ def _tasklist_image(pid: int) -> tuple[bool, str | None]:
         return (False, None)
     if result.returncode != 0:
         return (False, None)
-    line = result.stdout.strip()
-    if not line or line.upper().startswith("INFO:"):
-        return (True, None)
-    image = line.split(",", 1)[0].strip().strip('"')
-    return (True, image or None)
+    # Quoted CSV fields may contain commas, so parse with the csv module.
+    # "No process owns the PID" is decided structurally — no data row carries
+    # the queried PID — because the notice tasklist prints instead is
+    # localized text ("INFO: ..." only on English Windows) and must not be
+    # mistaken for an image name.
+    for row in csv.reader(result.stdout.splitlines()):
+        if len(row) >= 2 and row[1].strip() == str(pid):
+            image = row[0].strip()
+            return (True, image or None)
+    return (True, None)
 
 
 def _looks_like_python(image: str) -> bool:

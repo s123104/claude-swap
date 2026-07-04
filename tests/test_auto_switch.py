@@ -1614,6 +1614,34 @@ class TestMonitorPidLifecycle:
         with patch("claude_swap.monitor.subprocess.run", side_effect=OSError):
             assert monitor._tasklist_image(4242) == (False, None)
 
+    def test_tasklist_image_handles_quoted_comma_fields(self):
+        # CSV semantics: a quoted image name containing a comma must not
+        # shear the row apart (a naive split returned a fragment as the image).
+        running = MagicMock(
+            returncode=0,
+            stdout='"my, app.exe","4242","Console","1","10,000 K"\n',
+        )
+        with patch("claude_swap.monitor.subprocess.run", return_value=running):
+            assert monitor._tasklist_image(4242) == (True, "my, app.exe")
+
+    @pytest.mark.parametrize(
+        "notice",
+        [
+            # tasklist localizes its no-match notice; only English says INFO:.
+            "INFORMATION: Es werden keine Aufgaben mit den angegebenen "
+            "Kriterien ausgeführt.\n",
+            "情報: 指定された条件に一致するタスクは実行されていません。\n",
+        ],
+    )
+    def test_tasklist_image_no_match_is_structural_not_localized(
+        self, notice: str
+    ):
+        # "No process owns the PID" must be decided by the absence of a data
+        # row carrying the queried PID, not by an English text prefix.
+        absent = MagicMock(returncode=0, stdout=notice)
+        with patch("claude_swap.monitor.subprocess.run", return_value=absent):
+            assert monitor._tasklist_image(4242) == (True, None)
+
     def test_tasklist_timeout_keeps_conservative_holder_bias(self):
         # A hung tasklist (WMI-backed and able to stall forever) must map to
         # "undeterminable" instead of wedging the supervised monitor at
