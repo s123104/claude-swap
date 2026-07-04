@@ -87,6 +87,9 @@ cswap auto --dry-run           # log what it would do, never switch
 
 - Switches cooperate with Claude Code's own credential locks, so a swap can never collide with a token refresh mid-session.
 - A cooldown (default 5 min) and a hysteresis margin keep it from flip-flopping between accounts near the line; when every account is exhausted it sleeps until the earliest quota reset.
+- Usage polling is adaptive: each check polls the active account plus one alternate (whichever has the stalest data), and only refreshes everything when a switch is actually near — so API traffic stays flat no matter how many accounts you manage. An alternate whose usage is moving (in use on another machine or in session mode) gets watched more closely, an unchanging one backs off, and an exhausted one isn't polled again until its window resets.
+- A failed usage fetch doesn't blind it: the last-known usage keeps being trusted for a few minutes while retries back off (honoring the server's `Retry-After`), so a network blip can't trigger a spurious failover.
+- If the active account's token expires while Claude Code sits idle (typical after the PC wakes from sleep), auto holds and slows down instead of failing over — Claude Code refreshes the token itself on your next message, and nothing consumes quota in the meantime.
 - An account whose refresh token has died is quarantined — taken out of rotation and reported — until you log in with it and re-run `cswap --add-account --slot N`.
 - API-key accounts are never rotated onto unless you pass `--include-api-key-accounts` (they bill per token).
 
@@ -211,6 +214,8 @@ cswap --switch-to 2 --json
 ```
 
 Every payload carries a `schemaVersion` (currently `1`); on a handled error stdout is `{"schemaVersion":1,"error":{...}}` with a non-zero exit code. `--switch`/`--switch-to` report `{"switched": true|false, "from": …, "to": …, "reason": …}`.
+
+Usage is served from a per-account cache: when the usage API is briefly unreachable, the last-known numbers are shown instead of nothing (the human view marks them with their age, e.g. `· 2m ago`). Rows with usage carry additive `usageFetchedAt`/`usageAgeSeconds` fields telling you how old the measurement is.
 
 </details>
 

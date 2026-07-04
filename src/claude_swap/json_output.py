@@ -8,6 +8,8 @@ the single ``json.dumps`` (see cli.py).
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 # Bump only on a breaking change to any payload shape. Scripts key off this.
 SCHEMA_VERSION = 1
 
@@ -102,6 +104,26 @@ def account_ref(number: int | None, email: str) -> dict:
     return {"number": number, "email": email}
 
 
+def usage_freshness_fields(
+    fetched_at: float | None, age_s: float | None
+) -> dict:
+    """Additive ``usageFetchedAt``/``usageAgeSeconds`` fields describing how
+    old the served ``usage`` measurement is (the store may serve last-good
+    data on fetch failure). Emitted only alongside a non-null ``usage``."""
+    if fetched_at is None:
+        return {}
+    fields: dict = {
+        "usageFetchedAt": (
+            datetime.fromtimestamp(fetched_at, tz=timezone.utc)
+            .isoformat(timespec="seconds")
+            .replace("+00:00", "Z")
+        )
+    }
+    if age_s is not None:
+        fields["usageAgeSeconds"] = round(age_s, 1)
+    return fields
+
+
 def account_row(
     number: int,
     email: str,
@@ -109,10 +131,13 @@ def account_row(
     org_uuid: str,
     active: bool,
     usage_entry: dict | str | None,
+    *,
+    usage_fetched_at: float | None = None,
+    usage_age_s: float | None = None,
 ) -> dict:
     """A full account row for ``--list``."""
     status, usage = usage_fields(usage_entry)
-    return {
+    row = {
         "number": number,
         "email": email,
         "organizationName": org_name,
@@ -122,6 +147,9 @@ def account_row(
         "usageStatus": status,
         "usage": usage,
     }
+    if usage is not None:
+        row.update(usage_freshness_fields(usage_fetched_at, usage_age_s))
+    return row
 
 
 def error_envelope(exc: Exception) -> dict:

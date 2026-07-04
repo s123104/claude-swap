@@ -32,6 +32,7 @@ from __future__ import annotations
 import enum
 import hashlib
 import json
+import logging
 import random
 import threading
 import time
@@ -43,13 +44,15 @@ from typing import ClassVar
 
 from claude_swap import oauth
 from claude_swap.exceptions import ClaudeSwitchError
-from claude_swap.json_output import SCHEMA_VERSION
+from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
 from claude_swap.locking import FileLock
 from claude_swap.settings import AutoSwitchSettings, atomic_write_json
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 STATE_FILENAME = "autoswitch_state.json"
 STATE_SCHEMA_VERSION = 1
+
+_logger = logging.getLogger("claude-swap")
 
 # Freshen targets whose access token expires within this window: twice Claude
 # Code's own 5-minute refresh buffer, so its post-lock "abort refresh if not
@@ -62,6 +65,26 @@ FRESHEN_BUFFER_MS = 10 * 60 * 1000
 RESET_SLACK_S = 60.0
 MAX_SLEEP_S = 6 * 3600.0
 NO_RESET_FALLBACK_S = 300.0
+
+# Idle-hold cap (elapsed, not ticks — the hold itself slows the cadence to
+# NO_RESET_FALLBACK_S): an owned-and-expired token normally means Claude Code
+# is idle and will self-heal on next use, but a *dead* refresh token with an
+# active user would look identical forever, so after this long the engine
+# falls back to normal unhealthy counting.
+IDLE_HOLD_MAX_S = 30 * 60.0
+
+# Adaptive scheduler: the baseline request volume is O(1) per tick — the
+# active account plus ONE due candidate (stalest data first) — instead of
+# every account in parallel. Candidates far from mattering are served stale
+# from the usage store. The engine escalates to a full refresh only when a
+# switch could actually be near: active utilization within this margin of the
+# threshold, or active usage unknown (failover needs fresh candidate data).
+ESCALATION_MARGIN_PCT = 15.0
+# A candidate whose binding pct moved at least this much between polls is
+# being used elsewhere (another PC / session mode) → poll it more closely;
+# an unmoved one backs off, up to the cap.
+MOVEMENT_DELTA_PCT = 1.0
+CANDIDATE_MAX_INTERVAL_S = 600.0
 
 
 def _now_iso() -> str:
@@ -106,23 +129,40 @@ class PollEvent(AutoSwitchEvent):
     active: dict | None  # account_ref shape, or None
     headroom: dict[str, float | None]  # account number → headroom pct (None=unknown)
     threshold: float
+    # account number → last fetch-error cause ("http-429", "timeout", ...) for
+    # accounts whose usage is unknown this tick. Additive field.
+    fetch_errors: dict[str, str] = field(default_factory=dict)
 
     def _fields(self) -> dict:
-        return {
+        fields = {
             "active": self.active,
             "headroomPct": self.headroom,
             "threshold": self.threshold,
         }
+        if self.fetch_errors:
+            fields["fetchErrors"] = self.fetch_errors
+        return fields
+
+    def _describe(self, num: str) -> str:
+        h = self.headroom.get(num)
+        if h is not None:
+            return f"{100 - h:.0f}%"
+        err = self.fetch_errors.get(num)
+        return f"? ({err})" if err else "?"
 
     def human(self) -> str:
         if self.active is None:
             return "poll: no active account"
         num = self.active.get("number")
         h = self.headroom.get(str(num))
-        used = f"{100 - h:.0f}% used" if h is not None else "usage unknown"
+        if h is not None:
+            used = f"{100 - h:.0f}% used"
+        else:
+            err = self.fetch_errors.get(str(num))
+            used = f"usage unknown ({err})" if err else "usage unknown"
         others = ", ".join(
-            f"#{n}: {100 - v:.0f}%" if v is not None else f"#{n}: ?"
-            for n, v in self.headroom.items()
+            f"#{n}: {self._describe(n)}"
+            for n in self.headroom
             if n != str(num)
         )
         tail = f" | others: {others}" if others else ""
@@ -270,6 +310,38 @@ def _refresh_fingerprint(credentials: str) -> str | None:
     return "sha256:" + hashlib.sha256(token.encode()).hexdigest()
 
 
+def _binding_pct(usage: dict | None) -> float | None:
+    """Utilization of the binding (higher) 5h/7d window, or None."""
+    headroom = oauth.account_headroom(usage)
+    return None if headroom is None else 100.0 - headroom
+
+
+def _limiting_reset_ts(usage: dict | None) -> float | None:
+    """Epoch when the last of the ≥100% windows resets (account usable again)."""
+    if not isinstance(usage, dict):
+        return None
+    latest: float | None = None
+    for key in ("five_hour", "seven_day"):
+        window = usage.get(key)
+        if not isinstance(window, dict):
+            continue
+        pct = window.get("pct")
+        if not isinstance(pct, (int, float)) or pct < 100.0:
+            continue
+        resets_at = window.get("resets_at")
+        if not resets_at:
+            continue
+        try:
+            ts = datetime.fromisoformat(
+                str(resets_at).replace("Z", "+00:00")
+            ).timestamp()
+        except ValueError:
+            continue
+        if latest is None or ts > latest:
+            latest = ts
+    return latest
+
+
 def _ref(number: str, email: str) -> dict:
     return {"number": int(number), "email": email}
 
@@ -305,6 +377,12 @@ class AutoSwitchEngine:
         # longer than the normal interval.
         self._sleep_until_ts: float | None = None
         self._blocked_wait_long = False
+        # Idle-hold: when the active token expired while Claude Code owns it
+        # (and is therefore idle), crawl instead of counting unhealthy ticks.
+        # ``_idle_hold_since`` survives across ticks (elapsed-time cap);
+        # ``_idle_hold_slow`` is per-tick like ``_blocked_wait_long``.
+        self._idle_hold_since: float | None = None
+        self._idle_hold_slow = False
 
     # -- state file ---------------------------------------------------------
 
@@ -448,6 +526,7 @@ class AutoSwitchEngine:
     def _tick_inner(self) -> TickOutcome:
         self._sleep_until_ts = None
         self._blocked_wait_long = False
+        self._idle_hold_slow = False
         settings = self.settings
         state = self._read_state()
         if not self.dry_run:
@@ -489,14 +568,17 @@ class AutoSwitchEngine:
             "email": "",
         }
 
-        usage = self.switcher.usage_by_account()
-        headroom = {
-            num: oauth.account_headroom(entry if isinstance(entry, dict) else None)
-            for num, entry in usage.items()
-        }
+        entries, usage, headroom = self._collect_scheduled_usage(current, quarantined)
         self._emit(
             PollEvent(
-                active=active_ref, headroom=headroom, threshold=settings.threshold
+                active=active_ref,
+                headroom=headroom,
+                threshold=settings.threshold,
+                fetch_errors={
+                    num: entry.last_error
+                    for num, entry in entries.items()
+                    if usage.get(num) is None and entry.last_error
+                },
             )
         )
 
@@ -515,6 +597,7 @@ class AutoSwitchEngine:
         active_headroom = headroom.get(current)
         if active_headroom is not None:
             self._unhealthy_ticks = 0
+            self._idle_hold_since = None
             utilization = 100.0 - active_headroom
             if utilization < settings.threshold:
                 self._emit(
@@ -526,6 +609,39 @@ class AutoSwitchEngine:
                 return TickOutcome.NO_ACTION
             trigger = "at-limit" if active_headroom <= 0 else "proactive"
         else:
+            if usage.get(current) == USAGE_TOKEN_EXPIRED:
+                # Expired while an owner (Claude Code / live session) holds the
+                # credential: CC refreshes on every API request, so expired +
+                # owner present proves Claude has been idle since expiry — no
+                # quota burn, nothing to switch for. Self-heals on next use;
+                # crawl slowly instead of burning failover ticks (Finding 2 of
+                # the usage-lapse investigation).
+                now = self.clock()
+                if self._idle_hold_since is None:
+                    self._idle_hold_since = now
+                if now - self._idle_hold_since <= IDLE_HOLD_MAX_S:
+                    self._unhealthy_ticks = 0
+                    self._idle_hold_slow = True
+                    self._emit(
+                        NoSwitchEvent(
+                            reason="active-idle",
+                            detail=(
+                                "token expired while Claude Code is idle; "
+                                "resumes on next use"
+                            ),
+                        )
+                    )
+                    return TickOutcome.NO_ACTION
+                # Held far longer than any idle nap should need — likely a
+                # dead refresh token with an *active* user. Fall through to
+                # normal unhealthy counting so failover can still happen.
+                _logger.warning(
+                    "Active token expired and owned for over %.0f minutes; "
+                    "resuming unhealthy counting (dead refresh token?)",
+                    IDLE_HOLD_MAX_S / 60,
+                )
+            else:
+                self._idle_hold_since = None
             self._unhealthy_ticks += 1
             if self._unhealthy_ticks < settings.unhealthy_ticks:
                 self._emit(
@@ -668,6 +784,146 @@ class AutoSwitchEngine:
         self._emit(NoSwitchEvent(reason="no-viable-target"))
         return TickOutcome.BLOCKED
 
+    # -- adaptive usage scheduling ---------------------------------------------
+
+    def _collect_scheduled_usage(
+        self, current: str, quarantined: set[str] = frozenset()
+    ) -> tuple[dict, dict[str, dict | str | None], dict[str, float | None]]:
+        """Two-phase usage collection with an O(1) baseline.
+
+        Phase A fetches the active account plus ONE due candidate (the one
+        with the stalest data — never-fetched first, then oldest fetch);
+        everyone else is served from the usage store. Phase B refetches ALL
+        candidates and recomputes before any switch decision when a switch
+        could be near: active utilization within ``ESCALATION_MARGIN_PCT`` of
+        the threshold, or active usage unknown (failover must not run on
+        stale candidate data). Candidate selection never runs on the
+        pre-escalation snapshot.
+
+        Stalest-first needs no rotation cursor: it reads the persisted store,
+        so the loop and cron-driven ``--once`` runs schedule identically.
+        Backoff (``backoffUntil``) is enforced by the collector even for the
+        active account — a Retry-After must never be defeated — and during an
+        idle-hold no candidate is polled at all (slow crawl for everything).
+
+        Returns ``(entries, usage, headroom)`` where ``usage`` carries
+        decision values and ``headroom`` the derived headroom per account.
+        """
+        now = self.clock()
+        # Quarantined accounts can never be switch targets, so spending the
+        # single alternate poll slot (or an escalation fetch) on one is wasted.
+        candidates = [
+            n
+            for n in self.switcher.switchable_account_numbers()
+            if n != current and n not in quarantined
+        ]
+
+        pre = self.switcher.usage_entries_by_account(fetch=set())
+        plan: set[str] = {current}
+        if self._idle_hold_since is None:
+            pick = self._due_candidate(candidates, pre, now)
+            if pick is not None:
+                plan.add(pick)
+        entries = self.switcher.usage_entries_by_account(fetch=plan)
+        usage = {num: entry.decision_value() for num, entry in entries.items()}
+
+        active_value = usage.get(current)
+        active_headroom = oauth.account_headroom(
+            active_value if isinstance(active_value, dict) else None
+        )
+        escalate = bool(candidates) and (
+            (active_headroom is None and active_value != USAGE_TOKEN_EXPIRED)
+            or (
+                active_headroom is not None
+                and 100.0 - active_headroom
+                >= self.settings.threshold - ESCALATION_MARGIN_PCT
+            )
+        )
+        if escalate:
+            entries = self.switcher.usage_entries_by_account(
+                fetch={current, *candidates}
+            )
+            usage = {num: entry.decision_value() for num, entry in entries.items()}
+
+        headroom = {
+            num: oauth.account_headroom(value if isinstance(value, dict) else None)
+            for num, value in usage.items()
+        }
+        if not self.dry_run:
+            self._update_poll_plans(candidates, pre, entries, now)
+        return entries, usage, headroom
+
+    @staticmethod
+    def _due_candidate(
+        candidates: list[str], entries: dict, now: float
+    ) -> str | None:
+        """The due candidate with the stalest data, or None.
+
+        Due = past its ``nextPollAt`` and not in failure backoff. Sentinel
+        accounts (api-key / no credentials) have nothing to fetch. A
+        perpetually failing account can't monopolize the slot: its backoff
+        removes it from the due set between attempts.
+        """
+        due: list[tuple[int, float, str]] = []
+        for num in candidates:
+            entry = entries.get(num)
+            if entry is None:
+                due.append((0, 0.0, num))
+                continue
+            if entry.sentinel is not None:
+                continue
+            if entry.in_backoff(now):
+                continue
+            if entry.next_poll_at is not None and now < entry.next_poll_at:
+                continue
+            if entry.fetched_at is None:
+                due.append((0, 0.0, num))
+            else:
+                due.append((1, entry.fetched_at, num))
+        if not due:
+            return None
+        due.sort()
+        return due[0][2]
+
+    def _update_poll_plans(
+        self, candidates: list[str], pre: dict, post: dict, now: float
+    ) -> None:
+        """Adapt each just-fetched candidate's poll cadence, persisted in the
+        store (survives ``--once`` engine restarts).
+
+        Movement (binding pct changed ≥ ``MOVEMENT_DELTA_PCT`` since its
+        previous poll — someone is using it elsewhere) halves the interval,
+        floored at the engine interval; no movement backs it off ×1.5 up to
+        ``CANDIDATE_MAX_INTERVAL_S``. A candidate at its limit skips straight
+        to its window reset (``nextPollAt`` only — the learned interval is
+        kept for when it comes back).
+        """
+        plans: dict[str, tuple[float | None, float | None]] = {}
+        for num in candidates:
+            before, after = pre.get(num), post.get(num)
+            if before is None or after is None or after.sentinel is not None:
+                continue
+            if after.fetched_at is None or after.fetched_at == before.fetched_at:
+                continue  # not fetched this pass
+            base = before.poll_interval_s or self.settings.interval_seconds
+            prev_pct = _binding_pct(before.last_good)
+            new_pct = _binding_pct(after.last_good)
+            if prev_pct is None or new_pct is None:
+                interval = self.settings.interval_seconds
+            elif abs(new_pct - prev_pct) >= MOVEMENT_DELTA_PCT:
+                interval = max(self.settings.interval_seconds, base / 2)
+            else:
+                interval = min(CANDIDATE_MAX_INTERVAL_S, base * 1.5)
+            next_poll = now + interval
+            headroom = oauth.account_headroom(after.last_good)
+            if headroom is not None and headroom <= 0:
+                reset_ts = _limiting_reset_ts(after.last_good)
+                if reset_ts is not None and reset_ts > next_poll:
+                    next_poll = reset_ts
+            plans[num] = (next_poll, interval)
+        if plans:
+            self.switcher.set_usage_poll_plan(plans)
+
     def _perform(self, number: str, email: str, trigger: str) -> TickOutcome:
         if self.dry_run:
             current = self.switcher.current_account_number()
@@ -767,6 +1023,11 @@ class AutoSwitchEngine:
             # Blocked on something that can resolve any tick (hysteresis,
             # unreadable usage) — keep the normal cadence so the at-limit
             # escape isn't missed.
+        elif outcome is TickOutcome.NO_ACTION and self._idle_hold_slow:
+            # Idle-hold: Claude is idle on an expired token — nothing changes
+            # until the user comes back, so crawl. Worst case protection
+            # resumes one slow tick after they do.
+            return max(interval, NO_RESET_FALLBACK_S)
         # ±10% jitter so multiple machines don't synchronize their API hits.
         return interval * (0.9 + 0.2 * random.random())
 
