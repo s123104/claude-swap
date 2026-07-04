@@ -2,7 +2,7 @@
 
 All notable user-facing changes to claude-swap are documented here.
 
-Release version is defined in `pyproject.toml` (currently `0.17.0+haotool.1`).
+Release version is defined in `pyproject.toml` (currently `0.17.1+haotool.1`).
 
 ## [Unreleased]
 
@@ -14,6 +14,23 @@ Release version is defined in `pyproject.toml` (currently `0.17.0+haotool.1`).
 
 ### Added
 
+- **Upstream v0.17.1 merged** (usage-polling tuning and macOS hot-reload
+  fix — upstream #85/#86):
+  - **Deliberate staleness stays decision-grade.** Usage kept stale by a
+    failure backoff or the scheduler's own cadence remains trusted for
+    switch decisions past the 5-minute freshness window, capped at 1 hour
+    (`TRUST_MAX_AGE_S`) — a sustained outage eventually reads as unknown
+    so the verified-failover machinery takes back over.
+  - **Candidate polls never outlive a window reset.** A poll is never
+    scheduled past the candidate's next quota-window reset: stored usage
+    is obsolete the moment a window rolls over.
+  - **Paste-safe usage-fetch warnings.** Failure logs drop the account
+    email and carry the server's `Retry-After` instead.
+  - **macOS Keychain switches hot-reload running sessions.** A successful
+    Keychain write now rewrites an already-present `.credentials.json`
+    (never creating or deleting one), bumping its mtime so a running
+    Claude Code session drops its memoized token and picks up the new
+    account without a restart.
 - **Upstream v0.17.0 merged** (per-account usage store, adaptive
   auto-switch, `cswap config` — upstream #73/#84/#88 and the 07-04 `main`
   series):
