@@ -1,8 +1,8 @@
-"""Windows Task Scheduler backend for the auto-switch monitor.
+"""Windows Task Scheduler backend for the auto-switch engine.
 
 The odd one out among the backends: Task Scheduler has no real supervisor
-semantics, so the task XML approximates them — the monitor's exit-75 retry
-rides repeating logon and time triggers plus ``MultipleInstancesPolicy=IgnoreNew``,
+semantics, so the task XML approximates them — a crashed engine is revived
+by repeating logon and time triggers plus ``MultipleInstancesPolicy=IgnoreNew``,
 and the version stamp lives in ``RegistrationInfo/Version`` because the
 schema has no per-task environment variables. ``pythonw.exe`` keeps the
 hidden task from flashing a console window; the persisted XML under the
@@ -92,7 +92,7 @@ def _build_task_xml(switcher: ServiceHost) -> str:
 
     reg_info = ET.SubElement(root, f"{{{_TASK_NS}}}RegistrationInfo")
     ET.SubElement(reg_info, f"{{{_TASK_NS}}}Description").text = (
-        "Claude Swap auto-switch monitor"
+        "Claude Swap auto-switch engine"
     )
     # Version drift is stamped here because the Exec action cannot carry it:
     # the schema allows only Command / Arguments / WorkingDirectory under
@@ -129,8 +129,8 @@ def _build_task_xml(switcher: ServiceHost) -> str:
     ET.SubElement(logon, f"{{{_TASK_NS}}}UserId").text = user
     # The logon trigger's repetition only arms on an actual logon;
     # Start-ScheduledTask (the install-time kick) arms no trigger at all, so
-    # in the install session a dead monitor would stay dead until the next
-    # logon — exactly when the exit-75 race is most likely. This TimeTrigger
+    # in the install session a dead engine would stay dead until the next
+    # logon — exactly when a crash is most likely to go unnoticed. This TimeTrigger
     # anchors the same 5-minute watchdog at install time (no Duration =
     # repeats forever); Settings/StartWhenAvailable covers the boundary
     # already being in the past once registration completes.

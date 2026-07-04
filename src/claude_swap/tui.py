@@ -686,7 +686,7 @@ def _show_service_unsupported(stdscr: CursesWindow) -> None:
     _show_message(
         stdscr,
         "Background service is not available on this platform. "
-        "Use the foreground monitor (`cswap --monitor`) instead.",
+        "Use the foreground engine (`cswap auto`) instead.",
         is_error=True,
     )
 

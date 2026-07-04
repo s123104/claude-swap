@@ -1,4 +1,4 @@
-"""macOS launchd backend for the auto-switch monitor.
+"""macOS launchd backend for the auto-switch engine.
 
 Manages a per-user LaunchAgent (``~/Library/LaunchAgents``) through
 ``launchctl`` in the ``gui/<uid>`` domain. Install is an idempotent
@@ -7,6 +7,13 @@ so re-running ``cswap service install`` is also the upgrade path after a
 cswap update. The plist is written 0o600 through an ``O_EXCL | O_NOFOLLOW``
 temp file so a pre-planted file or symlink at the predictable temp path
 cannot redirect the write.
+
+Engine events land twice on macOS by design: launchd captures the human
+stdout stream in ``monitor.out`` (unrotated — launchd offers no rotation)
+while the same events are mirrored into the size-capped ``claude-swap.log``.
+The mirror is the durable record; ``monitor.out``/``monitor.err`` exist for
+supervisor-level debugging and stay small because the engine only prints on
+decisions.
 """
 
 from __future__ import annotations

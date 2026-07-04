@@ -129,7 +129,7 @@ def run_self_upgrade() -> int:
             "This is a source/git fork build, not the upstream PyPI release.\n"
             "Do not run `pip install --upgrade claude-swap` or package-manager "
             "upgrade commands; they may replace fork-only features such as "
-            "`--monitor`.\n"
+            "`cswap service`.\n"
             "Update this checkout with `git pull` (or reinstall from the fork "
             "source) instead."
         )

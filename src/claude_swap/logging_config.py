@@ -30,7 +30,7 @@ class _LazyDirRotatingFileHandler(RotatingFileHandler):
         return stream
 
     def doRollover(self) -> None:
-        # The monitor and any concurrent CLI share this file; on Windows,
+        # The service engine and any concurrent CLI share this file; on Windows,
         # renaming a file another process holds open raises a sharing
         # violation, and letting it escape drops the record — and every
         # record after it, silencing the decision log. Keep appending past

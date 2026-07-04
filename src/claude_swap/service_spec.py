@@ -76,14 +76,6 @@ def powershell_exe() -> str:
     return rf"{root}\System32\WindowsPowerShell\v1.0\powershell.exe"
 
 
-def tasklist_exe() -> str:
-    """Absolute Windows tasklist path, else the bare name."""
-    root = os.environ.get("SystemRoot")
-    if not root:
-        return "tasklist"
-    return rf"{root}\System32\tasklist.exe"
-
-
 def log_dir(switcher: ServiceHost) -> Path:
     """Absolute directory for the supervised engine's stdout/stderr logs."""
     return switcher.backup_dir / "logs"

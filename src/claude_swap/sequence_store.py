@@ -189,7 +189,7 @@ class SequenceStore:
         """Raw dict as stored, or ``None`` when absent/corrupt.
 
         Kept for the dict-returning accessors that external modules
-        (monitor/list_reporter/migrations) still consume via protocols.
+        (engine/list_reporter/migrations) still consume via protocols.
         """
         return self._read_json(self._sequence_file)
 

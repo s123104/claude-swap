@@ -640,7 +640,7 @@ class ClaudeAccountSwitcher:
         return self._sequence_store.load_raw()
 
     def _get_sequence_view(self) -> SequenceData | None:
-        """Typed ``sequence.json`` view for protocol consumers (monitor track)."""
+        """Typed ``sequence.json`` view for protocol consumers (engine track)."""
         return self._sequence_store.load()
 
     def _get_next_account_number(self) -> int:

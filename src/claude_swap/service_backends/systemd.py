@@ -1,10 +1,10 @@
-"""Linux/WSL systemd --user backend for the auto-switch monitor.
+"""Linux/WSL systemd --user backend for the auto-switch engine.
 
 Manages a per-user unit under ``$XDG_CONFIG_HOME/systemd/user`` through
 ``systemctl --user``. Preflight is deliberately strict because the failure
 modes are confusing at a distance: PID 1 must be systemd (WSL2 needs it
 enabled in ``/etc/wsl.conf``) and the per-user manager must be reachable in
-this session. Install also enables linger so the monitor survives logout,
+this session. Install also enables linger so the engine survives logout,
 and on WSL prints the Task Scheduler keepalive guidance (see
 ``_WSL_KEEPALIVE_EXEC``).
 """
@@ -70,7 +70,7 @@ def _require_systemd() -> None:
     if not sys.platform.startswith("linux"):
         raise ClaudeSwitchError(
             "cswap service (systemd) requires Linux or WSL. "
-            "Use `cswap --monitor` in the foreground on this platform."
+            "Use `cswap auto` in the foreground on this platform."
         )
     if not _pid1_is_systemd():  # type: ignore[unreachable]
         raise ClaudeSwitchError(
@@ -99,10 +99,11 @@ def _build_unit(switcher: ServiceHost) -> str:
     # Restart=on-failure restarts a crashed engine after RestartSec.
     # RestartSec=30 also keeps every restart outside the default start-limit
     # window (10s/5 tries), so the unit retries indefinitely.
+    # No After=network.target: it is a no-op under the per-user manager and
+    # the engine tolerates an unready network anyway (fetch failure → backoff).
     lines = [
         "[Unit]",
         "Description=Claude Swap auto-switch engine",
-        "After=network.target",
         "",
         "[Service]",
         "Type=simple",
@@ -179,7 +180,7 @@ def _installed_version() -> str | None:
 # Keepalive command suggested for the Windows Task Scheduler logon task. It
 # must leave a long-lived process attached to WSL's init: WSL idle-terminates
 # the VM when no user-launched process remains, and processes started by
-# systemd (like our monitor unit) do not count. ``sleep infinity`` never
+# systemd (like our engine unit) do not count. ``sleep infinity`` never
 # exits, so the instance stays alive; it ships with coreutils, unlike the
 # previously suggested ``dbus-launch`` (dbus-x11 package), which the default
 # Ubuntu WSL image does not include. A bare ``--exec /usr/bin/true`` exits
@@ -198,7 +199,7 @@ def _print_wsl_guidance() -> None:
     )
     print(f"  {dimmed(f'wsl.exe -d {distro} -u {user} --exec {_WSL_KEEPALIVE_EXEC}')}")
     print(
-        f"  {dimmed('The command must leave a resident process behind (sleep infinity never exits) — WSL shuts the distro down when idle and systemd services do not keep it alive, stopping the monitor.')}"
+        f"  {dimmed('The command must leave a resident process behind (sleep infinity never exits) — WSL shuts the distro down when idle and systemd services do not keep it alive, stopping the engine.')}"
     )
     print(
         f"  {dimmed('WSL ~/.claude and Windows %USERPROFILE%\\.claude are separate; install cswap in the same environment as Claude Code.')}"
@@ -226,7 +227,7 @@ class SystemdBackend:
             warning(
                 f"loginctl enable-linger {user} failed (rc={linger.returncode}): "
                 f"{linger.stderr.strip() or linger.stdout.strip()}. "
-                "The monitor may stop when you log out unless linger is enabled."
+                "The service may stop when you log out unless linger is enabled."
             )
         if service_spec.is_wsl():
             _print_wsl_guidance()
