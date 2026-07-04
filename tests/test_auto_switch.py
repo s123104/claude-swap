@@ -17,6 +17,7 @@ import pytest
 
 from claude_swap import monitor, oauth, tui
 from claude_swap.credentials import ActiveCredentials
+from claude_swap.locking import FileLock
 from claude_swap.usage_policy import binding_pct as max_usage_pct
 from claude_swap.exceptions import ClaudeSwitchError, SwitchError, ValidationError
 from claude_swap.models import (
@@ -1254,6 +1255,91 @@ class TestMonitorEngine:
 
         mock_refresh.assert_called_once()
         assert state.usage_cache_warmed is True
+
+
+@pytest.mark.usefixtures("stub_live_claude")
+class TestMonitorStepSelfHeals:
+    """Environmental failures in the poll body map to backoff, never escape.
+
+    The adapters (CLI loop, TUI loop, service) treat an exception from
+    ``monitor_step`` as fatal. A concurrent switch legitimately holds the
+    file lock past the 10s default (in-lock network refresh), and on Windows
+    a store read can race an ``os.replace`` writer into a transient OSError —
+    neither may kill the monitor.
+    """
+
+    def test_wedged_lock_during_usage_resolution_backs_off(
+        self, temp_home: Path, caplog
+    ):
+        """A held FileLock reached via the usage-cache merge must degrade to
+        the usage-unavailable backoff (it used to escape as LockError)."""
+        switcher = bootstrap_switchable_accounts(temp_home, num_accounts=1)
+        (temp_home / ".claude" / ".credentials.json").write_text(
+            json.dumps(
+                {
+                    "claudeAiOauth": {
+                        "accessToken": "at-live",
+                        "refreshToken": "rt-live",
+                        "expiresAt": 9_999_999_999_000,
+                    }
+                }
+            )
+        )
+        switcher.set_auto_switch_config(enabled=True, threshold=95)
+        state = monitor.MonitorRuntimeState()
+
+        blocker = FileLock(switcher.lock_file)
+        assert blocker.acquire()
+        try:
+            with (
+                patch(
+                    "claude_swap.switcher.FileLock",
+                    side_effect=lambda p: FileLock(p, timeout=0.1),
+                ),
+                patch(
+                    "claude_swap.oauth.fetch_usage_for_account",
+                    return_value={"five_hour": {"pct": 50.0}},
+                ),
+                caplog.at_level(logging.WARNING, logger="claude-swap"),
+            ):
+                result = monitor.monitor_step(switcher, state, poll_seconds=0)
+        finally:
+            blocker.release()
+
+        assert result.kind == "usage_unavailable"
+        assert state.consecutive_failures == 1
+        assert any(
+            "monitor poll failed" in r.getMessage() for r in caplog.records
+        ), [r.getMessage() for r in caplog.records]
+
+    def test_transient_read_error_backs_off_then_recovers(self, temp_home: Path):
+        """A sharing-violation-shaped OSError (Windows os.replace race on
+        sequence.json) must cost one backoff cycle, not the process."""
+        switcher = ClaudeAccountSwitcher()
+        state = monitor.MonitorRuntimeState()
+
+        with patch.object(
+            switcher,
+            "get_auto_switch_config",
+            side_effect=PermissionError("sharing violation"),
+        ):
+            result = monitor.monitor_step(switcher, state, poll_seconds=0)
+
+        assert result.kind == "usage_unavailable"
+        assert state.consecutive_failures == 1
+
+        with (
+            patch.object(
+                switcher,
+                "get_auto_switch_config",
+                return_value={"enabled": True, "threshold": 95},
+            ),
+            patch.object(switcher, "get_active_usage_pct", return_value=42.0),
+        ):
+            result = monitor.monitor_step(switcher, state, poll_seconds=0)
+
+        assert result.kind == "polled"
+        assert state.consecutive_failures == 0
 
 
 # --------------------------------------------------------------------------- #

@@ -30,6 +30,7 @@ from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.models import AutoSwitchDecisionContext, BackgroundAutoSwitchIntent
 from claude_swap.printer import accent, bolded, dimmed, muted
 from claude_swap.protocols import MonitorHost
+from claude_swap.sequence_store import DEFAULT_AUTO_SWITCH_THRESHOLD
 from claude_swap.service_spec import (
     SERVICE_MONITOR_ENV_KEY,
     powershell_exe,
@@ -683,7 +684,43 @@ def monitor_step(
     themselves. ``perform_switch`` receives the poll-cycle decision snapshot
     and must invoke ``switcher.switch(BackgroundAutoSwitchIntent(...))`` (or
     the interactive equivalent for TUI).
+
+    Environmental failures outside the guarded switch attempt must not
+    escape: the adapters treat an exception as fatal, so a FileLock held past
+    its timeout by a concurrent switch/list (``LockError`` — a switch's
+    in-lock network refresh legitimately exceeds the 10s default) or a
+    transient ``OSError`` from a store read racing an ``os.replace`` writer
+    (Windows sharing violations) would otherwise kill the monitor mid-poll.
+    Both map to the usage-unavailable backoff and retry on the next cycle.
     """
+    try:
+        return _monitor_step_body(
+            switcher,
+            state,
+            poll_seconds=poll_seconds,
+            perform_switch=perform_switch,
+        )
+    except (ClaudeSwitchError, OSError) as exc:
+        log = _logger(switcher)
+        log.warning("monitor poll failed: %r — backing off", exc)
+        return _step_usage_unavailable(
+            state,
+            poll_seconds,
+            time.time(),
+            DEFAULT_AUTO_SWITCH_THRESHOLD,
+            "unavailable",
+            log,
+        )
+
+
+def _monitor_step_body(
+    switcher: MonitorHost,
+    state: MonitorRuntimeState,
+    *,
+    poll_seconds: int,
+    perform_switch: PerformSwitch | None,
+) -> MonitorStepResult:
+    """One raising decision cycle — ``monitor_step`` owns the error boundary."""
     log = _logger(switcher)
     cfg = switcher.get_auto_switch_config()
     if not cfg["enabled"]:
