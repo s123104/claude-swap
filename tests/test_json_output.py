@@ -53,6 +53,20 @@ class TestJsonHelpers:
         assert out["spend"]["used"] == 12.5
         assert out["spend"]["resetsAt"] == "2026-07-01T00:00:00Z"
 
+    def test_usage_to_json_projects_scoped_windows(self):
+        usage = {
+            "five_hour": {"pct": 7.0},
+            "scoped": [
+                {"name": "Fable", "pct": 100.0, "resets_at": "2026-07-03T21:59:59Z",
+                 "countdown": "3h", "clock": "21:59"},
+            ],
+        }
+        out = usage_to_json(usage)
+        assert out["scoped"] == [
+            {"name": "Fable", "pct": 100.0, "resetsAt": "2026-07-03T21:59:59Z",
+             "countdown": "3h", "clock": "21:59"},
+        ]
+
     def test_usage_fields_variants(self):
         assert usage_fields({"five_hour": {"pct": 1.0}})[0] == "ok"
         assert usage_fields({"five_hour": {"pct": 1.0}})[1] == {"fiveHour": {"pct": 1.0}}

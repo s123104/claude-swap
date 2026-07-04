@@ -837,3 +837,139 @@ class TestJsonOutputCli:
         envelope = json.loads(captured.out)  # error went to stdout as JSON
         assert envelope["error"] == {"type": "ConfigError", "message": "nope"}
         assert captured.err == ""  # nothing on stderr in JSON mode
+
+
+class TestAutoCommand:
+    """`cswap auto` pre-dispatch: parsing, settings merge, exit codes, JSONL."""
+
+    class FakeEngine:
+        instances: list = []
+        tick_outcome = None  # set per test (TickOutcome)
+
+        def __init__(self, switcher, settings, on_event, *, dry_run=False,
+                     state_path=None, clock=None):
+            self.switcher = switcher
+            self.settings = settings
+            self.on_event = on_event
+            self.dry_run = dry_run
+            type(self).instances.append(self)
+
+        def tick(self):
+            from claude_swap.autoswitch import TickOutcome
+
+            return type(self).tick_outcome or TickOutcome.NO_ACTION
+
+        def run_loop(self):
+            return 0
+
+        def stop(self):
+            pass
+
+    @pytest.fixture(autouse=True)
+    def _fresh_fake(self):
+        self.FakeEngine.instances = []
+        self.FakeEngine.tick_outcome = None
+
+    def _run(self, argv: list[str], temp_home):
+        with patch("claude_swap.autoswitch.AutoSwitchEngine", self.FakeEngine), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(sys, "argv", ["claude-swap", "auto", *argv]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+        return excinfo.value.code
+
+    def test_once_exit_code_switched(self, temp_home):
+        from claude_swap.autoswitch import TickOutcome
+
+        self.FakeEngine.tick_outcome = TickOutcome.SWITCHED
+        assert self._run(["--once"], temp_home) == 0
+
+    def test_once_exit_code_no_action(self, temp_home):
+        from claude_swap.autoswitch import TickOutcome
+
+        self.FakeEngine.tick_outcome = TickOutcome.NO_ACTION
+        assert self._run(["--once"], temp_home) == 2
+
+    def test_once_exit_code_blocked(self, temp_home):
+        from claude_swap.autoswitch import TickOutcome
+
+        self.FakeEngine.tick_outcome = TickOutcome.BLOCKED
+        assert self._run(["--once"], temp_home) == 3
+
+    def test_loop_mode_returns_loop_exit(self, temp_home):
+        assert self._run([], temp_home) == 0
+        assert self.FakeEngine.instances  # loop path constructed the engine
+
+    def test_flags_override_settings_json(self, temp_home):
+        from claude_swap.paths import get_backup_root
+
+        backup = get_backup_root()
+        backup.mkdir(parents=True, exist_ok=True)
+        (backup / "settings.json").write_text(json.dumps({
+            "schemaVersion": 1,
+            "autoswitch": {"threshold": 80.0, "cooldownSeconds": 42.0},
+        }))
+        self._run(["--once", "--threshold", "60"], temp_home)
+        engine = self.FakeEngine.instances[-1]
+        assert engine.settings.threshold == 60.0     # CLI wins
+        assert engine.settings.cooldown_seconds == 42.0  # settings.json kept
+
+    def test_dry_run_forwarded(self, temp_home):
+        self._run(["--once", "--dry-run"], temp_home)
+        assert self.FakeEngine.instances[-1].dry_run is True
+
+    def test_json_stdout_is_pure_jsonl(self, temp_home, capsys):
+        from claude_swap.autoswitch import NoSwitchEvent, TickOutcome
+
+        class EmittingEngine(self.FakeEngine):
+            def tick(self):
+                self.on_event(NoSwitchEvent(reason="below-threshold"))
+                self.on_event(NoSwitchEvent(reason="cooldown"))
+                return TickOutcome.NO_ACTION
+
+        with patch("claude_swap.autoswitch.AutoSwitchEngine", EmittingEngine), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(sys, "argv", ["claude-swap", "auto", "--once", "--json"]):
+            with pytest.raises(SystemExit):
+                cli.main()
+        lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.strip()]
+        assert len(lines) == 2
+        for line in lines:
+            payload = json.loads(line)
+            assert payload["event"] == "no-switch"
+            assert payload["schemaVersion"] == 1
+
+    def test_unknown_flag_errors(self, temp_home, capsys):
+        with patch.object(sys, "argv", ["claude-swap", "auto", "--bogus"]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+        assert excinfo.value.code == 2
+
+    def test_auto_help(self, capsys):
+        with patch.object(sys, "argv", ["claude-swap", "auto", "--help"]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+        assert excinfo.value.code == 0
+        out = capsys.readouterr().out
+        assert "--once" in out
+        assert "Exit codes" in out
+
+    def test_main_help_mentions_auto(self):
+        result = subprocess.run(
+            [sys.executable, "-m", "claude_swap", "--help"],
+            capture_output=True,
+            text=True,
+            env=_subprocess_env(),
+        )
+        assert "auto" in result.stdout
+
+    def test_switcher_error_exits_1(self, temp_home, capsys):
+        from claude_swap.exceptions import ConfigError
+
+        with patch("claude_swap.cli.ClaudeAccountSwitcher",
+                   side_effect=ConfigError("nope")), \
+             patch.object(sys, "argv", ["claude-swap", "auto", "--once"]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+        assert excinfo.value.code == 1
+        assert "nope" in capsys.readouterr().err  # printer.error -> stderr

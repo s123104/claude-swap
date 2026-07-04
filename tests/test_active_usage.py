@@ -12,7 +12,7 @@ from unittest.mock import MagicMock, patch
 from claude_swap import oauth
 from claude_swap.credentials import ActiveCredentials, pending_rotation_path
 from claude_swap.json_output import USAGE_API_KEY, USAGE_KEYCHAIN_UNAVAILABLE
-from claude_swap.list_reporter import ListReporter
+from claude_swap.list_reporter import ListReporter, _format_usage_lines
 from claude_swap.locking import FileLock
 from claude_swap.models import Platform
 from claude_swap.switcher import ClaudeAccountSwitcher
@@ -2051,3 +2051,72 @@ class TestRefreshInactiveCredentialsIfNeeded:
         assert "fresh" in note.lower() or "skip" in note.lower()
         assert result == fresh_creds
         mock_refresh.assert_not_called()
+
+
+class TestFormatUsageLines:
+    """Test _format_usage_lines rendering, including per-model scoped windows."""
+
+    def test_scoped_lines_render_per_model_with_at_limit_marker(self):
+        usage = {
+            "five_hour": {"pct": 7.0, "clock": "20:39", "countdown": "1h 30m"},
+            "seven_day": {"pct": 72.0, "clock": "21:59", "countdown": "3h"},
+            "scoped": [
+                {"name": "Fable", "pct": 100.0, "clock": "21:59", "countdown": "3h"},
+            ],
+        }
+        lines = _format_usage_lines(usage)
+        assert lines[0].startswith("5h:")
+        assert lines[1].startswith("7d:")
+        fable = lines[2]
+        assert fable.startswith("Fable:")
+        assert "100%" in fable
+        assert fable.rstrip().endswith("(!)")  # at/over limit marker
+
+    def test_scoped_under_limit_has_no_marker(self):
+        usage = {
+            "scoped": [
+                {"name": "Fable", "pct": 40.0, "clock": "21:59", "countdown": "3h"},
+            ],
+        }
+        lines = _format_usage_lines(usage)
+        assert len(lines) == 1
+        assert lines[0].startswith("Fable:")
+        assert "40%" in lines[0]
+        assert "resets 21:59" in lines[0]
+        assert "in 3h" in lines[0]
+        assert not lines[0].rstrip().endswith("(!)")
+
+    def test_scoped_without_clock_renders_pct_only(self):
+        usage = {"scoped": [{"name": "Fable", "pct": 100.0}]}
+        lines = _format_usage_lines(usage)
+        assert lines == ["Fable: 100%  (!)"]
+
+    def test_no_scoped_key_renders_only_standard_windows(self):
+        usage = {"five_hour": {"pct": 7.0}, "seven_day": {"pct": 72.0}}
+        lines = _format_usage_lines(usage)
+        assert all(not line.startswith("Fable:") for line in lines)
+
+    def test_scoped_labels_align_columns_with_standard_windows(self):
+        usage = {
+            "five_hour": {"pct": 0.0},
+            "seven_day": {"pct": 62.0, "clock": "Jul 5 08:59", "countdown": "1d 19h"},
+            "scoped": [
+                {
+                    "name": "Fable",
+                    "pct": 100.0,
+                    "clock": "Jul 5 08:59",
+                    "countdown": "1d 19h",
+                },
+            ],
+        }
+        lines = _format_usage_lines(usage)
+        # Labels are padded to the widest ("Fable:"), so the % column lines up.
+        assert lines[0] == "5h:      0%"
+        assert lines[1].startswith("7d:     62%   resets Jul 5 08:59")
+        assert lines[2].startswith("Fable: 100%   resets Jul 5 08:59")
+        assert len({line.index("%") for line in lines}) == 1
+
+    def test_standard_windows_alone_keep_legacy_layout(self):
+        usage = {"five_hour": {"pct": 7.0, "clock": "20:39", "countdown": "1h 30m"}}
+        lines = _format_usage_lines(usage)
+        assert lines == ["5h:   7%   resets 20:39         in 1h 30m"]

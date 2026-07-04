@@ -373,6 +373,55 @@ class TestFetchUsage:
         )
         assert result is None
 
+    def test_scoped_per_model_limits(self):
+        """weekly_scoped entries in limits[] surface as result['scoped'] by model name."""
+        from datetime import timedelta
+        fixed_now = datetime(2026, 3, 23, 12, 0, 0, tzinfo=timezone.utc)
+        future = fixed_now + timedelta(hours=3)
+        response_data = {
+            "five_hour": {"utilization": 7.0, "resets_at": None},
+            "seven_day": {"utilization": 72.0, "resets_at": None},
+            "seven_day_opus": None,
+            "limits": [
+                {"kind": "session", "group": "session", "percent": 7,
+                 "resets_at": None, "scope": None, "is_active": False},
+                {"kind": "weekly_all", "group": "weekly", "percent": 72,
+                 "resets_at": None, "scope": None, "is_active": False},
+                {"kind": "weekly_scoped", "group": "weekly", "percent": 100,
+                 "severity": "critical", "resets_at": future.isoformat(),
+                 "scope": {"model": {"id": None, "display_name": "Fable"}, "surface": None},
+                 "is_active": True},
+            ],
+        }
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps(response_data).encode()
+        mock_response.__enter__ = lambda s: s
+        mock_response.__exit__ = MagicMock(return_value=False)
+        with patch("claude_swap.oauth.urllib.request.urlopen", return_value=mock_response), \
+             patch("claude_swap.oauth.datetime") as mock_dt:
+            mock_dt.fromisoformat = datetime.fromisoformat
+            mock_dt.now.return_value = fixed_now
+            result = oauth.fetch_usage("sk-test-token")
+
+        assert result is not None
+        # Only the model-scoped entry is surfaced; session/weekly_all (scope=None) are not.
+        assert len(result["scoped"]) == 1
+        fable = result["scoped"][0]
+        assert fable["name"] == "Fable"
+        assert fable["pct"] == 100.0
+        assert fable["resets_at"] == future.isoformat()
+        assert fable["countdown"] == "3h 0m"
+        assert "clock" in fable
+
+    def test_no_limits_no_scoped_key(self):
+        """A response without a limits array yields no 'scoped' key (backward compat)."""
+        result = self._fetch_with_response({
+            "five_hour": {"utilization": 22.0, "resets_at": None},
+            "seven_day": {"utilization": 61.0, "resets_at": None},
+        })
+        assert result is not None
+        assert "scoped" not in result
+
 
 class TestRefreshOAuthCredentials:
     """Test direct OAuth refresh requests."""
@@ -413,6 +462,81 @@ class TestRefreshOAuthCredentials:
         assert seen_body["refresh_token"] == "old-refresh"
         assert seen_body["client_id"] == oauth.OAUTH_CLIENT_ID
         assert "scope" not in seen_body
+
+
+class TestTryRefreshOAuthCredentials:
+    """Typed refresh outcomes: permanent vs transient failure classification."""
+
+    _make_credentials = staticmethod(TestRefreshOAuthCredentials._make_credentials)
+
+    @staticmethod
+    def _http_error(code, body: bytes, msg="err"):
+        import io
+
+        return urllib.error.HTTPError(
+            oauth.OAUTH_TOKEN_URL, code, msg, hdrs=None, fp=io.BytesIO(body)
+        )
+
+    def test_success_rotates_and_has_no_error(self):
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps({
+            "access_token": "new-access",
+            "refresh_token": "new-refresh",
+            "expires_in": 3600,
+        }).encode()
+        mock_response.__enter__ = lambda s: s
+        mock_response.__exit__ = MagicMock(return_value=False)
+
+        with patch(
+            "claude_swap.oauth.urllib.request.urlopen", return_value=mock_response
+        ):
+            outcome = oauth.try_refresh_oauth_credentials(self._make_credentials())
+
+        assert outcome.error is None
+        rotated = json.loads(outcome.credentials)["claudeAiOauth"]
+        assert rotated["accessToken"] == "new-access"
+        assert rotated["refreshToken"] == "new-refresh"
+
+    def test_invalid_grant_body_on_400_is_permanent(self):
+        err = self._http_error(400, b'{"error": "invalid_grant"}')
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=err):
+            outcome = oauth.try_refresh_oauth_credentials(self._make_credentials())
+        assert outcome.credentials is None
+        assert outcome.error == "invalid_grant"
+
+    def test_400_without_marker_is_transient(self):
+        err = self._http_error(400, b'{"error": "temporarily_unavailable"}')
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=err):
+            outcome = oauth.try_refresh_oauth_credentials(self._make_credentials())
+        assert outcome.error == "transient"
+
+    def test_5xx_is_transient_even_with_marker(self):
+        err = self._http_error(500, b'{"error": "invalid_grant"}')
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=err):
+            outcome = oauth.try_refresh_oauth_credentials(self._make_credentials())
+        assert outcome.error == "transient"
+
+    def test_network_error_is_transient(self):
+        with patch(
+            "claude_swap.oauth.urllib.request.urlopen",
+            side_effect=urllib.error.URLError("dns"),
+        ):
+            outcome = oauth.try_refresh_oauth_credentials(self._make_credentials())
+        assert outcome.error == "transient"
+
+    def test_missing_refresh_token_is_permanent(self):
+        creds = json.dumps({"claudeAiOauth": {"accessToken": "a", "expiresAt": 0}})
+        outcome = oauth.try_refresh_oauth_credentials(creds)
+        assert outcome.error == "no_refresh_token"
+
+    def test_invalid_json_is_permanent(self):
+        outcome = oauth.try_refresh_oauth_credentials("not json")
+        assert outcome.error == "no_refresh_token"
+
+    def test_wrapper_returns_none_on_failure(self):
+        err = self._http_error(400, b'{"error": "invalid_grant"}')
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=err):
+            assert oauth.refresh_oauth_credentials(self._make_credentials()) is None
 
 
 class TestBuildTokenStatus:

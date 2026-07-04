@@ -28,6 +28,7 @@ from claude_swap.cache import (
     read_cache_with_timestamp,
     write_cache,
 )
+from claude_swap.claude_locks import claude_config_lock, claude_credentials_lock
 from claude_swap.json_output import (
     _KNOWN_USAGE_SENTINELS,
     _slot_for_identity,
@@ -735,6 +736,67 @@ class ClaudeAccountSwitcher:
     def read_account_config(self, account_num: str, email: str) -> str:
         """Public wrapper for session bootstrap. Empty string when missing."""
         return self._read_account_config(account_num, email)
+
+    # -- public accessors for the auto-switch engine -----------------------
+
+    def usage_by_account(self) -> dict[str, dict | str | None]:
+        """Public wrapper: account number → usage entry (cache-first)."""
+        return self._usage_by_account()
+
+    def switchable_account_numbers(self) -> list[str]:
+        """Account numbers in rotation order that have usable stored backups."""
+        data = self._get_sequence_data() or {}
+        return [
+            str(num)
+            for num in data.get("sequence", [])
+            if self._account_is_switchable(str(num))
+        ]
+
+    def account_kind_for(self, account_num: str) -> str:
+        """Public wrapper: ``"api_key"`` or ``"oauth"`` (setup-tokens read as oauth)."""
+        return self._account_kind(account_num)
+
+    def account_email(self, account_num: str) -> str:
+        """Stored email for a slot; empty string when unknown."""
+        data = self._get_sequence_data() or {}
+        return data.get("accounts", {}).get(str(account_num), {}).get("email", "")
+
+    def current_account_number(self) -> str | None:
+        """Slot of the live login; ``None`` when there is none or it's unmanaged.
+
+        Deliberately no fallback to the recorded ``activeAccountNumber``: an
+        unmanaged live login must return ``None`` — never a guessed slot — so
+        the auto-switch engine can't evaluate the wrong account's usage and
+        overwrite a login cswap doesn't own (``_perform_switch`` would take
+        the no-backup direct-activation path). Use :meth:`has_live_login` to
+        tell the two ``None`` cases apart.
+        """
+        identity = self._get_current_account()
+        if identity is None:
+            return None
+        data = self._get_sequence_data() or {}
+        email, org_uuid = identity
+        return self._find_account_slot(data, email, org_uuid)
+
+    def has_live_login(self) -> bool:
+        """Whether ``~/.claude.json`` carries any live account identity."""
+        return self._get_current_account() is not None
+
+    def live_session_pids_for(self, account_num: str, email: str) -> list[int]:
+        """Public wrapper: PIDs of live ``cswap run`` sessions for a slot."""
+        return self._live_session_pids(account_num, email)
+
+    def persist_backup_credentials(
+        self, account_num: str, email: str, credentials: str
+    ) -> None:
+        """Persist rotated credentials to a slot's backup store, under the lock.
+
+        For inactive accounts only — never routes to the active store. Mirrors
+        the persist callback ``_collect_usage`` uses. The caller must NOT hold
+        ``self.lock_file`` (FileLock is non-reentrant).
+        """
+        with FileLock(self.lock_file):
+            self._write_account_credentials(account_num, email, credentials)
 
     # -- session profile lifecycle ----------------------------------------
 
@@ -2592,7 +2654,15 @@ class ClaudeAccountSwitcher:
 
         self._warn_switch_session_hazards(target_account, quiet=quiet)
 
-        with FileLock(self.lock_file):
+        # Beyond cswap's own lock, hold Claude Code's advisory locks for the
+        # whole mutation (including rollback paths): its token refresh runs
+        # under ~/.claude.lock and re-reads credentials there — holding it
+        # means a mid-refresh Claude Code either finishes before our swap
+        # (backup captures the rotated token) or re-checks after it and aborts.
+        # ~/.claude.json.lock likewise keeps the oauthAccount splice from
+        # interleaving with Claude Code's own config writes. Everything under
+        # here is local I/O — no network while locks are held.
+        with FileLock(self.lock_file), claude_credentials_lock(), claude_config_lock():
             data = self._get_sequence_data()
             if not data or target_account not in data.get("accounts", {}):
                 raise ConfigError(

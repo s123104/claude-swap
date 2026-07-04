@@ -98,6 +98,39 @@ Or let claude-swap auto-pick by remaining quota — `cswap --switch --strategy b
 
 **Note:** You usually don't need to restart — on Linux/Windows the new account is picked up automatically, and on macOS after the Keychain cache expires. To apply it instantly, restart Claude Code or reopen the VS Code extension tab. See [Tips](#tips) for the per-platform details.
 
+### Automatic switching
+
+Let claude-swap watch your usage and switch for you. When the active account's 5-hour or 7-day window reaches the threshold (default 90%), it switches to the account with the most quota left — before you hit the limit, and safe to run while Claude Code is working:
+
+```bash
+cswap auto                     # foreground loop, polls every 60s
+cswap auto --threshold 80      # switch earlier
+cswap auto --once              # single check-and-switch, for cron/scripts
+cswap auto --dry-run           # log what it would do, never switch
+```
+
+<details>
+<summary>How it behaves & advanced usage</summary>
+
+- Switches cooperate with Claude Code's own credential locks, so a swap can never collide with a token refresh mid-session.
+- A cooldown (default 5 min) and a hysteresis margin keep it from flip-flopping between accounts near the line; when every account is exhausted it sleeps until the earliest quota reset.
+- An account whose refresh token has died is quarantined — taken out of rotation and reported — until you log in with it and re-run `cswap --add-account --slot N`.
+- API-key accounts are never rotated onto unless you pass `--include-api-key-accounts` (they bill per token).
+
+For cron/systemd timers, `--once` reports the outcome in its exit code (`0` switched, `1` error, `2` nothing to do, `3` blocked — no viable target), and `--json` emits one JSON event per line:
+
+```bash
+*/5 * * * * cswap auto --once --json >> ~/.cswap-auto.log 2>&1
+```
+
+Defaults are configurable in `settings.json` in the backup root (see [Data locations](#data-locations)) — flags override it:
+
+```json
+{ "schemaVersion": 1, "autoswitch": { "threshold": 90, "intervalSeconds": 60, "cooldownSeconds": 300 } }
+```
+
+</details>
+
 ### Run multiple accounts at the same time (session mode)
 
 Launch Claude Code as a specific account in the current terminal only — every other terminal and the VS Code extension stay on your default account, so two accounts can work in parallel.
@@ -226,6 +259,7 @@ This will update the stored credentials without creating a duplicate.
 
 ```bash
 cswap run 2                     # Run an account in this terminal only (session mode)
+cswap auto                      # Auto-switch when nearing rate limits (see above)
 cswap --list                    # Show all accounts with 5h/7d usage and reset times
 cswap --list --token-status     # --list plus per-account OAuth token status (valid/expired)
 cswap --health                  # Show account health, usage, and OAuth token status
@@ -248,6 +282,8 @@ cswap --purge                   # Remove all claude-swap data
 - Backs up OAuth tokens and config when you add an account
 - Swaps credentials when you switch accounts
 - Account credentials stored securely using platform-appropriate methods
+- Switches (manual and automatic) hold Claude Code's own credential locks while writing, so a swap never interleaves with a token refresh
+- Auto-switch freshens a target's token before activating it, and quarantines accounts whose refresh token has died (recover with `cswap --add-account --slot N`)
 
 ## Data locations
 
@@ -257,7 +293,7 @@ cswap --purge                   # Remove all claude-swap data
 | macOS | macOS Keychain | `~/.claude-swap-backup/` |
 | Linux / WSL | File-based (inside the backup directory, under `credentials/`) | `${XDG_DATA_HOME:-~/.local/share}/claude-swap/` |
 
-Session-mode profiles (`cswap run`) live under the backup directory in `sessions/`.
+Session-mode profiles (`cswap run`) live under the backup directory in `sessions/`. Tool preferences (`settings.json`) and auto-switch state (`autoswitch_state.json` — cooldown and quarantined accounts; delete it to reset) live in the backup directory root.
 
 On Linux/WSL, set `XDG_DATA_HOME` to override the default location. Data from older installs under `~/.claude-swap-backup/` is migrated automatically on first run.
 
@@ -308,6 +344,8 @@ cswap --switch-to 2 --json
 Every payload carries a `schemaVersion` (currently `1`); on a handled error stdout is `{"schemaVersion":1,"error":{...}}` with a non-zero exit code. `--switch`/`--switch-to` report `{"switched": true|false, "from": …, "to": …, "reason": …}`.
 
 </details>
+
+`cswap auto --json` emits an event *stream* instead — one JSON object per line (`{"schemaVersion":1,"event":"switch","ts":…, …}` with kinds like `poll`, `switch`, `no-switch`, `account-quarantined`, `all-exhausted`, `error`). The contract is additive: new kinds and fields may appear, so scripts should ignore unknown ones.
 
 ### Add an account from a raw token or API key
 

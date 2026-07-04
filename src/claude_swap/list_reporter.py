@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 from claude_swap import oauth
 from claude_swap.cache import read_cache_data, read_cache_with_timestamp
+from claude_swap.claude_locks import claude_config_lock, claude_credentials_lock
 from claude_swap.credential_refresh import (
     park_rotated_credential,
     recover_pending_rotation,
@@ -73,38 +74,52 @@ _ROTATED_PERSIST_LOCK_TIMEOUT = 30.0
 
 
 def _format_usage_lines(usage: dict[str, Any]) -> list[str]:
-    lines: list[str] = []
+    # Collect (label, body) rows first, then pad every label to the widest one so
+    # per-model names (e.g. "Fable") don't shift the columns of the other lines.
+    rows: list[tuple[str, str]] = []
     spend = usage.get("spend")
     if spend:
         used = spend["used"]
         limit = spend["limit"]
         pct = spend["pct"]
         if "clock" in spend:
-            lines.append(
-                f"$$: {pct:>3.0f}%   resets {spend['clock']:<12}  "
-                f"${used:,.2f} / ${limit:,.2f}"
+            rows.append(
+                (
+                    "$$",
+                    f"{pct:>3.0f}%   resets {spend['clock']:<12}  "
+                    f"${used:,.2f} / ${limit:,.2f}",
+                )
             )
         else:
-            lines.append(f"$$: {pct:>3.0f}%   ${used:,.2f} / ${limit:,.2f}")
-    h5 = usage.get("five_hour")
-    if h5:
-        if "clock" in h5:
-            lines.append(
-                f"5h: {h5['pct']:>3.0f}%   resets {h5['clock']:<12}  "
-                f"in {h5['countdown']}"
+            rows.append(("$$", f"{pct:>3.0f}%   ${used:,.2f} / ${limit:,.2f}"))
+    for label, w in (("5h", usage.get("five_hour")), ("7d", usage.get("seven_day"))):
+        if w:
+            if "clock" in w:
+                rows.append(
+                    (
+                        label,
+                        f"{w['pct']:>3.0f}%   resets {w['clock']:<12}  "
+                        f"in {w['countdown']}",
+                    )
+                )
+            else:
+                rows.append((label, f"{w['pct']:>3.0f}%"))
+    for w in usage.get("scoped") or []:
+        # Per-model weekly limits (e.g. Fable). Flag ones at/over the limit so a
+        # maxed model — the usual reason to switch — stands out.
+        marker = "  (!)" if w["pct"] >= 100 else ""
+        if "clock" in w:
+            rows.append(
+                (
+                    w["name"],
+                    f"{w['pct']:>3.0f}%   resets {w['clock']:<12}  "
+                    f"in {w['countdown']}{marker}",
+                )
             )
         else:
-            lines.append(f"5h: {h5['pct']:>3.0f}%")
-    d7 = usage.get("seven_day")
-    if d7:
-        if "clock" in d7:
-            lines.append(
-                f"7d: {d7['pct']:>3.0f}%   resets {d7['clock']:<12}  "
-                f"in {d7['countdown']}"
-            )
-        else:
-            lines.append(f"7d: {d7['pct']:>3.0f}%")
-    return lines
+            rows.append((w["name"], f"{w['pct']:>3.0f}%{marker}"))
+    width = max((len(label) for label, _ in rows), default=0) + 1  # label + ':'
+    return [f"{label + ':':<{width}} {body}" for label, body in rows]
 
 
 def run_list(
@@ -509,50 +524,65 @@ class ListReporter:
 
         def persist_active(num: str, acct_email: str, new_creds: str) -> None:
             nonlocal persist_skipped
-            with FileLock(self.lock_file):
-                live = self._host._read_credentials() or ""
-                live_oauth = oauth.extract_oauth_data(live) if live else None
-                live_refresh = live_oauth.get("refreshToken") if live_oauth else None
-                if live_refresh != original_refresh:
-                    # Someone else already rotated the live token while we were
-                    # refreshing; ours is stale — drop it (no back-up either).
-                    persist_skipped = True
-                    self._logger.warning(
-                        "Active-account refresh for %s (%s): refresh token changed "
-                        "mid-refresh; discarding rotated credential.",
-                        num, acct_email,
-                    )
-                    return
-                if self._active_cc_running() or self._host._live_session_pids(
-                    num, acct_email
+            # Failing to acquire any lock means the rotated credential was NOT
+            # persisted — mark it skipped (never show usage for it) before the
+            # error propagates to oauth._persist's warning path. The Claude
+            # Code locks matter here too: _write_credentials touches the
+            # active store and (via _clear_managed_key) possibly ~/.claude.json,
+            # and holding them closes the owner-check-to-write gap.
+            try:
+                with (
+                    FileLock(self.lock_file),
+                    claude_credentials_lock(),
+                    claude_config_lock(),
                 ):
-                    # Claude Code appeared mid-refresh and owns the live store.
-                    # We already consumed the single-use refresh token, so do NOT
-                    # discard the rotation (that would leave a dead token on disk):
-                    # back it up so a later switch recovers it, but leave the live
-                    # credentials untouched to avoid clobbering the owner.
-                    persist_skipped = True
-                    try:
-                        self._host._write_account_credentials(num, acct_email, new_creds)
-                    except Exception:
+                    live = self._host._read_credentials() or ""
+                    live_oauth = oauth.extract_oauth_data(live) if live else None
+                    live_refresh = (
+                        live_oauth.get("refreshToken") if live_oauth else None
+                    )
+                    if live_refresh != original_refresh:
+                        # Someone else already rotated the live token while we were
+                        # refreshing; ours is stale — drop it (no back-up either).
+                        persist_skipped = True
                         self._logger.warning(
-                            "Active-account refresh for %s (%s): owner appeared and "
-                            "backing up the rotated credential failed.",
-                            num, acct_email, exc_info=True,
-                        )
-                    else:
-                        self._logger.warning(
-                            "Active-account refresh for %s (%s): owner appeared "
-                            "mid-refresh; kept live, backed up rotated credential.",
+                            "Active-account refresh for %s (%s): refresh token changed "
+                            "mid-refresh; discarding rotated credential.",
                             num, acct_email,
                         )
-                    return
-                try:
+                        return
+                    if self._active_cc_running() or self._host._live_session_pids(
+                        num, acct_email
+                    ):
+                        # Claude Code appeared mid-refresh and owns the live store.
+                        # We already consumed the single-use refresh token, so do NOT
+                        # discard the rotation (that would leave a dead token on disk):
+                        # back it up so a later switch recovers it, but leave the live
+                        # credentials untouched to avoid clobbering the owner.
+                        persist_skipped = True
+                        try:
+                            self._host._write_account_credentials(
+                                num, acct_email, new_creds,
+                            )
+                        except Exception:
+                            self._logger.warning(
+                                "Active-account refresh for %s (%s): owner appeared and "
+                                "backing up the rotated credential failed.",
+                                num, acct_email, exc_info=True,
+                            )
+                        else:
+                            self._logger.warning(
+                                "Active-account refresh for %s (%s): owner appeared "
+                                "mid-refresh; kept live, backed up rotated credential.",
+                                num, acct_email,
+                            )
+                        return
                     self._host._write_credentials(new_creds)
                     self._host._write_account_credentials(num, acct_email, new_creds)
-                except Exception:
+            except Exception:
+                if not persist_skipped:
                     persist_skipped = True
-                    raise
+                raise
 
         usage = oauth.fetch_usage_for_account(
             account_num, email, creds,

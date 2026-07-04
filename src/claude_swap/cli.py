@@ -110,6 +110,157 @@ Examples:
         sys.exit(130)
 
 
+def _auto_command(argv: list[str]) -> None:
+    """Handle `cswap auto [--once] [--json] [...]`.
+
+    Pre-dispatched before the main parser is built, like `run` (and with the
+    same limitation: `auto` must be the first argument). Runs the auto-switch
+    engine — a foreground loop by default, or a single evaluate-and-maybe-
+    switch tick with --once whose exit code reports the outcome (for cron/
+    systemd timers): 0 switched, 1 error, 2 no action needed, 3 blocked
+    (no viable target / all accounts exhausted).
+    """
+    import signal
+    import time as _time
+
+    parser = argparse.ArgumentParser(
+        prog="cswap auto",
+        description=(
+            "Automatically switch accounts when the active one nears its "
+            "5h/7d rate limit. Runs a foreground polling loop; use --once "
+            "for a single tick (cron-friendly)."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Exit codes with --once:
+  0  switched to another account
+  1  error (network trouble, lock contention, ...)
+  2  no action needed
+  3  blocked: wanted to switch but no viable target / all exhausted
+
+Examples:
+  cswap auto                       # foreground loop, switch at 90%% used
+  cswap auto --threshold 80        # switch earlier
+  cswap auto --json                # one JSON event per line (for scripts)
+  cswap auto --once; echo $?       # single tick, outcome in exit code
+  cswap auto --dry-run             # log decisions, never actually switch
+
+Defaults live in settings.json in the backup root; flags override them.
+        """,
+    )
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Evaluate once, maybe switch, and exit (exit code = outcome)",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit one machine-readable JSON event per line on stdout",
+    )
+    parser.add_argument(
+        "--interval",
+        type=float,
+        metavar="SECONDS",
+        help="Poll interval in loop mode (min 15; default 60)",
+    )
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        metavar="PCT",
+        help=(
+            "Switch when the active account's binding 5h/7d window reaches "
+            "this utilization (50-99.9; default 90)"
+        ),
+    )
+    parser.add_argument(
+        "--cooldown",
+        type=float,
+        metavar="SECONDS",
+        help="Minimum time between proactive switches (default 300)",
+    )
+    parser.add_argument(
+        "--include-api-key-accounts",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Allow switching onto managed API-key accounts as a last resort "
+            "(they bill per token; default: excluded)"
+        ),
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Evaluate and report, but never switch or write state",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug logging",
+    )
+    args = parser.parse_args(argv)
+
+    from claude_swap.autoswitch import AutoSwitchEngine, AutoSwitchEvent
+    from claude_swap.printer import accent, yellowed
+    from claude_swap.settings import load_settings, merged_with_cli
+
+    def jsonl_emit(event: AutoSwitchEvent) -> None:
+        print(json.dumps(event.to_json()), flush=True)
+
+    def human_emit(event: AutoSwitchEvent) -> None:
+        stamp = _time.strftime("%H:%M:%S")
+        line = event.human()
+        if event.kind == "switch":
+            line = accent(line)
+        elif event.kind in ("error", "account-quarantined"):
+            line = yellowed(line)
+        elif event.kind in ("poll", "no-switch", "sleep"):
+            line = dimmed(line)
+        print(f"{stamp}  {line}", flush=True)
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        if sys.platform != "win32":
+            if os.geteuid() == 0 and not switcher._is_running_in_container():
+                error("Error: Do not run this script as root (unless running in a container)")
+                sys.exit(1)
+
+        settings = merged_with_cli(load_settings(switcher.backup_dir), args)
+        engine = AutoSwitchEngine(
+            switcher,
+            settings,
+            jsonl_emit if args.json else human_emit,
+            dry_run=args.dry_run,
+        )
+
+        if args.once:
+            sys.exit(engine.tick().value)
+
+        # Loop mode: SIGTERM (systemd stop) exits the loop cleanly.
+        signal.signal(signal.SIGTERM, lambda *_: engine.stop())
+        if not args.json:
+            print(
+                dimmed(
+                    f"Auto-switch running: threshold {settings.threshold:.0f}%, "
+                    f"every {settings.interval_seconds:.0f}s"
+                    f"{' (dry-run)' if args.dry_run else ''} — Ctrl-C to stop"
+                )
+            )
+        sys.exit(engine.run_loop())
+    except ClaudeSwitchError as e:
+        if args.json:
+            print(json.dumps(error_envelope(e)))
+        else:
+            error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(
+            f"\n{dimmed('Auto-switch stopped')}",
+            file=sys.stderr if args.json else sys.stdout,
+        )
+        sys.exit(130)
+
+
 def _use_native_tls() -> None:
     """Route TLS trust decisions through the OS-native verifier.
 
@@ -284,6 +435,7 @@ Examples:
 # can monkeypatch the module-level handler (e.g. cli._service_command).
 _SUBCOMMANDS = {
     "run": "_run_command",
+    "auto": "_auto_command",
     "service": "_service_command",
     "auto-switch": "_auto_switch_command",
 }
@@ -311,6 +463,8 @@ Examples:
   %(prog)s --switch-to user@example.com
   %(prog)s run 2                            # run account 2 in this terminal only
   %(prog)s run 2 -- --resume                # forward args after '--' to claude
+  %(prog)s auto                             # auto-switch when nearing rate limits
+  %(prog)s auto --once                      # single auto-switch tick (cron-friendly)
   %(prog)s --remove-account user@example.com
   %(prog)s --status
   %(prog)s --purge
