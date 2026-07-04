@@ -14,9 +14,10 @@ import math
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Literal
+from typing import Literal
 
 from claude_swap.models import AutoSwitchDecisionContext, SwitchPlanResult
+from claude_swap.sequence_store import SequenceData
 
 # Score buckets for cooldown-aware ranking. The numeric order is the
 # preference order — scores are compared as plain tuples, so unsaturated
@@ -217,7 +218,7 @@ def _rank_cooldown_aware(
 
 
 def pick_best_from_snapshots(
-    get_sequence_data: Callable[[], dict[str, Any] | None],
+    get_sequence_view: Callable[[], SequenceData | None],
     is_switchable: Callable[[str], bool],
     threshold: int,
     snapshots: dict[str, object],
@@ -231,8 +232,8 @@ def pick_best_from_snapshots(
     winning slot number, or ``None`` when the sequence is empty or no
     candidate has usable usage.
     """
-    data = get_sequence_data() or {}
-    sequence = data.get("sequence", [])
+    data = get_sequence_view()
+    sequence = data.sequence if data else ()
     if not sequence:
         return None
 

@@ -708,10 +708,10 @@ def _warm_usage_cache_on_first_poll(
         return
     state.usage_cache_warmed = True
 
-    data = switcher._get_sequence_data() or {}
+    data = switcher._get_sequence_view()
     switchable = [
         str(num)
-        for num in data.get("sequence", [])
+        for num in (data.sequence if data else ())
         if switcher._account_is_switchable(str(num))
     ]
     if not switchable:

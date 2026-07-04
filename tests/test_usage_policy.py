@@ -19,6 +19,7 @@ from claude_swap.usage_policy import (
     plan_automated_switch,
 )
 from claude_swap.models import AutoSwitchDecisionContext
+from claude_swap.sequence_store import SequenceData
 from tests.conftest import bootstrap_switchable_accounts
 
 
@@ -131,7 +132,7 @@ class TestCooldownPlannerGolden:
             "3": {"five_hour": {"pct": 100, "resets_at": "2026-06-14T13:01:00+00:00"}},
         }
         best = pick_best_from_snapshots(
-            lambda: {"sequence": [1, 2, 3]},
+            lambda: SequenceData({"sequence": [1, 2, 3]}),
             lambda _n: True,
             95,
             snapshots,
@@ -147,7 +148,7 @@ class TestCooldownPlannerGolden:
         }
         assert (
             pick_best_from_snapshots(
-                lambda: {"sequence": [1, 2, 3]},
+                lambda: SequenceData({"sequence": [1, 2, 3]}),
                 lambda _n: True,
                 95,
                 snapshots,
@@ -173,7 +174,7 @@ class TestCooldownPlannerGolden:
         plan = plan_automated_switch(
             decision,
             lambda _t, snaps, ex: pick_best_from_snapshots(
-                lambda: {"sequence": [1, 2]},
+                lambda: SequenceData({"sequence": [1, 2]}),
                 lambda _n: True,
                 95,
                 snaps,
@@ -201,7 +202,7 @@ class TestCooldownPlannerGolden:
         plan = plan_automated_switch(
             decision,
             lambda _t, snaps, ex: pick_best_from_snapshots(
-                lambda: {"sequence": [1, 2]},
+                lambda: SequenceData({"sequence": [1, 2]}),
                 lambda _n: True,
                 95,
                 snaps,

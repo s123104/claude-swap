@@ -659,7 +659,7 @@ class ClaudeAccountSwitcher:
         exclude: str | None = None,
     ) -> str | None:
         return pick_best_from_snapshots(
-            self._get_sequence_data,
+            self._get_sequence_view,
             self._account_is_switchable,
             threshold,
             snapshots,
@@ -824,11 +824,15 @@ class ClaudeAccountSwitcher:
     def _get_sequence_data(self) -> dict[str, Any] | None:
         """Raw sequence.json dict shim over the typed store.
 
-        Retained for external consumers (monitor/list_reporter/migrations via
+        Retained for external consumers (list_reporter/migrations via
         protocols) that still read the raw dict; switcher's own logic uses the
         typed ``self._sequence_store`` model.
         """
         return self._sequence_store.load_raw()
+
+    def _get_sequence_view(self) -> SequenceData | None:
+        """Typed ``sequence.json`` view for protocol consumers (monitor track)."""
+        return self._sequence_store.load()
 
     def _get_next_account_number(self) -> int:
         """Get next account number."""

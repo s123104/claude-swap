@@ -14,7 +14,7 @@ from claude_swap.models import (
     SwitchPreconditions,
 )
 from claude_swap.monitor import MonitorRuntimeState, monitor_step
-from claude_swap.sequence_store import AutoSwitchConfig
+from claude_swap.sequence_store import AutoSwitchConfig, SequenceData
 from claude_swap.switch_cli import run_switch_cli
 
 
@@ -41,7 +41,7 @@ def _monitor_host(tmp_path: Path) -> SimpleNamespace:
         ),
         switch=lambda *args, **kwargs: False,
         _live_default_mode_claude_pids=lambda: [],
-        _get_sequence_data=lambda: {"sequence": []},
+        _get_sequence_view=lambda: SequenceData({"sequence": []}),
         _account_is_switchable=lambda num: True,
         _trusted_usage_snapshots=lambda: {},
         _refresh_switchable_usage_cache=lambda: None,
