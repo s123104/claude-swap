@@ -797,6 +797,21 @@ class TestQuarantineLifecycle:
         assert harness.active_number() == 2
         assert "2" not in (harness.state().get("quarantine") or {})
 
+    def test_corrupt_quarantine_entry_is_dropped_not_fatal(self, harness):
+        """A non-dict quarantine entry (hand-edited state) must not raise on
+        every real tick — it is released as corrupt and the tick proceeds."""
+        harness.engine._mutate_state(
+            lambda s: s.setdefault("quarantine", {}).update({"2": "oops"})
+        )
+        harness.events.clear()
+        outcome = harness.tick_with_usage({
+            "1": _usage(95), "2": _usage(0), "3": _usage(50),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        released = [e for e in harness.events if isinstance(e, UnquarantineEvent)]
+        assert released and released[0].reason == "corrupt-state-entry"
+        assert "2" not in (harness.state().get("quarantine") or {})
+
     def test_state_lock_preserves_concurrent_writes(self, harness):
         # Simulate another engine writing between our read and our write: the
         # RMW under the state lock must preserve its quarantine entry.

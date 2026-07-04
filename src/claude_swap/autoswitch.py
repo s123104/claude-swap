@@ -444,6 +444,11 @@ class AutoSwitchEngine:
             return state
         to_release: list[tuple[str, str, str]] = []
         for number, entry in quarantine.items():
+            if not isinstance(entry, dict):
+                # A hand-edited or corrupted state file must not wedge every
+                # real tick (dry-run skips this pass) — drop the broken entry.
+                to_release.append((number, "", "corrupt-state-entry"))
+                continue
             email_now = self.switcher.account_email(number)
             if not email_now or email_now != entry.get("email"):
                 to_release.append(
