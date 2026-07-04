@@ -703,7 +703,7 @@ class TestAutoswitchConfigToSettings:
         raw = json.loads(switcher.sequence_file.read_text(encoding="utf-8"))
         assert "autoSwitch" not in raw
 
-    @pytest.mark.parametrize("threshold", ["oops", 40, None])
+    @pytest.mark.parametrize("threshold", ["oops", None])
     def test_unusable_threshold_still_drops_section(
         self, temp_home: Path, threshold: object
     ):
@@ -716,6 +716,43 @@ class TestAutoswitchConfigToSettings:
         assert not settings_path(switcher.backup_dir).exists()
         raw = json.loads(switcher.sequence_file.read_text(encoding="utf-8"))
         assert "autoSwitch" not in raw
+
+    @pytest.mark.parametrize(
+        "legacy,expected", [(40, 50.0), (100, 99.9), (1, 50.0)]
+    )
+    def test_out_of_range_threshold_clamped_with_warning(
+        self, temp_home: Path, caplog, legacy: int, expected: float
+    ):
+        """The monitor's 1–100 range maps into the engine's bounds, loudly."""
+        import logging
+
+        from claude_swap.settings import load_settings
+
+        switcher = self._switcher_with_section(
+            temp_home, {"enabled": True, "threshold": legacy}
+        )
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            assert migrations.migrate_autoswitch_config_to_settings(switcher) is True
+        assert load_settings(switcher.backup_dir).threshold == expected
+        assert any("clamped" in r.getMessage() for r in caplog.records)
+
+    def test_disabled_with_service_warns_on_stderr(
+        self, temp_home: Path, caplog, capsys
+    ):
+        """enabled=false used to mean "never switch"; the engine has no such
+        mode, so the migration must say the semantics flipped."""
+        import logging
+
+        switcher = self._switcher_with_section(
+            temp_home, {"enabled": False, "threshold": 96}
+        )
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            assert migrations.migrate_autoswitch_config_to_settings(switcher) is True
+        err = capsys.readouterr().err
+        assert "switches accounts proactively" in err
+        assert any(
+            "no disabled mode" in r.getMessage() for r in caplog.records
+        )
 
     def test_runner_marks_applied(self, temp_home: Path):
         switcher = self._switcher_with_section(

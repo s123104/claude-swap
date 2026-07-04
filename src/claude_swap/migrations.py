@@ -480,9 +480,12 @@ def migrate_autoswitch_config_to_settings(
     The retired fork monitor kept ``{enabled, threshold}`` under an
     ``autoSwitch`` key in ``sequence.json``; the engine reads the
     ``autoswitch`` section of ``settings.json``. A user-tuned threshold is
-    carried over unless ``settings.json`` already sets one; ``enabled`` has
-    no engine equivalent (running the service or foreground engine *is* the
-    opt-in) and is dropped with the section.
+    carried over unless ``settings.json`` already sets one; the monitor's
+    1–100 range is clamped into the engine's [THRESHOLD_MIN, THRESHOLD_MAX]
+    with a warning rather than silently dropped. ``enabled`` has no engine
+    equivalent (running the service or foreground engine *is* the opt-in):
+    it is dropped with the section, and ``enabled=false`` earns a loud
+    warning because the installed service now switches proactively.
     """
     with FileLock(switcher.lock_file):
         raw = switcher._read_json(switcher.sequence_file)
@@ -496,7 +499,15 @@ def migrate_autoswitch_config_to_settings(
                 threshold = float(legacy.get("threshold"))  # type: ignore[arg-type]
             except (TypeError, ValueError):
                 threshold = None
-        if threshold is not None and THRESHOLD_MIN <= threshold <= THRESHOLD_MAX:
+        if threshold is not None:
+            clamped = min(max(threshold, THRESHOLD_MIN), THRESHOLD_MAX)
+            if clamped != threshold:
+                switcher._logger.warning(
+                    "Migrated auto-switch threshold %s%% is outside the engine's "
+                    "%s–%s%% range; clamped to %s%%. Adjust with "
+                    "`cswap config set autoswitch.threshold <pct>`.",
+                    threshold, THRESHOLD_MIN, THRESHOLD_MAX, clamped,
+                )
             already_set = False
             try:
                 current = json.loads(
@@ -510,9 +521,23 @@ def migrate_autoswitch_config_to_settings(
                 save_settings(
                     switcher.backup_dir,
                     dataclasses.replace(
-                        load_settings(switcher.backup_dir), threshold=threshold
+                        load_settings(switcher.backup_dir), threshold=clamped
                     ),
                 )
+
+        if isinstance(legacy, dict) and legacy.get("enabled") is False:
+            # Semantics flip: the old monitor honored enabled=false as "watch
+            # but never switch"; the engine has no such knob — an installed
+            # service now switches proactively. Say so where the user can see
+            # it (migrations run under CLI commands, so stderr is visible).
+            message = (
+                "auto-switch was disabled (autoSwitch.enabled=false) before this "
+                "upgrade, but the new engine has no disabled mode: an installed "
+                "cswap service now switches accounts proactively. Run "
+                "`cswap service uninstall` if you do not want that."
+            )
+            switcher._logger.warning("%s", message)
+            print(f"warning: {message}", file=sys.stderr)
 
         switcher._write_json(switcher.sequence_file, raw)
     return True
