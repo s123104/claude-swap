@@ -67,6 +67,35 @@ Release version is defined in `pyproject.toml` (currently `0.16.0b1+haotool.1`).
   (`LockError`) during the live→backup sync is logged and swallowed like
   every other environmental failure, instead of aborting the surrounding
   list/status/switch pass.
+- **launchd reinstall rides out the teardown race:** `service install` over a
+  loaded agent retries a `bootstrap` that fails with rc=5 — launchd tears the
+  previous instance down asynchronously after `bootout`, and an immediate
+  bootstrap can land in that window — up to three times, 0.5s apart, instead
+  of leaving the agent installed but not loaded. Any other failure still
+  surfaces immediately.
+- **Monitor backs off on persistent switch failures:** consecutive failed
+  switch attempts raise the retry interval exponentially (capped at 300s)
+  instead of re-paying a full plan and forced-refresh churn every poll cycle
+  while pinned at the threshold. Success, idle, or a wake gap resets the
+  backoff.
+- **A consumed rotation survives failed backup verification:** when the
+  backup write cannot be verified after a network refresh has already
+  consumed the single-use refresh token, the rotation is parked in the
+  slot's pending file (the same recovery path as a wedged lock) before the
+  error surfaces, instead of being lost with the error.
+- **Windows PID probe survives localized `tasklist` output:** the CSV is
+  parsed with the `csv` module (quoted image names may contain commas) and
+  "no process owns the PID" is decided structurally — no data row carries
+  the queried PID — instead of matching the English-only `INFO:` notice.
+- **Stale PID files are reclaimed by atomic rename:** the reclaim captures
+  the file under a unique temp name, so exactly one reclaimer wins the race
+  and a racer's fresh PID file is restored with no-overwrite semantics
+  instead of deleted — closing the read-verify-unlink window that could let
+  two monitors run at once.
+- **Threshold triggers refuse masked stale readings:** when a trusted prior
+  cache row masks this cycle's failed usage fetch, the monitor holds instead
+  of switching on a pct that may be arbitrarily old, and switches only once
+  a fresh fetch succeeds.
 
 ### Changed
 
@@ -84,6 +113,11 @@ Release version is defined in `pyproject.toml` (currently `0.16.0b1+haotool.1`).
   `switcher.py`'s indentation, docstrings, and import prologue were re-aligned
   with upstream — shrinking the shared-file diff against `upstream/main` by
   ~240 lines. Comments/docs only, no behavior change.
+- **Auto-switch config seam is typed:** `get_auto_switch_config` /
+  `ensure_auto_switch_enabled` / `set_auto_switch_config` return the
+  sequence-store `AutoSwitchConfig` dataclass instead of a `dict[str, Any]`,
+  so the monitor, CLI, and TUI read `.enabled` / `.threshold` under
+  mypy-strict. Internal typing only — no behavior change.
 
 ## [0.15.1+haotool.1] — 2026-07-03
 
