@@ -639,3 +639,88 @@ class TestMacosKeyringToSecurity:
             run_migrations(switcher)
         state = json.loads((switcher.backup_dir / ".migrations.json").read_text())
         assert "macos_keyring_to_security" in state["applied"]
+
+
+# ---------------------------------------------------------------------------
+# autoswitch_config_to_settings
+# ---------------------------------------------------------------------------
+
+
+class TestAutoswitchConfigToSettings:
+    """The legacy ``autoSwitch`` section of ``sequence.json`` moves into
+    ``settings.json`` (the engine's config) and the section is dropped."""
+
+    def _switcher_with_section(
+        self, temp_home: Path, section: object
+    ) -> ClaudeAccountSwitcher:
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        data: dict = {
+            "accounts": {"1": {"email": "a@example.com"}},
+            "sequence": [1],
+            "activeAccountNumber": 1,
+        }
+        if section is not None:
+            data["autoSwitch"] = section
+        switcher._write_json(switcher.sequence_file, data)
+        return switcher
+
+    def test_moves_threshold_and_drops_section(self, temp_home: Path):
+        from claude_swap.settings import load_settings
+
+        switcher = self._switcher_with_section(
+            temp_home, {"enabled": True, "threshold": 97}
+        )
+        assert migrations.migrate_autoswitch_config_to_settings(switcher) is True
+
+        assert load_settings(switcher.backup_dir).threshold == 97.0
+        raw = json.loads(switcher.sequence_file.read_text(encoding="utf-8"))
+        assert "autoSwitch" not in raw
+        assert raw["accounts"]["1"]["email"] == "a@example.com"
+
+    def test_skips_when_section_absent(self, temp_home: Path):
+        from claude_swap.settings import settings_path
+
+        switcher = self._switcher_with_section(temp_home, None)
+        assert migrations.migrate_autoswitch_config_to_settings(switcher) is False
+        assert not settings_path(switcher.backup_dir).exists()
+
+    def test_existing_settings_threshold_wins(self, temp_home: Path):
+        import dataclasses
+
+        from claude_swap.settings import load_settings, save_settings
+
+        switcher = self._switcher_with_section(
+            temp_home, {"enabled": True, "threshold": 97}
+        )
+        save_settings(
+            switcher.backup_dir,
+            dataclasses.replace(load_settings(switcher.backup_dir), threshold=92.0),
+        )
+
+        assert migrations.migrate_autoswitch_config_to_settings(switcher) is True
+        assert load_settings(switcher.backup_dir).threshold == 92.0
+        raw = json.loads(switcher.sequence_file.read_text(encoding="utf-8"))
+        assert "autoSwitch" not in raw
+
+    @pytest.mark.parametrize("threshold", ["oops", 40, None])
+    def test_unusable_threshold_still_drops_section(
+        self, temp_home: Path, threshold: object
+    ):
+        from claude_swap.settings import settings_path
+
+        switcher = self._switcher_with_section(
+            temp_home, {"enabled": True, "threshold": threshold}
+        )
+        assert migrations.migrate_autoswitch_config_to_settings(switcher) is True
+        assert not settings_path(switcher.backup_dir).exists()
+        raw = json.loads(switcher.sequence_file.read_text(encoding="utf-8"))
+        assert "autoSwitch" not in raw
+
+    def test_runner_marks_applied(self, temp_home: Path):
+        switcher = self._switcher_with_section(
+            temp_home, {"enabled": False, "threshold": 96}
+        )
+        run_migrations(switcher)
+        state = json.loads((switcher.backup_dir / ".migrations.json").read_text())
+        assert "autoswitch_config_to_settings" in state["applied"]

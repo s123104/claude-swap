@@ -23,6 +23,7 @@ file read and never touches the source backend again.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import sys
@@ -33,7 +34,15 @@ from typing import TYPE_CHECKING, Any, Callable
 
 from claude_swap import macos_keychain
 from claude_swap.exceptions import MigrationIncomplete
+from claude_swap.locking import FileLock
 from claude_swap.models import Platform, get_timestamp
+from claude_swap.settings import (
+    THRESHOLD_MAX,
+    THRESHOLD_MIN,
+    load_settings,
+    save_settings,
+    settings_path,
+)
 from claude_swap.switcher import KEYRING_SERVICE
 
 if TYPE_CHECKING:
@@ -462,10 +471,58 @@ def migrate_macos_keyring_to_security(switcher: "ClaudeAccountSwitcher") -> bool
     return True
 
 
+def migrate_autoswitch_config_to_settings(
+    switcher: "ClaudeAccountSwitcher",
+) -> bool:
+    """Move the legacy ``autoSwitch`` section of ``sequence.json`` into
+    ``settings.json``.
+
+    The retired fork monitor kept ``{enabled, threshold}`` under an
+    ``autoSwitch`` key in ``sequence.json``; the engine reads the
+    ``autoswitch`` section of ``settings.json``. A user-tuned threshold is
+    carried over unless ``settings.json`` already sets one; ``enabled`` has
+    no engine equivalent (running the service or foreground engine *is* the
+    opt-in) and is dropped with the section.
+    """
+    with FileLock(switcher.lock_file):
+        raw = switcher._read_json(switcher.sequence_file)
+        if not isinstance(raw, dict) or "autoSwitch" not in raw:
+            return False
+        legacy = raw.pop("autoSwitch")
+
+        threshold: float | None = None
+        if isinstance(legacy, dict):
+            try:
+                threshold = float(legacy.get("threshold"))  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                threshold = None
+        if threshold is not None and THRESHOLD_MIN <= threshold <= THRESHOLD_MAX:
+            already_set = False
+            try:
+                current = json.loads(
+                    settings_path(switcher.backup_dir).read_text(encoding="utf-8")
+                )
+                section = current.get("autoswitch")
+                already_set = isinstance(section, dict) and "threshold" in section
+            except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+                pass
+            if not already_set:
+                save_settings(
+                    switcher.backup_dir,
+                    dataclasses.replace(
+                        load_settings(switcher.backup_dir), threshold=threshold
+                    ),
+                )
+
+        switcher._write_json(switcher.sequence_file, raw)
+    return True
+
+
 # Registry of (id, fn). Order matters if migrations ever depend on each other.
 MIGRATIONS: list[tuple[str, Callable[["ClaudeAccountSwitcher"], bool]]] = [
     ("windows_keyring_to_files", migrate_windows_keyring_to_files),
     ("macos_keyring_to_security", migrate_macos_keyring_to_security),
+    ("autoswitch_config_to_settings", migrate_autoswitch_config_to_settings),
 ]
 
 

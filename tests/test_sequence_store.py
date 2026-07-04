@@ -9,9 +9,7 @@ from typing import Any
 import pytest
 
 from claude_swap.sequence_store import (
-    DEFAULT_AUTO_SWITCH_THRESHOLD,
     AccountRecord,
-    AutoSwitchConfig,
     SequenceData,
     SequenceStore,
 )
@@ -36,21 +34,6 @@ def _store(tmp_path: Path) -> SequenceStore:
         read_json=_read_json,
         write_json=_write_json,
     )
-
-
-# --- AutoSwitchConfig ------------------------------------------------------
-
-
-def test_auto_switch_defaults_when_absent() -> None:
-    cfg = AutoSwitchConfig.from_raw(None)
-    assert cfg.enabled is False
-    assert cfg.threshold == DEFAULT_AUTO_SWITCH_THRESHOLD
-
-
-def test_auto_switch_tolerates_bad_threshold() -> None:
-    cfg = AutoSwitchConfig.from_raw({"enabled": True, "threshold": "oops"})
-    assert cfg.enabled is True
-    assert cfg.threshold == DEFAULT_AUTO_SWITCH_THRESHOLD
 
 
 # --- AccountRecord ---------------------------------------------------------
@@ -209,16 +192,6 @@ def test_mutations_are_immutable() -> None:
     # original is untouched by the discarded result above
     assert original.sequence == ()
     assert original.active_account_number is None
-
-
-def test_with_auto_switch_merges_fields() -> None:
-    data = SequenceData.empty().with_auto_switch(enabled=True)
-    assert data.auto_switch.enabled is True
-    assert data.auto_switch.threshold == DEFAULT_AUTO_SWITCH_THRESHOLD
-    data = data.with_auto_switch(threshold=50)
-    # enabled preserved from the prior merge
-    assert data.auto_switch.enabled is True
-    assert data.auto_switch.threshold == 50
 
 
 def test_set_active_none() -> None:

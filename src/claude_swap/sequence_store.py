@@ -27,31 +27,8 @@ from typing import Any, Callable
 
 from claude_swap.models import get_timestamp
 
-# SSOT for the auto-switch default. Re-exported by ``switcher`` for back-compat.
-DEFAULT_AUTO_SWITCH_THRESHOLD = 95
-
 ReadJson = Callable[[Path], "dict[str, Any] | None"]
 WriteJson = Callable[[Path, "dict[str, Any]"], None]
-
-
-@dataclass(frozen=True)
-class AutoSwitchConfig:
-    """Persisted auto-switch (Beta) settings from the ``autoSwitch`` key."""
-
-    enabled: bool
-    threshold: int
-
-    @classmethod
-    def from_raw(cls, raw: dict[str, Any] | None) -> AutoSwitchConfig:
-        cfg = raw or {}
-        try:
-            threshold = int(cfg.get("threshold", DEFAULT_AUTO_SWITCH_THRESHOLD))
-        except (TypeError, ValueError):
-            threshold = DEFAULT_AUTO_SWITCH_THRESHOLD
-        return cls(
-            enabled=bool(cfg.get("enabled", False)),
-            threshold=threshold,
-        )
 
 
 @dataclass(frozen=True)
@@ -131,10 +108,6 @@ class SequenceData:
             for num, record in raw_accounts.items()
         }
 
-    @property
-    def auto_switch(self) -> AutoSwitchConfig:
-        return AutoSwitchConfig.from_raw(self.raw.get("autoSwitch"))
-
     def get(self, account_num: str) -> AccountRecord | None:
         record = self.raw.get("accounts", {}).get(str(account_num))
         return AccountRecord(record) if record is not None else None
@@ -187,21 +160,6 @@ class SequenceData:
     def set_active(self, account_num: int | None) -> SequenceData:
         data = self._copy()
         data["activeAccountNumber"] = account_num
-        return SequenceData(data)
-
-    def with_auto_switch(
-        self, *, enabled: bool | None = None, threshold: int | None = None
-    ) -> SequenceData:
-        """Merge auto-switch fields, keeping unspecified ones (immutable)."""
-        data = self._copy()
-        cfg = dict(data.get("autoSwitch") or {})
-        if enabled is not None:
-            cfg["enabled"] = bool(enabled)
-        if threshold is not None:
-            cfg["threshold"] = int(threshold)
-        cfg.setdefault("enabled", False)
-        cfg.setdefault("threshold", DEFAULT_AUTO_SWITCH_THRESHOLD)
-        data["autoSwitch"] = cfg
         return SequenceData(data)
 
     def to_dict(self) -> dict[str, Any]:
