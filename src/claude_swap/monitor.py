@@ -205,6 +205,9 @@ class MonitorRuntimeState:
     last_pcts: dict[str, float] = field(default_factory=dict)
     last_poll_time: float | None = None
     last_wall_time: float | None = None
+    # Interval the adapter was told to sleep before this cycle; lets the
+    # wake-gap detector tell a long planned sleep from a machine sleep.
+    last_planned_interval: int = 0
     consecutive_failures: int = 0
     consecutive_switch_failures: int = 0
     last_switch_error: str | None = None
@@ -303,10 +306,17 @@ def _apply_wake_gap_reset(
     poll_seconds: int,
     log: logging.Logger,
 ) -> None:
+    # A planned sleep can legitimately exceed the multiplier window (honoring
+    # a server Retry-After of up to 300s > 4x60s); waking from it must not
+    # read as a machine-sleep gap, or the reset throws away the failure count
+    # and velocity baseline for nothing.
+    expected_gap = max(
+        MONITOR_WAKE_GAP_MULTIPLIER * poll_seconds,
+        state.last_planned_interval + poll_seconds,
+    )
     if (
         state.last_wall_time is not None
-        and wall - state.last_wall_time
-        > MONITOR_WAKE_GAP_MULTIPLIER * poll_seconds
+        and wall - state.last_wall_time > expected_gap
     ):
         log.info(
             "monitor: wake-gap %ds detected — resetting baselines",
@@ -742,7 +752,7 @@ def monitor_step(
     Both map to the usage-unavailable backoff and retry on the next cycle.
     """
     try:
-        return _monitor_step_body(
+        result = _monitor_step_body(
             switcher,
             state,
             poll_seconds=poll_seconds,
@@ -751,7 +761,7 @@ def monitor_step(
     except (ClaudeSwitchError, OSError) as exc:
         log = _logger(switcher)
         log.warning("monitor poll failed: %r — backing off", exc)
-        return _step_usage_unavailable(
+        result = _step_usage_unavailable(
             state,
             poll_seconds,
             time.time(),
@@ -759,6 +769,8 @@ def monitor_step(
             "unavailable",
             log,
         )
+    state.last_planned_interval = result.next_interval
+    return result
 
 
 def _monitor_step_body(

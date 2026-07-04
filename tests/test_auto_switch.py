@@ -2566,6 +2566,69 @@ class TestSleepWakeAndHeartbeat:
             if "switch failed" in r.getMessage()
         ]
 
+    def test_honored_retry_after_sleep_is_not_a_wake_gap(
+        self,
+        temp_home: Path,
+        caplog,
+    ):
+        """A planned sleep that legitimately exceeds the wake-gap threshold
+        (honoring a server Retry-After up to 300s > 4x60s) must not read as a
+        machine-sleep gap on wake: resetting there throws away the failure
+        count the backoff is built on and pays an extra replan for nothing.
+        """
+        switcher = ClaudeAccountSwitcher()
+        switcher.set_auto_switch_config(enabled=True, threshold=95)
+        caplog.set_level(logging.DEBUG, logger="claude-swap")
+        state = monitor.MonitorRuntimeState()
+        wall = [1_000_000.0]
+
+        with (
+            patch.object(switcher, "get_active_usage_pct", return_value=None),
+            patch.object(
+                switcher, "get_active_usage_retry_after", return_value=300
+            ),
+            patch("claude_swap.monitor.time.time", side_effect=lambda: wall[0]),
+        ):
+            first = monitor.monitor_step(switcher, state, poll_seconds=60)
+            wall[0] += 300.0  # the monitor slept exactly the honored window
+            second = monitor.monitor_step(switcher, state, poll_seconds=60)
+
+        assert first.next_interval == 300  # the honored Retry-After sleep
+        assert second.consecutive_failures == 2, (
+            "waking from the honored Retry-After must continue the failure "
+            "count, not restart it via a wake-gap reset"
+        )
+        msgs = [r.getMessage() for r in caplog.records if r.name == "claude-swap"]
+        assert not any("wake-gap" in m for m in msgs), msgs
+
+    def test_machine_sleep_beyond_planned_interval_still_resets(
+        self,
+        temp_home: Path,
+        caplog,
+    ):
+        """The safety net stays intact: a wall gap well past the planned
+        sleep (machine slept) still resets baselines."""
+        switcher = ClaudeAccountSwitcher()
+        switcher.set_auto_switch_config(enabled=True, threshold=95)
+        caplog.set_level(logging.DEBUG, logger="claude-swap")
+        state = monitor.MonitorRuntimeState()
+        wall = [1_000_000.0]
+
+        with (
+            patch.object(switcher, "get_active_usage_pct", return_value=None),
+            patch.object(
+                switcher, "get_active_usage_retry_after", return_value=300
+            ),
+            patch("claude_swap.monitor.time.time", side_effect=lambda: wall[0]),
+        ):
+            monitor.monitor_step(switcher, state, poll_seconds=60)
+            wall[0] += 10 * 3600.0  # machine slept far past the planned 300s
+            second = monitor.monitor_step(switcher, state, poll_seconds=60)
+
+        assert second.consecutive_failures == 1
+        msgs = [r.getMessage() for r in caplog.records if r.name == "claude-swap"]
+        assert any("wake-gap" in m and "resetting baselines" in m for m in msgs)
+
     def test_idle_heartbeat_fires_after_long_idle_with_enabled_auto_switch(
         self,
         temp_home: Path,
