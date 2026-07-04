@@ -1427,6 +1427,11 @@ class ClaudeAccountSwitcher:
             self._live_session_pids(account_num, email)
         )
         if owned:
+            if oauth.is_oauth_token_expired(oauth_data.get("expiresAt")):
+                # The request would just 401 (an owned credential may not be
+                # refreshed), so skip it — Claude Code's own /usage does the
+                # same on a locally-expired token.
+                return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
             outcome = oauth.try_fetch_usage_for_account(
                 account_num, email, creds, is_active=True,
             )

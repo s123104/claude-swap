@@ -10,6 +10,8 @@ import pytest
 
 from claude_swap import oauth
 from claude_swap.autoswitch import (
+    IDLE_HOLD_MAX_S,
+    NO_RESET_FALLBACK_S,
     AllExhaustedEvent,
     AutoSwitchEngine,
     ErrorEvent,
@@ -20,6 +22,7 @@ from claude_swap.autoswitch import (
     TickOutcome,
     UnquarantineEvent,
 )
+from claude_swap.json_output import USAGE_TOKEN_EXPIRED
 from claude_swap.models import Platform
 from claude_swap.settings import AutoSwitchSettings
 from claude_swap.switcher import ClaudeAccountSwitcher
@@ -324,6 +327,58 @@ class TestDecisionTable:
         event = next(e for e in harness.events if isinstance(e, AllExhaustedEvent))
         assert event.earliest_reset_at == "2026-07-03T10:30:00Z"
         assert harness.engine._sleep_until_ts is not None
+
+
+class TestIdleHold:
+    """Active token expired while Claude Code owns it → hold, don't fail over."""
+
+    _HELD = {"1": USAGE_TOKEN_EXPIRED, "2": _usage(10), "3": _usage(20)}
+
+    def test_token_expired_holds_instead_of_failover(self, harness):
+        for _ in range(6):  # far past unhealthy_ticks (3)
+            assert harness.tick_with_usage(self._HELD) is TickOutcome.NO_ACTION
+            harness.clock.advance(60)
+        assert harness.active_number() == 1
+        assert not any(isinstance(e, SwitchEvent) for e in harness.events)
+        reasons = {e.reason for e in harness.events if isinstance(e, NoSwitchEvent)}
+        assert reasons == {"active-idle"}
+        assert harness.engine._unhealthy_ticks == 0
+
+    def test_idle_hold_slows_cadence(self, harness):
+        outcome = harness.tick_with_usage(self._HELD)
+        assert outcome is TickOutcome.NO_ACTION
+        assert harness.engine._next_delay(outcome) >= NO_RESET_FALLBACK_S
+
+    def test_idle_hold_cap_escalates_to_failover(self, harness):
+        assert harness.tick_with_usage(self._HELD) is TickOutcome.NO_ACTION
+        harness.clock.advance(IDLE_HOLD_MAX_S + 1)
+        # Past the cap the sentinel counts as unhealthy again → failover after
+        # unhealthy_ticks (3) consecutive ticks.
+        assert harness.tick_with_usage(self._HELD) is TickOutcome.NO_ACTION
+        assert harness.tick_with_usage(self._HELD) is TickOutcome.NO_ACTION
+        assert harness.tick_with_usage(self._HELD) is TickOutcome.SWITCHED
+        switch = next(e for e in harness.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "failover"
+
+    def test_recovery_resets_the_hold_clock(self, harness):
+        healthy = {"1": _usage(50), "2": _usage(10), "3": _usage(20)}
+        harness.tick_with_usage(self._HELD)
+        harness.clock.advance(IDLE_HOLD_MAX_S - 60)
+        harness.tick_with_usage(healthy)  # user came back; token refreshed
+        harness.clock.advance(120)
+        # New expiry long after: the hold clock restarted, so still held.
+        assert harness.tick_with_usage(self._HELD) is TickOutcome.NO_ACTION
+        assert harness.engine._unhealthy_ticks == 0
+        assert harness.active_number() == 1
+
+    def test_plain_fetch_failure_still_counts_unhealthy(self, harness):
+        # A None (network failure / dead creds) is NOT the idle sentinel:
+        # unhealthy counting and the hold clock reset both apply.
+        harness.tick_with_usage(self._HELD)
+        unknown = {"1": None, "2": _usage(10), "3": _usage(20)}
+        assert harness.tick_with_usage(unknown) is TickOutcome.NO_ACTION
+        assert harness.engine._unhealthy_ticks == 1
+        assert harness.engine._idle_hold_since is None
 
 
 class TestApiKeyAccounts:

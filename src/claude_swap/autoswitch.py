@@ -32,6 +32,7 @@ from __future__ import annotations
 import enum
 import hashlib
 import json
+import logging
 import random
 import threading
 import time
@@ -43,13 +44,15 @@ from typing import ClassVar
 
 from claude_swap import oauth
 from claude_swap.exceptions import ClaudeSwitchError
-from claude_swap.json_output import SCHEMA_VERSION
+from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
 from claude_swap.locking import FileLock
 from claude_swap.settings import AutoSwitchSettings, atomic_write_json
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 STATE_FILENAME = "autoswitch_state.json"
 STATE_SCHEMA_VERSION = 1
+
+_logger = logging.getLogger("claude-swap")
 
 # Freshen targets whose access token expires within this window: twice Claude
 # Code's own 5-minute refresh buffer, so its post-lock "abort refresh if not
@@ -62,6 +65,13 @@ FRESHEN_BUFFER_MS = 10 * 60 * 1000
 RESET_SLACK_S = 60.0
 MAX_SLEEP_S = 6 * 3600.0
 NO_RESET_FALLBACK_S = 300.0
+
+# Idle-hold cap (elapsed, not ticks — the hold itself slows the cadence to
+# NO_RESET_FALLBACK_S): an owned-and-expired token normally means Claude Code
+# is idle and will self-heal on next use, but a *dead* refresh token with an
+# active user would look identical forever, so after this long the engine
+# falls back to normal unhealthy counting.
+IDLE_HOLD_MAX_S = 30 * 60.0
 
 
 def _now_iso() -> str:
@@ -305,6 +315,12 @@ class AutoSwitchEngine:
         # longer than the normal interval.
         self._sleep_until_ts: float | None = None
         self._blocked_wait_long = False
+        # Idle-hold: when the active token expired while Claude Code owns it
+        # (and is therefore idle), crawl instead of counting unhealthy ticks.
+        # ``_idle_hold_since`` survives across ticks (elapsed-time cap);
+        # ``_idle_hold_slow`` is per-tick like ``_blocked_wait_long``.
+        self._idle_hold_since: float | None = None
+        self._idle_hold_slow = False
 
     # -- state file ---------------------------------------------------------
 
@@ -448,6 +464,7 @@ class AutoSwitchEngine:
     def _tick_inner(self) -> TickOutcome:
         self._sleep_until_ts = None
         self._blocked_wait_long = False
+        self._idle_hold_slow = False
         settings = self.settings
         state = self._read_state()
         if not self.dry_run:
@@ -515,6 +532,7 @@ class AutoSwitchEngine:
         active_headroom = headroom.get(current)
         if active_headroom is not None:
             self._unhealthy_ticks = 0
+            self._idle_hold_since = None
             utilization = 100.0 - active_headroom
             if utilization < settings.threshold:
                 self._emit(
@@ -526,6 +544,39 @@ class AutoSwitchEngine:
                 return TickOutcome.NO_ACTION
             trigger = "at-limit" if active_headroom <= 0 else "proactive"
         else:
+            if usage.get(current) == USAGE_TOKEN_EXPIRED:
+                # Expired while an owner (Claude Code / live session) holds the
+                # credential: CC refreshes on every API request, so expired +
+                # owner present proves Claude has been idle since expiry — no
+                # quota burn, nothing to switch for. Self-heals on next use;
+                # crawl slowly instead of burning failover ticks (Finding 2 of
+                # the usage-lapse investigation).
+                now = self.clock()
+                if self._idle_hold_since is None:
+                    self._idle_hold_since = now
+                if now - self._idle_hold_since <= IDLE_HOLD_MAX_S:
+                    self._unhealthy_ticks = 0
+                    self._idle_hold_slow = True
+                    self._emit(
+                        NoSwitchEvent(
+                            reason="active-idle",
+                            detail=(
+                                "token expired while Claude Code is idle; "
+                                "resumes on next use"
+                            ),
+                        )
+                    )
+                    return TickOutcome.NO_ACTION
+                # Held far longer than any idle nap should need — likely a
+                # dead refresh token with an *active* user. Fall through to
+                # normal unhealthy counting so failover can still happen.
+                _logger.warning(
+                    "Active token expired and owned for over %.0f minutes; "
+                    "resuming unhealthy counting (dead refresh token?)",
+                    IDLE_HOLD_MAX_S / 60,
+                )
+            else:
+                self._idle_hold_since = None
             self._unhealthy_ticks += 1
             if self._unhealthy_ticks < settings.unhealthy_ticks:
                 self._emit(
@@ -767,6 +818,11 @@ class AutoSwitchEngine:
             # Blocked on something that can resolve any tick (hysteresis,
             # unreadable usage) — keep the normal cadence so the at-limit
             # escape isn't missed.
+        elif outcome is TickOutcome.NO_ACTION and self._idle_hold_slow:
+            # Idle-hold: Claude is idle on an expired token — nothing changes
+            # until the user comes back, so crawl. Worst case protection
+            # resumes one slow tick after they do.
+            return max(interval, NO_RESET_FALLBACK_S)
         # ±10% jitter so multiple machines don't synchronize their API hits.
         return interval * (0.9 + 0.2 * random.random())
 

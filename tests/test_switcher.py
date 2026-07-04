@@ -13,6 +13,7 @@ import pytest
 
 from claude_swap import macos_keychain
 from claude_swap import oauth
+from claude_swap.json_output import USAGE_TOKEN_EXPIRED
 from claude_swap.exceptions import (
     AccountNotFoundError,
     ConfigError,
@@ -816,12 +817,12 @@ class TestActiveAccountRefresh:
              patch.object(switcher, "_active_cc_running", return_value=True), \
              patch.object(switcher, "_live_session_pids", return_value=[]), \
              patch.object(switcher, "_write_credentials") as write_live, \
-             patch("claude_swap.oauth.try_fetch_usage_for_account",
-                   return_value=oauth.UsageOutcome(None)) as mock_fetch:
+             patch("claude_swap.oauth.try_fetch_usage_for_account") as mock_fetch:
             result = switcher._fetch_active_usage("1", "test@example.com", self._EXPIRED)
 
         assert result.sentinel == USAGE_TOKEN_EXPIRED
-        assert mock_fetch.call_args.kwargs.get("is_active") is True
+        # Owned + locally expired → the request would just 401, so none is made.
+        mock_fetch.assert_not_called()
         write_live.assert_not_called()
 
     def test_live_session_blocks_refresh(
@@ -834,11 +835,13 @@ class TestActiveAccountRefresh:
              patch.object(switcher, "_active_cc_running", return_value=False), \
              patch.object(switcher, "_live_session_pids", return_value=[4242]), \
              patch.object(switcher, "_write_credentials") as write_live, \
-             patch("claude_swap.oauth.try_fetch_usage_for_account",
-                   return_value=oauth.UsageOutcome(None)) as mock_fetch:
-            switcher._fetch_active_usage("1", "test@example.com", self._EXPIRED)
+             patch("claude_swap.oauth.try_fetch_usage_for_account") as mock_fetch:
+            result = switcher._fetch_active_usage("1", "test@example.com", self._EXPIRED)
 
-        assert mock_fetch.call_args.kwargs.get("is_active") is True
+        # Session owns the credential + token expired → sentinel, no request,
+        # and certainly no refresh write.
+        assert result.sentinel == USAGE_TOKEN_EXPIRED
+        mock_fetch.assert_not_called()
         write_live.assert_not_called()
 
     def test_lineage_mismatch_skips_write_and_reports_token_expired(
@@ -912,11 +915,13 @@ class TestActiveAccountRefresh:
              patch("claude_swap.switcher.get_running_instances", side_effect=OSError("boom")), \
              patch.object(switcher, "_live_session_pids", return_value=[]), \
              patch.object(switcher, "_write_credentials") as write_live, \
-             patch("claude_swap.oauth.try_fetch_usage_for_account",
-                   return_value=oauth.UsageOutcome(None)) as mock_fetch:
-            switcher._fetch_active_usage("1", "test@example.com", self._EXPIRED)
+             patch("claude_swap.oauth.try_fetch_usage_for_account") as mock_fetch:
+            result = switcher._fetch_active_usage("1", "test@example.com", self._EXPIRED)
 
-        assert mock_fetch.call_args.kwargs.get("is_active") is True
+        # Fails closed: assumed owner + expired token → sentinel, no request,
+        # no refresh write.
+        assert result.sentinel == USAGE_TOKEN_EXPIRED
+        mock_fetch.assert_not_called()
         write_live.assert_not_called()
 
     def test_refresh_network_call_does_not_hold_the_lock(
