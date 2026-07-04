@@ -96,6 +96,16 @@ Release version is defined in `pyproject.toml` (currently `0.16.0b1+haotool.1`).
   cache row masks this cycle's failed usage fetch, the monitor holds instead
   of switching on a pct that may be arbitrarily old, and switches only once
   a fresh fetch succeeds.
+- **A lost pending-rotation recovery race is quiet:** when two concurrent
+  passes race to recover the same parked rotation, the loser's read of the
+  already-consumed file logs at debug instead of warning "Discarding
+  unreadable pending credential rotation" over a rotation that was in fact
+  applied.
+- **An honored Retry-After no longer reads as a wake gap:** the wake-gap
+  detector accounts for the interval the monitor was told to sleep, so
+  honoring a long server backoff (up to 300s > the 4x poll-ceiling window)
+  no longer resets the failure count and velocity baseline on wake. A real
+  machine sleep past the planned interval still resets.
 
 ### Changed
 
@@ -118,6 +128,21 @@ Release version is defined in `pyproject.toml` (currently `0.16.0b1+haotool.1`).
   sequence-store `AutoSwitchConfig` dataclass instead of a `dict[str, Any]`,
   so the monitor, CLI, and TUI read `.enabled` / `.threshold` under
   mypy-strict. Internal typing only — no behavior change.
+- **Monitor's sequence seam is typed:** the `MonitorHost` protocol and
+  `usage_policy.pick_best_from_snapshots` consume the sequence-store
+  `SequenceData` view instead of a raw `dict[str, Any]`. The raw-dict shim
+  remains for the list/migration/transfer consumers. Internal typing only —
+  no behavior change.
+- **Test suite reorganized:** the two largest test files were split by
+  feature (switch path, broken-slot resilience, add-account, org migration,
+  purge, monitor PID lifecycle, poll cadence) and the obvious copy-paste
+  tables converted to `pytest.mark.parametrize`. No assertion was removed;
+  coverage is unchanged.
+- **CI registers a real scheduled task on Windows:** a new
+  `windows-task-scheduler` job round-trips the production task XML through
+  `Register-ScheduledTask` under a run-unique name (no `Start-ScheduledTask`)
+  and asserts it queries back as loaded before unregistering. Marked
+  `continue-on-error` until its first green run.
 
 ## [0.15.1+haotool.1] — 2026-07-03
 
