@@ -267,6 +267,10 @@ class CredentialRefresher:
                         account_num,
                         _BACKUP_CREDENTIAL_VERIFY_ATTEMPTS,
                     )
+                    # This final write is deliberately unverified: read-back
+                    # cannot converge while live keeps rotating, and a real
+                    # storage fault here still surfaces as mode 1 on the next
+                    # locked sync over this slot.
                     self._sw._write_account_credentials(account_num, email, live_now)
                     return live_now
                 raise CredentialWriteError(

@@ -969,6 +969,11 @@ def _cmdline_is_monitor_holder(cmd: str) -> bool:
     anywhere in the command line would mistake a recycled PID running e.g.
     ``vim claude-swap.py`` or ``less notes-on-monitor.txt`` for the holder
     and refuse to start a monitor.
+
+    A recycled PID that lands on an *unrelated* cswap invocation still reads
+    as the holder — accepted conservative bias: the TUI monitor's argv is
+    bare ``cswap``, so flags can't disambiguate, and refusing a redundant
+    start is recoverable while running two monitors is not.
     """
     tokens = _split_command_line(cmd)
     if not tokens:
