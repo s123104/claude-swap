@@ -24,6 +24,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from claude_swap import macos_keychain
+from claude_swap.locking import FileLock
 from claude_swap.models import Platform
 from claude_swap.switcher import ClaudeAccountSwitcher
 
@@ -253,3 +254,47 @@ class TestSyncFreshnessGate:
         stored = sw._read_account_credentials("1", "user@example.com")
         assert json.loads(stored)["claudeAiOauth"]["refreshToken"] == "rt-rotated"
         capsys.readouterr()
+
+
+class TestSyncNeverRaises:
+    """The sync is opportunistic: a busy lock must degrade to a warning, not
+    escape as LockError and kill the caller (--list/--status/TUI)."""
+
+    def test_busy_lock_logs_warning_and_leaves_backup_untouched(
+        self, temp_home: Path, caplog
+    ):
+        """A concurrent switch legitimately holds the file lock past the sync's
+        acquire timeout (in-lock network refresh); sync_live_to_backup promises
+        'never raises' for exactly this — the sync retries on the next list."""
+        sw = _seed_switcher(
+            temp_home,
+            {"1": "user@example.com"},
+            active=1,
+            live_email="user@example.com",
+        )
+        sw.platform = Platform.LINUX
+        old_backup = _oauth_creds("old", expires_in_s=60)
+        live_rotated = _oauth_creds("rotated", expires_in_s=7200)
+        sw._write_account_credentials("1", "user@example.com", old_backup)
+
+        blocker = FileLock(sw.lock_file)
+        assert blocker.acquire()
+        try:
+            with (
+                patch(
+                    "claude_swap.credential_refresh.FileLock",
+                    side_effect=lambda p: FileLock(p, timeout=0.1),
+                ),
+                caplog.at_level(logging.WARNING, logger="claude-swap"),
+            ):
+                sw._refresher.sync_live_to_backup(
+                    "1", "user@example.com", live_rotated,
+                )
+        finally:
+            blocker.release()
+
+        assert sw._read_account_credentials("1", "user@example.com") == old_backup
+        assert any(
+            "Failed to sync live credentials for account 1" in r.getMessage()
+            for r in caplog.records
+        ), [r.getMessage() for r in caplog.records]

@@ -27,7 +27,7 @@ import pytest
 
 from claude_swap.credential_refresh import CredentialRefresher
 from claude_swap.credentials import CredentialStore
-from claude_swap.exceptions import CredentialWriteError, LockError
+from claude_swap.exceptions import CredentialWriteError
 from claude_swap.locking import FileLock
 from claude_swap.models import Platform
 
@@ -226,14 +226,40 @@ class TestCredentialRefresherLocking:
 
         assert lock_held_during_write["value"] is True
 
-    def test_sync_live_to_backup_waits_when_lock_contended(self, tmp_path: Path):
+    def test_sync_live_to_backup_never_raises_when_lock_contended(
+        self, tmp_path: Path, caplog
+    ):
+        """A busy lock degrades the opportunistic sync to a warning.
+
+        A concurrent switch legitimately holds the lock past the acquire
+        timeout (in-lock network refresh); letting LockError escape here
+        killed every --list/--status that raced it. The sync retries on the
+        next list pass, so warn-and-skip loses nothing.
+        """
         host = _refresher_host(tmp_path)
+        host._store[("1", "a@example.com")] = _oauth_creds("old-backup")
         refresher = CredentialRefresher(host)
         host._live["creds"] = _oauth_creds("rotated-live")
 
         with FileLock(host.lock_file):
-            with pytest.raises(LockError):
-                refresher.sync_live_to_backup("1", "a@example.com", host._live["creds"])
+            with (
+                patch(
+                    "claude_swap.credential_refresh.FileLock",
+                    side_effect=lambda p: FileLock(p, timeout=0.1),
+                ),
+                caplog.at_level(
+                    logging.WARNING, logger="test.credential_refresh"
+                ),
+            ):
+                refresher.sync_live_to_backup(
+                    "1", "a@example.com", host._live["creds"]
+                )
+
+        assert host._store[("1", "a@example.com")] == _oauth_creds("old-backup")
+        assert any(
+            "Failed to sync live credentials for account 1" in r.getMessage()
+            for r in caplog.records
+        ), [r.getMessage() for r in caplog.records]
 
     def test_refresh_inactive_does_not_hold_lock_during_network_refresh(
         self,

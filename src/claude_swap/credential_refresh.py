@@ -25,6 +25,7 @@ from claude_swap.credentials import pending_rotation_path
 from claude_swap.exceptions import (
     CredentialReadError,
     CredentialWriteError,
+    LockError,
     SwitchError,
 )
 from claude_swap.locking import FileLock
@@ -345,7 +346,7 @@ class CredentialRefresher:
                     assume_locked=True,
                 )
             self._sw._logger.info("Synced refreshed live credentials for account %s", account_num)
-        except (CredentialReadError, CredentialWriteError, OSError) as exc:
+        except (CredentialReadError, CredentialWriteError, LockError, OSError) as exc:
             self._sw._logger.warning(
                 "Failed to sync live credentials for account %s (%s): %r",
                 account_num,
