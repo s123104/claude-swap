@@ -910,7 +910,7 @@ class AutoSwitchEngine:
             self._update_poll_plans(candidates, pre, entries, now)
         return entries, usage, headroom
 
-    def _active_poll_interval_s(self, entry) -> float:
+    def _active_poll_interval_s(self, entry: UsageEntry) -> float:
         """Stepwise active cadence by distance to the escalation band.
 
         Unknown utilization or in-band → every tick (the at-limit escape and
