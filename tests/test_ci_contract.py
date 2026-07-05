@@ -37,3 +37,13 @@ def test_ci_has_linux_systemd_round_trip() -> None:
 
     assert "linux-systemd:" in workflow
     assert "systemctl --user is-active cswap-monitor.service" in workflow
+
+
+def test_ci_has_redirected_list_smoke() -> None:
+    # `cswap --list > file` under a CJK console CP (Windows) and the C
+    # locale (Linux) is the UnicodeEncodeError regression surface; both
+    # variants must stay wired to the real CLI, not just unit tests.
+    workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
+
+    assert "chcp 950 & cswap --list > out.txt" in workflow
+    assert "LC_ALL=C uv run cswap --list > out.txt" in workflow
