@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 
@@ -22,10 +23,13 @@ def test_ci_mypy_gate_covers_win32_platform_branches() -> None:
 def test_ci_windows_task_scheduler_job_is_blocking() -> None:
     # The registration round-trip and the start smoke are the only real
     # Task Scheduler coverage; continue-on-error would silently waive both.
+    # Scoped to this job so a justified waiver elsewhere stays possible.
     workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
 
-    assert "continue-on-error" not in workflow
-    assert "Start-Sleep" in workflow
+    job = re.search(r"^  windows-task-scheduler:.*?(?=^  \S|\Z)", workflow, re.M | re.S)
+    assert job is not None
+    assert "continue-on-error" not in job.group(0)
+    assert "Start-Sleep" in job.group(0)
 
 
 def test_ci_has_linux_systemd_round_trip() -> None:
