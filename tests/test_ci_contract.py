@@ -32,8 +32,39 @@ def test_ci_windows_task_scheduler_job_is_blocking() -> None:
     assert "Start-Sleep" in job.group(0)
 
 
+def test_ci_task_scheduler_covers_spaced_interpreter_path() -> None:
+    # The <Command> quoting branch in _build_task_xml only runs when the
+    # interpreter path has a space; the stock runner Python never does, so
+    # the spaced-venv smoke is its only behavioral coverage.
+    workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
+
+    assert "C:\\spaced dir\\venv" in workflow
+
+
 def test_ci_has_linux_systemd_round_trip() -> None:
     workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
 
     assert "linux-systemd:" in workflow
     assert "systemctl --user is-active cswap-monitor.service" in workflow
+
+
+def test_ci_has_wsl_systemd_round_trip() -> None:
+    # The WSL path has no other automated window: the preflight wsl.conf
+    # guidance (systemd off) and the real install/is-active/uninstall cycle
+    # with the keepalive note (systemd on) must both stay wired.
+    workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
+
+    assert "wsl-systemd:" in workflow
+    assert "Vampire/setup-wsl" in workflow
+    assert 'grep -q "/etc/wsl.conf"' in workflow
+    assert 'grep -q "sleep infinity"' in workflow
+
+
+def test_ci_has_redirected_list_smoke() -> None:
+    # `cswap --list > file` under a CJK console CP (Windows) and the C
+    # locale (Linux) is the UnicodeEncodeError regression surface; both
+    # variants must stay wired to the real CLI, not just unit tests.
+    workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
+
+    assert "chcp 950 & cswap --list > out.txt" in workflow
+    assert "LC_ALL=C uv run cswap --list > out.txt" in workflow

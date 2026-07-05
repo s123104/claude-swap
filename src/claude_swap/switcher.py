@@ -36,7 +36,7 @@ from claude_swap.credentials import (
 from claude_swap.locking import FileLock
 from claude_swap.logging_config import setup_logging
 from claude_swap.models import (
-    _ONLY_ONE_ACCOUNT_MSG,
+    ONLY_ONE_ACCOUNT_MSG,
     ManualSwitchIntent,
     Platform,
     SwitchIntent,
@@ -45,7 +45,6 @@ from claude_swap.models import (
     SwitchTransaction,
     get_timestamp,
 )
-from claude_swap.switch_cli import run_switch_cli
 from claude_swap.printer import (
     accent,
     dimmed,
@@ -65,6 +64,7 @@ from claude_swap.sequence_store import (
     SequenceData,
     SequenceStore,
 )
+from claude_swap.switch_cli import run_switch_cli
 from claude_swap.usage_policy import headroom, rank_headroom_best
 from claude_swap.usage_store import UsageEntry, UsageStore
 from typing import Any, cast
@@ -77,6 +77,7 @@ KEYRING_SERVICE = "claude-code"
 # Setup-tokens are inference-only server-side; wider scopes trigger 403s
 # on profile endpoints. Matches Claude Code's CLAUDE_CODE_OAUTH_TOKEN path.
 SETUP_TOKEN_SCOPES = ("user:inference",)
+
 
 def _sweep_legacy_keyring(usernames: list[str], removed_items: list[str]) -> None:
     """Best-effort purge of legacy ``KEYRING_SERVICE`` entries via ``keyring``.
@@ -1761,8 +1762,8 @@ class ClaudeAccountSwitcher:
 
         if preconditions.kind == SwitchPreconditionKind.SINGLE_ACCOUNT:
             if quiet:
-                raise SwitchError(_ONLY_ONE_ACCOUNT_MSG)
-            print(dimmed(_ONLY_ONE_ACCOUNT_MSG))
+                raise SwitchError(ONLY_ONE_ACCOUNT_MSG)
+            print(dimmed(ONLY_ONE_ACCOUNT_MSG))
             return False
 
         active_account = data.get("activeAccountNumber")

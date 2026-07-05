@@ -81,6 +81,18 @@ jobs:
             --ignore=tests/test_macos_keychain.py \
             --ignore=tests/test_macos_keychain_contract.py
 
+      - name: Redirected --list smoke (POSIX C locale)
+        # LC_ALL=C is the non-UTF-8 worst case for a redirected stream; the
+        # fresh runner has no accounts, so the no-account path must exit 0
+        # and the redirect must carry the guidance text — never a
+        # UnicodeEncodeError traceback (test matrix L-3).
+        if: runner.os == 'Linux'
+        run: |
+          LC_ALL=C uv run cswap --list > out.txt 2>&1
+          cat out.txt
+          if grep -q "UnicodeEncodeError" out.txt; then exit 1; fi
+          grep -q "No accounts are managed yet." out.txt
+
   test-windows:
     runs-on: windows-latest
 
@@ -116,6 +128,22 @@ jobs:
         # else — like an empty stderr — fails the step.
         shell: cmd
         run: chcp 850 & python -c "from claude_swap.service_spec import run_service_command; p = run_service_command(['powershell', '-NoProfile', '-Command', '[Console]::Error.WriteLine([char]252); exit 3'], check=False); assert p.returncode == 3, (p.returncode, p.stdout, p.stderr); assert '\u00fc' in p.stderr or '\ufffd' in p.stderr, repr(p.stderr); print('decoded stderr:', repr(p.stderr))"
+
+      - name: Redirected --list smoke (cp950 console)
+        # chcp only moves the console codepage — the ANSI codepage a
+        # redirected stream encodes with would need a system locale change,
+        # which is out of a runner's reach — but it still runs the CLI under
+        # a CJK console CP on real Windows. The fresh runner has no
+        # accounts, so the no-account path must exit 0 and the redirect
+        # must carry the guidance text, never a UnicodeEncodeError
+        # traceback (test matrix W-4).
+        shell: cmd
+        run: |
+          chcp 950 & cswap --list > out.txt 2>&1
+          if %errorlevel% neq 0 exit /b 1
+          type out.txt
+          findstr /C:"UnicodeEncodeError" out.txt && exit /b 1
+          findstr /C:"No accounts are managed yet." out.txt
 
   windows-task-scheduler:
     runs-on: windows-latest
@@ -159,6 +187,36 @@ jobs:
             exit 1
           }
 
+      - name: Spaced-path venv install + start smoke
+        # The conditional <Command> quoting in _build_task_xml only executes
+        # when the interpreter path contains a space, and the runner's stock
+        # Python never does — this venv under "C:\spaced dir" is the only
+        # behavioral coverage of that branch (test matrix W-3). Same
+        # skeleton as the smoke above: install through the spaced venv,
+        # pin the registered <Command> to the quoted form, then assert Task
+        # Scheduler saw the engine launch (2147942402 = file not found is
+        # exactly how an unquoted spaced path fails).
+        shell: pwsh
+        run: |
+          python -m venv "C:\spaced dir\venv"
+          & "C:\spaced dir\venv\Scripts\python.exe" -m pip install -e .
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          & "C:\spaced dir\venv\Scripts\cswap.exe" service install
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $xml = Export-ScheduledTask -TaskName "cswap-monitor" | Out-String
+          $command = ([xml]$xml).Task.Actions.Exec.Command
+          if ($command -ne '"C:\spaced dir\venv\Scripts\pythonw.exe"') {
+            Write-Error "unquoted or unexpected Command: $command"
+            exit 1
+          }
+          Start-Sleep -Seconds 15
+          $result = (Get-ScheduledTaskInfo -TaskName "cswap-monitor").LastTaskResult
+          & "C:\spaced dir\venv\Scripts\cswap.exe" service uninstall
+          if ($result -notin 0, 267009) {
+            Write-Error "engine did not run cleanly from the spaced venv: LastTaskResult=$result"
+            exit 1
+          }
+
       - name: Sweep any leftover CI task
         # Backstop for a crashed pytest process; the test's own try/finally
         # covers ordinary assertion failures.
@@ -171,6 +229,84 @@ jobs:
           Stop-ScheduledTask -TaskName cswap-monitor -ErrorAction SilentlyContinue
           Unregister-ScheduledTask -TaskName cswap-monitor -Confirm:$false -ErrorAction SilentlyContinue
           exit 0
+
+  wsl-systemd:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: Vampire/setup-wsl@v7
+        with:
+          distribution: Ubuntu-24.04
+          # Ubuntu-24.04 ships systemd=true in its default wsl.conf (this
+          # input overwrites the whole file); pin it off so the preflight
+          # phase below is deterministic regardless of image defaults.
+          wsl-conf: |
+            [boot]
+            systemd=false
+
+      - name: Restart WSL so the pinned wsl.conf applies
+        # setup-wsl may boot the distro before writing wsl.conf; only the
+        # next boot is guaranteed to run with systemd off.
+        shell: pwsh
+        run: wsl.exe --shutdown
+
+      - name: Install cswap into a WSL venv
+        # PEP 668 marks the system interpreter externally managed on
+        # Ubuntu 24.04, so the editable install goes into a venv.
+        shell: wsl-bash {0}
+        run: |
+          apt-get update
+          apt-get install -y python3-venv
+          python3 -m venv ~/venv
+          ~/venv/bin/pip install -e .
+
+      - name: Preflight guidance without systemd
+        # With systemd off, `cswap service install` must exit 1 with the
+        # wsl.conf recipe — not a bare traceback (test matrix WSL-1).
+        shell: wsl-bash {0}
+        run: |
+          cat /proc/1/comm
+          rc=0
+          out=$(~/venv/bin/cswap service install 2>&1) || rc=$?
+          echo "$out"
+          [ "$rc" -eq 1 ]
+          echo "$out" | grep -q "/etc/wsl.conf"
+          echo "$out" | grep -q "systemd=true"
+          ! echo "$out" | grep -q "Traceback"
+
+      - name: Enable systemd in wsl.conf
+        shell: wsl-bash {0}
+        run: printf '[boot]\nsystemd=true\n' > /etc/wsl.conf
+
+      - name: Restart WSL into systemd
+        shell: pwsh
+        run: wsl.exe --shutdown
+
+      - name: systemd --user round-trip + WSL keepalive note
+        # The linux-systemd cycle, but under real WSL (test matrix WSL-2):
+        # install → is-active → uninstall against the per-user manager,
+        # plus the WSL-only keepalive note — MS documents that systemd
+        # services do not keep a WSL instance alive, so install must print
+        # the `sleep infinity` Task Scheduler guidance. The runner session
+        # has no login manager for this user, so linger + XDG_RUNTIME_DIR
+        # is set up first, exactly as the preflight error message advises.
+        shell: wsl-bash {0}
+        run: |
+          [ "$(cat /proc/1/comm)" = "systemd" ]
+          loginctl enable-linger "$(id -un)"
+          for _ in $(seq 1 30); do [ -S "/run/user/$(id -u)/bus" ] && break; sleep 1; done
+          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+          out=$(~/venv/bin/cswap service install 2>&1) || { echo "$out"; exit 1; }
+          echo "$out"
+          echo "$out" | grep -q "sleep infinity"
+          sleep 5
+          systemctl --user is-active cswap-monitor.service
+          ~/venv/bin/cswap service status
+          ~/venv/bin/cswap service uninstall
+          ! systemctl --user is-active --quiet cswap-monitor.service
 
   linux-systemd:
     runs-on: ubuntu-latest

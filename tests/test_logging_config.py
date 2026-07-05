@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -77,6 +78,50 @@ def test_blocked_rollover_keeps_logging(
         assert "first record" in text
         assert "second record" in text
         assert not (tmp_path / "logs" / "claude-swap.log.1").exists()
+    finally:
+        handler.close()
+        logger.removeHandler(handler)
+
+
+def test_rollover_tolerates_second_handle_on_real_os(tmp_path: Path):
+    """Rollover behavior with a concurrent handle, against the real OS.
+
+    test_blocked_rollover_keeps_logging fakes os.rename; this one holds a
+    second open handle on the log — the production shape of the engine and
+    a concurrent CLI sharing the file — and lets the OS decide. On Windows
+    the rename raises a real sharing violation, so no backup may appear and
+    every record must still land in the main file. On POSIX renaming an
+    open file is legal, so the size cap must produce a normal rollover.
+    """
+    log_file = tmp_path / "logs" / "claude-swap.log"
+    handler = _LazyDirRotatingFileHandler(
+        log_file, maxBytes=1024, backupCount=3, delay=True
+    )
+    logger = logging.getLogger("claude-swap-real-rollover-test")
+    logger.setLevel(logging.INFO)
+    logger.addHandler(handler)
+    try:
+        logger.info("prime the file so it exists before the second handle")
+        with open(log_file, encoding="utf-8"):
+            # ~100 bytes per formatted record and maxBytes=1024: several
+            # rollover attempts happen while the handle is held.
+            for i in range(100):
+                logger.info("record %03d: %s", i, "x" * 64)
+            handler.flush()
+
+        backup = tmp_path / "logs" / "claude-swap.log.1"
+        text = log_file.read_text(encoding="utf-8")
+        if sys.platform == "win32":
+            # Sharing violation path: rollover is refused, yet no record may
+            # be dropped — the handler reopens and keeps appending.
+            assert not backup.exists()
+            assert "record 000" in text
+            assert "record 099" in text
+        else:
+            # flock-free POSIX rename: the cap must actually rotate, and the
+            # newest record lives in the fresh main file.
+            assert backup.exists()
+            assert "record 099" in text
     finally:
         handler.close()
         logger.removeHandler(handler)
