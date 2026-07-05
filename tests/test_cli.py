@@ -211,7 +211,7 @@ class TestCLI:
         with (
             patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls,
             patch.object(sys, "argv", ["claude-swap", "--health"]),
-            patch("os.geteuid", return_value=1000),
+            patch("os.geteuid", return_value=1000, create=True),
             patch("claude_swap.update_check.check_for_update", return_value=None),
         ):
             cli.main()
@@ -226,7 +226,7 @@ class TestCLI:
         with (
             patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls,
             patch.object(sys, "argv", ["claude-swap", "--health", "--token-status"]),
-            patch("os.geteuid", return_value=1000),
+            patch("os.geteuid", return_value=1000, create=True),
             patch("claude_swap.update_check.check_for_update", return_value=None),
         ):
             cli.main()

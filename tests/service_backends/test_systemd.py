@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from unittest.mock import MagicMock
 
 import pytest
@@ -78,7 +78,13 @@ class TestIsWsl:
 
 
 class TestBuildUnit:
-    def test_execstart_uses_program_arguments(self, temp_home: Path):
+    def test_execstart_uses_program_arguments(
+        self, temp_home: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        # Pin a POSIX interpreter path: a native Windows sys.executable
+        # would be backslash-escaped by the unit quoting rules, and
+        # building a systemd unit on win32 is not a real scenario anyway.
+        monkeypatch.setattr(sys, "executable", "/usr/bin/python3")
         switcher = ClaudeAccountSwitcher()
         unit = systemd_backend._build_unit(switcher)
         assert f"ExecStart={sys.executable}" in unit.replace('"', "")
@@ -247,13 +253,19 @@ class TestInstall:
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture,
     ):
-        # CLAUDE_CONFIG_DIR on /mnt/<drive> means the session PID files hold
+        # A config home on /mnt/<drive> means the session PID files hold
         # Windows PIDs, invisible to WSL's PID namespace — the engine would
         # judge every Windows-side session dead. Say so once at install.
+        # PurePosixPath keeps the /mnt prefix intact on every test host
+        # (Path would render it with backslashes on Windows).
         _force_linux(monkeypatch)
         config_home = temp_home / ".config"
         monkeypatch.setenv("XDG_CONFIG_HOME", str(config_home))
-        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/mnt/c/Users/dev/.claude")
+        monkeypatch.setattr(
+            systemd_backend,
+            "get_claude_config_home",
+            lambda: PurePosixPath("/mnt/c/Users/dev/.claude"),
+        )
         monkeypatch.setattr(systemd_backend, "_pid1_is_systemd", lambda: True)
         monkeypatch.setattr(
             systemd_backend, "_unit_path", lambda: _unit_path(config_home)
@@ -304,7 +316,7 @@ class TestInstall:
         monkeypatch.setattr(
             systemd_backend,
             "get_backup_root",
-            lambda: Path("/mnt/c/tmp/xdg/claude-swap"),
+            lambda: PurePosixPath("/mnt/c/tmp/xdg/claude-swap"),
         )
 
         systemd_backend._print_wsl_guidance()

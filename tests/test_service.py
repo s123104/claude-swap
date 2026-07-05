@@ -94,6 +94,7 @@ class TestBuildPlist:
 # --------------------------------------------------------------------------- #
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="launchd backend is darwin-only")
 class TestInstall:
     def test_writes_parseable_plist_and_bootstraps(
         self,
@@ -234,6 +235,7 @@ class TestInstall:
         assert len(bootstrap_calls) == launchd._BOOTSTRAP_ATTEMPTS
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="launchd backend is darwin-only")
 class TestUninstall:
     def test_removes_plist_and_calls_bootout(
         self,
@@ -288,6 +290,7 @@ class TestUninstall:
 # --------------------------------------------------------------------------- #
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="launchd backend is darwin-only")
 class TestStatus:
     def test_service_state_not_installed(
         self, temp_home: Path, monkeypatch: pytest.MonkeyPatch
@@ -546,6 +549,7 @@ class TestPlatformGuard:
                 call()
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="launchd backend is darwin-only")
 class TestLaunchdBackendEdges:
     def test_launchctl_timeout_raises_actionable_error(
         self, monkeypatch: pytest.MonkeyPatch

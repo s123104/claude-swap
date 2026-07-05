@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -56,6 +57,10 @@ def test_account_credentials_file_round_trip(tmp_path: Path):
     assert store._read_account_credentials("1", "alice@example.com") == "secret-token"
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Windows permissions are ACLs; chmod only toggles the read-only bit",
+)
 def test_account_credentials_written_0600(tmp_path: Path):
     """Backup file lands with owner-only permissions (no umask window)."""
     host = _file_host(tmp_path)
