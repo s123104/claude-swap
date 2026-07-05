@@ -15,11 +15,11 @@ import getpass
 import os
 import re
 import subprocess
-import sys
 from pathlib import Path
 
 from claude_swap import service_spec
 from claude_swap.exceptions import ClaudeSwitchError
+from claude_swap.models import is_linux
 from claude_swap.paths import get_claude_config_home
 from claude_swap.printer import bolded, dimmed, muted, warning
 from claude_swap.protocols import ServiceHost, ServiceState
@@ -68,12 +68,12 @@ def _user_manager_available() -> bool:
 
 
 def _require_systemd() -> None:
-    if not sys.platform.startswith("linux"):
+    if not is_linux():
         raise ClaudeSwitchError(
             "cswap service (systemd) requires Linux or WSL. "
             "Use `cswap auto` in the foreground on this platform."
         )
-    if not _pid1_is_systemd():  # type: ignore[unreachable]
+    if not _pid1_is_systemd():
         raise ClaudeSwitchError(
             "systemd is not running as PID 1 on this system. "
             "On WSL2, enable user systemd in /etc/wsl.conf:\n"
