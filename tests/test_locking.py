@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import builtins
 import multiprocessing
+import os
+import sys
 import time
 from pathlib import Path
 
 import pytest
 
+from claude_swap import locking as locking_mod
 from claude_swap.exceptions import LockError
 from claude_swap.locking import FileLock
 
@@ -143,6 +146,58 @@ class TestFileLock:
 
         with FileLock(lock_path):
             assert lock_path.read_text() == "existing content"
+
+    def test_lock_error_carries_last_os_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A persistent failure must surface in the LockError message.
+
+        A held lock and broken ACLs on the lock directory time out
+        identically; without the last OS error the message misdiagnoses
+        both as "another instance may be running".
+        """
+        lock_path = tmp_path / ".lock"
+        real_open = builtins.open
+
+        def denied_open(file, *args, **kwargs):
+            if str(file) == str(lock_path):
+                raise PermissionError("lock dir ACL broken")
+            return real_open(file, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "open", denied_open)
+
+        with pytest.raises(LockError, match="lock dir ACL broken"):
+            with FileLock(lock_path, timeout=0.2):
+                pass
+
+    def test_windows_lock_anchors_byte_at_file_start(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """msvcrt locks at the current position and "a" opens at EOF.
+
+        The locked byte must be anchored at offset 0, or two processes
+        opening a non-empty lock file at different sizes would lock
+        different bytes and mutual exclusion would silently fail.
+        """
+        lock_path = tmp_path / ".lock"
+        lock_path.write_text("stale debris")
+        offsets: dict[int, int] = {}
+
+        class FakeMsvcrt:
+            LK_NBLCK = 2
+            LK_UNLCK = 0
+
+            @staticmethod
+            def locking(fd: int, mode: int, nbytes: int) -> None:
+                offsets[mode] = os.lseek(fd, 0, os.SEEK_CUR)
+
+        monkeypatch.setattr(sys, "platform", "win32")
+        monkeypatch.setattr(locking_mod, "msvcrt", FakeMsvcrt, raising=False)
+
+        lock = FileLock(lock_path)
+        assert lock.acquire(timeout=1.0) is True
+        lock.release()
+        assert offsets[FakeMsvcrt.LK_NBLCK] == 0
 
 
 def _hold_lock_process(lock_path: str, duration: float, ready_event, done_event):
