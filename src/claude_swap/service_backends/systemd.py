@@ -143,6 +143,11 @@ def _unescape_env_value(value: str) -> str:
         if char == "\\" and index + 1 < len(value):
             out.append(value[index + 1])
             index += 2
+        elif char == "%" and index + 1 < len(value) and value[index + 1] == "%":
+            # Escaping doubles % after the backslash pass, so every %% pair
+            # here denotes one literal % and never splits a \-escape.
+            out.append("%")
+            index += 2
         else:
             out.append(char)
             index += 1

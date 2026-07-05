@@ -752,6 +752,13 @@ class TestHelpers:
         assert systemd_backend._systemd_escape("has space %i") == '"has space %%i"'
         assert systemd_backend._systemd_escape_value("50%") == "50%%"
 
+    def test_env_value_escape_round_trips_percent(self):
+        # Writing doubles % after the backslash pass; reading must fold %%
+        # back or a re-read value drifts from what was installed.
+        for value in ("50%", "%", "100%%", '/pct%40/"dir"\\x', "%h %i"):
+            escaped = systemd_backend._systemd_escape_value(value)
+            assert systemd_backend._unescape_env_value(escaped) == value
+
     def test_unit_with_percent_in_env_value_is_escaped(
         self, temp_home: Path, monkeypatch: pytest.MonkeyPatch
     ):
