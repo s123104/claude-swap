@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 from claude_swap.json_output import account_ref
 from claude_swap.models import (
-    _ONLY_ONE_ACCOUNT_MSG,
+    ONLY_ONE_ACCOUNT_MSG,
     CliSwitchIntent,
     SwitchPreconditionKind,
     SwitchPreconditions,
@@ -177,9 +177,9 @@ class SwitchCliDispatcher:
                     strategy=strategy_label,
                     reason="only-one-account",
                     to_ref=account_ref(int(num), current_email) if num else None,
-                    message=_ONLY_ONE_ACCOUNT_MSG,
+                    message=ONLY_ONE_ACCOUNT_MSG,
                 )
-            print(dimmed(_ONLY_ONE_ACCOUNT_MSG))
+            print(dimmed(ONLY_ONE_ACCOUNT_MSG))
             return True, None
 
         return False, None

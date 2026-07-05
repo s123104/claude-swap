@@ -189,7 +189,7 @@ SwitchIntent = ManualSwitchIntent | CliSwitchIntent
 # Shared by the interactive switch() path and the JSON/strategy CLI path so the
 # single-account no-op reads the same everywhere. Lives here (not in switcher)
 # so switch_cli never has to import switcher at runtime.
-_ONLY_ONE_ACCOUNT_MSG = (
+ONLY_ONE_ACCOUNT_MSG = (
     "Only one account is managed. Add more accounts to switch between."
 )
 
