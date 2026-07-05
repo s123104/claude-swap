@@ -48,6 +48,18 @@ def test_ci_has_linux_systemd_round_trip() -> None:
     assert "systemctl --user is-active cswap-monitor.service" in workflow
 
 
+def test_ci_has_wsl_systemd_round_trip() -> None:
+    # The WSL path has no other automated window: the preflight wsl.conf
+    # guidance (systemd off) and the real install/is-active/uninstall cycle
+    # with the keepalive note (systemd on) must both stay wired.
+    workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
+
+    assert "wsl-systemd:" in workflow
+    assert "Vampire/setup-wsl" in workflow
+    assert 'grep -q "/etc/wsl.conf"' in workflow
+    assert 'grep -q "sleep infinity"' in workflow
+
+
 def test_ci_has_redirected_list_smoke() -> None:
     # `cswap --list > file` under a CJK console CP (Windows) and the C
     # locale (Linux) is the UnicodeEncodeError regression surface; both
