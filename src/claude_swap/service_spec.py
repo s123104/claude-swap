@@ -23,6 +23,8 @@ VERSION_ENV_KEY = "CSWAP_INSTALLED_VERSION"
 # wedge the CLI or the engine; these are short-lived management commands.
 SUBPROCESS_TIMEOUT = 10
 
+# Monitor-era names kept for installed-service compat: existing installs are
+# registered under these IDs, and renaming would orphan their plist/unit/task.
 SERVICE_LABEL = "com.claude-swap.monitor"
 SERVICE_ID = "cswap-monitor"
 
