@@ -93,7 +93,7 @@ class FileLock:
             # (e.g. broken ACLs on the lock directory) time out identically,
             # and only the errno tells them apart.
             detail = (
-                f" (last error: {self._last_error!r})" if self._last_error else ""
+                f" (last error: {self._last_error!s})" if self._last_error else ""
             )
             raise LockError(
                 f"Failed to acquire lock - another instance may be running{detail}"
