@@ -3,7 +3,10 @@
 Mirrors claude-code's own resolution so cswap reads and writes the same files
 claude-code does. Key rules (from claude-code source):
 
-- Config home: ``CLAUDE_CONFIG_DIR`` if set, else ``~/.claude``.
+- Config home: ``CLAUDE_CONFIG_DIR`` if set, else ``~/.claude``. The value is
+  used verbatim — claude-code performs no tilde expansion on it, so a literal
+  ``~`` names a ``./~`` directory for both tools (cswap warns once when it
+  sees one).
 - Global config: ``<config_home>/.config.json`` if it exists (legacy),
   otherwise ``(CLAUDE_CONFIG_DIR || $HOME)/.claude.json``. Note the asymmetry:
   ``.claude.json`` sits at homedir by default, not inside ``.claude/``.
@@ -21,6 +24,7 @@ References:
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 from pathlib import Path
@@ -28,14 +32,38 @@ from pathlib import Path
 from claude_swap.exceptions import MigrationError
 from claude_swap.models import Platform
 
+_logger = logging.getLogger("claude-swap")
+
 LEGACY_BACKUP_DIRNAME = ".claude-swap-backup"
+
+_warned_tilde_config_dir = False
+
+
+def _claude_config_dir_env() -> str | None:
+    """Return the raw ``CLAUDE_CONFIG_DIR`` value, warning once on a ``~``.
+
+    Claude Code uses the value verbatim, so cswap must too — expanding it
+    here would make cswap manage credentials Claude Code never reads. A
+    leading ``~`` almost always means the shell did not expand it.
+    """
+    global _warned_tilde_config_dir
+    env = os.environ.get("CLAUDE_CONFIG_DIR")
+    if env and env.startswith("~") and not _warned_tilde_config_dir:
+        _warned_tilde_config_dir = True
+        _logger.warning(
+            "CLAUDE_CONFIG_DIR starts with a literal '~' (%s); Claude Code "
+            "does not expand it, so cswap uses it verbatim too. Set an "
+            "absolute path if this is unintended.",
+            env,
+        )
+    return env
 
 
 def get_claude_config_home() -> Path:
     """Return the Claude config home directory (CLAUDE_CONFIG_DIR or ~/.claude)."""
-    env = os.environ.get("CLAUDE_CONFIG_DIR")
+    env = _claude_config_dir_env()
     if env:
-        return Path(env).expanduser()
+        return Path(env)
     return Path.home() / ".claude"
 
 
@@ -48,8 +76,8 @@ def get_global_config_path() -> Path:
     legacy = get_claude_config_home() / ".config.json"
     if legacy.exists():
         return legacy
-    env = os.environ.get("CLAUDE_CONFIG_DIR")
-    base = Path(env).expanduser() if env else Path.home()
+    env = _claude_config_dir_env()
+    base = Path(env) if env else Path.home()
     return base / ".claude.json"
 
 
