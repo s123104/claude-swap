@@ -22,8 +22,8 @@ from claude_swap.exceptions import (
 )
 from claude_swap.claude_locks import claude_config_lock, claude_credentials_lock
 from claude_swap.json_output import (
-    _slot_for_identity,
     account_ref,
+    slot_for_identity,
     switch_noop,
     switch_result_from_op,
 )
@@ -36,6 +36,7 @@ from claude_swap.credentials import (
 from claude_swap.locking import FileLock
 from claude_swap.logging_config import setup_logging
 from claude_swap.models import (
+    _ONLY_ONE_ACCOUNT_MSG,
     ManualSwitchIntent,
     Platform,
     SwitchIntent,
@@ -44,6 +45,7 @@ from claude_swap.models import (
     SwitchTransaction,
     get_timestamp,
 )
+from claude_swap.switch_cli import run_switch_cli
 from claude_swap.printer import (
     accent,
     dimmed,
@@ -57,17 +59,15 @@ from claude_swap.paths import (
     migrate_legacy_backup_dir,
 )
 from claude_swap.credential_refresh import CredentialRefresher
+from claude_swap.list_reporter import ListReporter, run_list, run_status
 from claude_swap.sequence_store import (
     AccountRecord,
     SequenceData,
     SequenceStore,
 )
-from claude_swap.usage_policy import headroom
+from claude_swap.usage_policy import headroom, rank_headroom_best
 from claude_swap.usage_store import UsageEntry, UsageStore
-from typing import TYPE_CHECKING, Any, cast
-
-if TYPE_CHECKING:
-    from claude_swap.list_reporter import ListReporter
+from typing import Any, cast
 
 # Service name under which the legacy ``keyring`` backend stored per-account
 # backup credentials on macOS (kept for the one-time keyring → security migration
@@ -77,12 +77,6 @@ KEYRING_SERVICE = "claude-code"
 # Setup-tokens are inference-only server-side; wider scopes trigger 403s
 # on profile endpoints. Matches Claude Code's CLAUDE_CODE_OAUTH_TOKEN path.
 SETUP_TOKEN_SCOPES = ("user:inference",)
-
-# Shared by the interactive switch() path and the JSON/strategy CLI path so the
-# single-account no-op reads the same everywhere.
-_ONLY_ONE_ACCOUNT_MSG = (
-    "Only one account is managed. Add more accounts to switch between."
-)
 
 def _sweep_legacy_keyring(usernames: list[str], removed_items: list[str]) -> None:
     """Best-effort purge of legacy ``KEYRING_SERVICE`` entries via ``keyring``.
@@ -344,7 +338,7 @@ class ClaudeAccountSwitcher:
     def _find_account_slot(
         data: dict[str, Any], email: str, organization_uuid: str
     ) -> str | None:
-        return _slot_for_identity(data.get("accounts", {}), email, organization_uuid)
+        return slot_for_identity(data.get("accounts", {}), email, organization_uuid)
 
     def _delete_account_files(self, account_num: str, email: str) -> None:
         """Delete all backup files for an account (credentials + config).
@@ -743,7 +737,7 @@ class ClaudeAccountSwitcher:
         data = self._get_sequence_data()
         if not data:
             return
-        slot = _slot_for_identity(data.get("accounts", {}), email, "")
+        slot = slot_for_identity(data.get("accounts", {}), email, "")
         if slot is None:
             return
         existing_kind = self._account_kind(slot)
@@ -1317,7 +1311,6 @@ class ClaudeAccountSwitcher:
         pool — keep that ordering invariant.
         """
         if self._reporter is None:
-            from claude_swap.list_reporter import ListReporter
             self._reporter = ListReporter(self)
         return self._reporter
 
@@ -1355,8 +1348,6 @@ class ClaudeAccountSwitcher:
         Ties (including current-vs-other) resolve in favor of staying put.
         Never raises on network failure.
         """
-        from claude_swap.usage_policy import rank_headroom_best
-
         data = self._get_sequence_data() or {}
         others = [
             str(n) for n in data.get("sequence", [])
@@ -1675,7 +1666,6 @@ class ClaudeAccountSwitcher:
         watch view's adaptive set); ``None`` — the CLI default — leaves every
         stale account eligible.
         """
-        from claude_swap.list_reporter import run_list
         return run_list(
             self,
             show_token_status=show_token_status,
@@ -1686,7 +1676,6 @@ class ClaudeAccountSwitcher:
 
     def status(self, json_output: bool = False) -> dict[str, Any] | None:
         """Display current account status."""
-        from claude_swap.list_reporter import run_status
         return run_status(self, json_output=json_output)
 
     def _first_run_setup(self) -> None:
@@ -1738,7 +1727,6 @@ class ClaudeAccountSwitcher:
           * ``CliSwitchIntent(...)`` — CLI ``--switch`` (strategy / JSON)
         """
         if strategy is not None or json_output:
-            from claude_swap.switch_cli import run_switch_cli
             return run_switch_cli(
                 self, strategy=strategy, json_output=json_output,
             )

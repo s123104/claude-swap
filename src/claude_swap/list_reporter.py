@@ -1,7 +1,7 @@
 """Account list/status reporting for claude-swap.
 
-Renders the ``--list`` / ``--status`` views behind the narrow ``ListHost``
-view — it never imports ``switcher``. "Read-only" means switch state:
+Renders the ``--list`` / ``--status`` views for ``ClaudeAccountSwitcher`` —
+it never imports ``switcher`` at runtime (type-only). "Read-only" means switch state:
 listing never changes which account is active, but it is where opportunistic
 credential maintenance happens (live-rotation sync-back, inactive-token
 refresh, parked-rotation recovery), because a usage fetch can consume a
@@ -31,9 +31,9 @@ from claude_swap.json_output import (
     USAGE_KEYCHAIN_UNAVAILABLE,
     USAGE_NO_CREDENTIALS,
     USAGE_TOKEN_EXPIRED,
-    _slot_for_identity,
     empty_list_payload,
     list_payload,
+    slot_for_identity,
     status_payload,
 )
 from claude_swap.exceptions import LockError
@@ -53,7 +53,7 @@ from claude_swap.process_detection import get_running_instances
 from claude_swap.usage_store import FetchRecord, UsageEntry, with_sentinel
 
 if TYPE_CHECKING:
-    from claude_swap.protocols import ListHost
+    from claude_swap.switcher import ClaudeAccountSwitcher
 
 # Delay between successive usage-request launches in one collect pass, so N
 # accounts never burst the shared usage endpoint from one IP in the same
@@ -180,7 +180,7 @@ def _usage_entry_lines(entry: UsageEntry) -> list[str]:
 
 
 def run_list(
-    host: ListHost,
+    host: ClaudeAccountSwitcher,
     *,
     show_token_status: bool = False,
     show_health: bool = False,
@@ -197,7 +197,7 @@ def run_list(
 
 
 def run_status(
-    host: ListHost,
+    host: ClaudeAccountSwitcher,
     *,
     json_output: bool = False,
 ) -> dict[str, Any] | None:
@@ -206,9 +206,9 @@ def run_status(
 
 
 class ListReporter:
-    """Read-only list/status renderer backed by a narrow ``ListHost``."""
+    """Read-only list/status renderer backed by the switcher host."""
 
-    def __init__(self, host: ListHost) -> None:
+    def __init__(self, host: ClaudeAccountSwitcher) -> None:
         self._host = host
         self._active_keychain_unavailable = False
         self._active_degraded = False
@@ -247,7 +247,7 @@ class ListReporter:
             active_num = None
             if current_identity is not None:
                 ce, ou = current_identity
-                active_num = _slot_for_identity(data.get("accounts", {}), ce, ou)
+                active_num = slot_for_identity(data.get("accounts", {}), ce, ou)
             accounts_info, _ = self.collect_accounts_info(data, active_num)
             entries = self.collect_usage_entries(accounts_info, fetch=fetch)
             return self.build_list_payload(accounts_info, entries)
@@ -261,7 +261,7 @@ class ListReporter:
         active_num = None
         if current_identity is not None:
             current_email, current_org_uuid = current_identity
-            active_num = _slot_for_identity(
+            active_num = slot_for_identity(
                 data.get("accounts", {}), current_email, current_org_uuid,
             )
 

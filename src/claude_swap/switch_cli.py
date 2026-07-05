@@ -1,11 +1,11 @@
 """CLI dispatch for ``cswap --switch`` and its strategy flags.
 
 The adapter between the CLI surface (``--switch``, ``--strategy``,
-``--json``) and the switcher's domain methods, reached through the narrow
-``SwitchCliHost`` view. No switch logic lives here — precondition
-classification, target selection, and the switch transaction stay in
-``switcher``; this module owns each outcome's presentation: an interactive
-print, or a structured no-op/result payload when ``--json`` is on.
+``--json``) and the switcher's domain methods. No switch logic lives here —
+precondition classification, target selection, and the switch transaction
+stay in ``switcher``; this module owns each outcome's presentation: an
+interactive print, or a structured no-op/result payload when ``--json`` is
+on.
 """
 
 from __future__ import annotations
@@ -13,16 +13,20 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, cast
 
 from claude_swap.json_output import account_ref
-from claude_swap.models import CliSwitchIntent, SwitchPreconditionKind, SwitchPreconditions
+from claude_swap.models import (
+    _ONLY_ONE_ACCOUNT_MSG,
+    CliSwitchIntent,
+    SwitchPreconditionKind,
+    SwitchPreconditions,
+)
 from claude_swap.printer import accent, dimmed, warning
-from claude_swap.switcher import _ONLY_ONE_ACCOUNT_MSG
 
 if TYPE_CHECKING:
-    from claude_swap.protocols import SwitchCliHost
+    from claude_swap.switcher import ClaudeAccountSwitcher
 
 
 def run_switch_cli(
-    switcher: SwitchCliHost,
+    switcher: ClaudeAccountSwitcher,
     *,
     strategy: str | None = None,
     json_output: bool = False,
@@ -36,7 +40,7 @@ def run_switch_cli(
 class SwitchCliDispatcher:
     """JSON/strategy CLI adapter layer for ``ClaudeAccountSwitcher.switch()``."""
 
-    def __init__(self, switcher: SwitchCliHost) -> None:
+    def __init__(self, switcher: ClaudeAccountSwitcher) -> None:
         self._switcher = switcher
 
     def run(

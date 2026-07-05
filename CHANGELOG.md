@@ -120,6 +120,11 @@ Release version is defined in `pyproject.toml` (currently `0.17.1+haotool.1`).
 
 ### Fixed
 
+- **`CLAUDE_CONFIG_DIR` is used verbatim, mirroring Claude Code:** cswap no
+  longer tilde-expands the value. Claude Code performs no expansion, so the
+  old behavior made cswap manage `$HOME/x` while a self-started Claude Code
+  used the literal `./~/x` — swapping credentials Claude Code never read.
+  A value starting with a literal `~` now logs a one-time warning instead.
 - **Rotated OAuth tokens survive a wedged lock holder:** when persisting a
   just-refreshed single-use token cannot take the file lock within its 30s
   budget, the rotation is parked in a slot-tagged, owner-only pending file
