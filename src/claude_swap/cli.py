@@ -296,7 +296,7 @@ Defaults live in settings.json in the backup root; flags override them.
                 sys.exit(1)
 
         stdout_emit = jsonl_emit if args.json else human_emit
-        log = switcher._logger
+        log = logging.getLogger("claude-swap")
 
         def emit(event: AutoSwitchEvent) -> None:
             # Mirror every event into the structured decision log
