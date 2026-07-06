@@ -3808,6 +3808,67 @@ class TestFormatUsageLines:
         lines = _format_usage_lines(usage)
         assert lines == ["Fable: 100%  (!)"]
 
+    def test_countdown_recomputed_from_resets_at_not_cached_strings(self):
+        # A measurement served from the store hours after its fetch still
+        # carries the countdown frozen at fetch time; rendering must derive
+        # the live value from resets_at instead (issue: "resets 15:59 in 17h"
+        # printed when the reset was 15h away).
+        from datetime import datetime, timedelta, timezone
+
+        resets_at = (datetime.now(timezone.utc) + timedelta(hours=2, minutes=30)).isoformat()
+        usage = {
+            "seven_day": {
+                "pct": 62.0,
+                "resets_at": resets_at,
+                "clock": "15:59",
+                "countdown": "17h 0m",
+            }
+        }
+        line = _format_usage_lines(usage)[0]
+        assert "in 2h" in line
+        assert "17h" not in line
+
+    def test_reset_falls_back_to_cached_strings_without_resets_at(self):
+        # Entries persisted by older versions have no resets_at — the
+        # fetch-time strings are the best available then.
+        usage = {"seven_day": {"pct": 62.0, "clock": "15:59", "countdown": "17h 0m"}}
+        line = _format_usage_lines(usage)[0]
+        assert "resets 15:59" in line
+        assert "in 17h 0m" in line
+
+    def test_reset_falls_back_on_unparseable_resets_at(self):
+        usage = {
+            "seven_day": {
+                "pct": 62.0,
+                "resets_at": "not-a-date",
+                "clock": "15:59",
+                "countdown": "17h 0m",
+            }
+        }
+        line = _format_usage_lines(usage)[0]
+        assert "resets 15:59" in line
+        assert "in 17h 0m" in line
+
+    def test_spend_clock_recomputed_from_resets_at(self):
+        from datetime import datetime, timedelta, timezone
+
+        now = datetime.now(timezone.utc)
+        resets_at = (now + timedelta(hours=2)).isoformat()
+        expected_clock = oauth.format_reset(resets_at)[1]
+        usage = {
+            "spend": {
+                "used": 1.0,
+                "limit": 10.0,
+                "pct": 10.0,
+                "currency": "USD",
+                "resets_at": resets_at,
+                "clock": "stale-clock",
+            }
+        }
+        line = _format_usage_lines(usage)[0]
+        assert f"resets {expected_clock}" in line
+        assert "stale-clock" not in line
+
     def test_no_scoped_key_renders_only_standard_windows(self):
         usage = {"five_hour": {"pct": 7.0}, "seven_day": {"pct": 72.0}}
         lines = _format_usage_lines(usage)

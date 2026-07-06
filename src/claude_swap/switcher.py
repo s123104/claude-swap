@@ -100,6 +100,27 @@ _FETCH_STAGGER_S = 0.25
 _USAGE_AGE_NOTE_S = 90.0
 
 
+def _reset_cell(window: dict) -> tuple[str, str] | None:
+    """``(clock, countdown)`` for one usage window, or None when unknown.
+
+    Recomputed from ``resets_at`` at render time: the strings cached at fetch
+    time drift as the measurement ages (a countdown frozen 2h ago overstates
+    the remaining wait by those 2h, and a same-day "15:30" clock silently
+    starts meaning yesterday). Entries persisted without ``resets_at`` fall
+    back to the fetch-time strings — stale beats blank.
+    """
+    resets_at = window.get("resets_at")
+    if resets_at:
+        try:
+            countdown, clock = oauth.format_reset(resets_at)
+            return clock, countdown
+        except (ValueError, TypeError):
+            pass  # unparseable cached value — fall back below
+    if "clock" in window:
+        return window["clock"], window.get("countdown", "?")
+    return None
+
+
 def _format_usage_lines(usage: dict) -> list[str]:
     # Collect (label, body) rows first, then pad every label to the widest one so
     # per-model names (e.g. "Fable") don't shift the columns of the other lines.
@@ -109,22 +130,27 @@ def _format_usage_lines(usage: dict) -> list[str]:
         used = spend["used"]
         limit = spend["limit"]
         pct = spend["pct"]
-        if "clock" in spend:
-            rows.append(("$$", f"{pct:>3.0f}%   resets {spend['clock']:<12}  ${used:,.2f} / ${limit:,.2f}"))
+        cell = _reset_cell(spend)
+        if cell:
+            rows.append(("$$", f"{pct:>3.0f}%   resets {cell[0]:<12}  ${used:,.2f} / ${limit:,.2f}"))
         else:
             rows.append(("$$", f"{pct:>3.0f}%   ${used:,.2f} / ${limit:,.2f}"))
     for label, w in (("5h", usage.get("five_hour")), ("7d", usage.get("seven_day"))):
         if w:
-            if "clock" in w:
-                rows.append((label, f"{w['pct']:>3.0f}%   resets {w['clock']:<12}  in {w['countdown']}"))
+            cell = _reset_cell(w)
+            if cell:
+                clock, countdown = cell
+                rows.append((label, f"{w['pct']:>3.0f}%   resets {clock:<12}  in {countdown}"))
             else:
                 rows.append((label, f"{w['pct']:>3.0f}%"))
     for w in usage.get("scoped") or []:
         # Per-model weekly limits (e.g. Fable). Flag ones at/over the limit so a
         # maxed model — the usual reason to switch — stands out.
         marker = "  (!)" if w["pct"] >= 100 else ""
-        if "clock" in w:
-            rows.append((w["name"], f"{w['pct']:>3.0f}%   resets {w['clock']:<12}  in {w['countdown']}{marker}"))
+        cell = _reset_cell(w)
+        if cell:
+            clock, countdown = cell
+            rows.append((w["name"], f"{w['pct']:>3.0f}%   resets {clock:<12}  in {countdown}{marker}"))
         else:
             rows.append((w["name"], f"{w['pct']:>3.0f}%{marker}"))
     width = max((len(label) for label, _ in rows), default=0) + 1  # label + ':'
