@@ -239,18 +239,25 @@ class CredentialRefresher:
         email: str,
         credentials: str,
     ) -> str:
+        if not credentials:
+            # No caller has a legitimate empty write — it would brick the slot.
+            raise CredentialWriteError(
+                f"Refusing to back up empty credentials for account-{account_num}"
+            )
         expected = credentials
         previous_live: str | None = None
         live_keeps_changing = False
 
         for attempt in range(_BACKUP_CREDENTIAL_VERIFY_ATTEMPTS):
-            self._sw._write_account_credentials(account_num, email, expected)
-            stored = self._sw._read_account_credentials(account_num, email)
+            # Prove the live store readable before the write, so an unreadable
+            # store aborts with the backup untouched.
             live_now = self._sw._read_credentials()
             if live_now is None:
                 raise CredentialReadError("Failed to re-read live credentials for verification")
             if not live_now:
                 raise CredentialReadError("No live credentials found during verification")
+            self._sw._write_account_credentials(account_num, email, expected)
+            stored = self._sw._read_account_credentials(account_num, email)
             if stored == live_now:
                 return live_now
 

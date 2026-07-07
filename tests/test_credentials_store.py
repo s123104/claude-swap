@@ -18,6 +18,7 @@ from claude_swap.credentials import (
     ActiveCredentials,
 )
 from claude_swap.exceptions import (
+    CredentialReadError,
     CredentialWriteError,
 )
 from claude_swap.macos_keychain import KeychainError
@@ -135,6 +136,62 @@ class TestWriteVerifiedLiveDriftHandling:
                 "b@example.com",
                 stable_live,
             )
+
+    def test_refuses_to_back_up_empty_credentials(
+        self,
+        temp_home: Path,
+        monkeypatch,
+    ):
+        """An empty payload must be rejected before any backup write —
+        persisting it clobbers the slot's ``.enc`` to 0 bytes and, in file
+        mode, deletes the Keychain copy."""
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+
+        writes: list = []
+        monkeypatch.setattr(
+            switcher, "_write_account_credentials",
+            lambda *a: writes.append(a),
+        )
+        monkeypatch.setattr(switcher, "_read_account_credentials", lambda *_: "")
+        monkeypatch.setattr(
+            switcher, "_read_credentials", lambda: self._creds("live"),
+        )
+
+        with pytest.raises(CredentialWriteError, match="empty credentials"):
+            switcher._write_verified_live_account_credentials(
+                "1",
+                "a@example.com",
+                "",
+            )
+        assert writes == []
+
+    def test_unreadable_live_raises_before_touching_backup(
+        self,
+        temp_home: Path,
+        monkeypatch,
+    ):
+        """Live reads "" (e.g. Keychain pinned to file mode on a Keychain-only
+        Mac): the verifier must raise BEFORE the first backup write, not after
+        it has already clobbered the slot."""
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+
+        writes: list = []
+        monkeypatch.setattr(
+            switcher, "_write_account_credentials",
+            lambda *a: writes.append(a),
+        )
+        monkeypatch.setattr(switcher, "_read_account_credentials", lambda *_: "")
+        monkeypatch.setattr(switcher, "_read_credentials", lambda: "")
+
+        with pytest.raises(CredentialReadError, match="No live credentials"):
+            switcher._write_verified_live_account_credentials(
+                "1",
+                "a@example.com",
+                self._creds("intended"),
+            )
+        assert writes == []
 
 
 class TestMacosKeychainFallback:

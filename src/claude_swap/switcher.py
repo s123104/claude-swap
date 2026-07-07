@@ -2017,6 +2017,12 @@ class ClaudeAccountSwitcher:
             original_creds = self._read_credentials()
             if original_creds is None:
                 raise CredentialReadError("Failed to read current credentials")
+            if not original_creds:
+                # An empty live read must not be backed up over the current
+                # slot; mirrors add_account's guard.
+                raise CredentialReadError(
+                    "No credentials found for current account"
+                )
             original_config = config_path.read_text(encoding="utf-8")
         except FileNotFoundError:
             raise ConfigError("Claude config file not found")
