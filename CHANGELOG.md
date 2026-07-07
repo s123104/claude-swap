@@ -120,6 +120,12 @@ Release version is defined in `pyproject.toml` (currently `0.17.1+haotool.1`).
 
 ### Fixed
 
+- **A failed switch can no longer clobber the current slot's backup.** When
+  the live credential store is unreadable, the switch now fails fast before
+  the backup step, and the backup verifier both refuses an empty payload and
+  reads the live store *before* writing. Previously each failed auto-switch
+  tick overwrote the active slot's `.enc` with 0 bytes and deleted its
+  Keychain backup copy, bricking the slot until a manual `--add-account`.
 - **Redirected Windows output is UTF-8, not the ANSI code page:** piped or
   redirected `cswap` output previously encoded with the locale ANSI code page
   (e.g. cp950), so glyphs like the em dash came out as ANSI multi-byte

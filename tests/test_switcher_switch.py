@@ -221,6 +221,42 @@ class TestPerformSwitchPostDisplay:
         )
         assert backup_oauth["accessToken"] == "sk-rotated-1"
 
+    def test_switch_aborts_on_empty_live_creds_before_touching_backup(
+        self,
+        temp_home: Path,
+        mock_claude_config: Path,
+        sample_sequence_data: dict,
+    ):
+        """Live reads "" (e.g. the Keychain capability cache pinned to file
+        mode on a Keychain-only Mac): the switch must fail fast without
+        writing an empty backup over the current slot.
+
+        Before the fix every failed auto-switch tick clobbered the current
+        slot's backup (0-byte .enc, deleted Keychain copy) before raising."""
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home,
+            sample_sequence_data,
+        )
+        creds_store[("1", "test@example.com")] = "pre-existing-backup"
+        live_state = {"creds": ""}
+        patches = self._install_store_patches(
+            switcher,
+            creds_store,
+            configs_store,
+            live_state,
+        )
+        try:
+            with pytest.raises(
+                CredentialReadError,
+                match="No credentials found for current account",
+            ):
+                switcher._perform_switch("2")
+        finally:
+            for p in patches:
+                p.stop()
+
+        assert creds_store[("1", "test@example.com")] == "pre-existing-backup"
+
     def test_quiet_switch_suppresses_banners_and_followup(
         self,
         temp_home: Path,

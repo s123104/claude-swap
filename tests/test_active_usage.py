@@ -148,6 +148,11 @@ class TestListAccountsUsage:
                 "_read_active_credentials",
                 return_value=ActiveCredentials(refreshed_live, False),
             ),
+            # The sync's write-back verification re-reads live via
+            # _read_credentials; keep both live-read paths consistent.
+            patch.object(
+                switcher, "_read_credentials", return_value=refreshed_live
+            ),
             patch(
                 "claude_swap.oauth.try_fetch_usage_for_account",
                 return_value=oauth.UsageOutcome(None),
