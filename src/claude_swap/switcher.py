@@ -2690,17 +2690,20 @@ class ClaudeAccountSwitcher:
         # Every rotation target is at its limit. Switching onto an exhausted
         # account would not help, so stay on the current one instead.
         if next_account is None and skipped_exhausted:
+            # With model limits in play the binding window may be a scoped
+            # one (the per-skip lines name it), so don't claim "5h/7d".
+            limits_label = "usage limits" if models else "5h/7d limit"
             if json_output:
                 return self._switch_noop(
                     strategy=strategy_label, reason="candidates-exhausted",
                     to_ref=current_ref, warnings=warnings,
                     message=(
-                        f"All other accounts are at their 5h/7d limit — staying on "
+                        f"All other accounts are at their {limits_label} — staying on "
                         f"Account-{current_num}."
                     ),
                 )
             warning(
-                f"All other accounts are at their 5h/7d limit — staying on "
+                f"All other accounts are at their {limits_label} — staying on "
                 f"Account-{current_num}."
             )
             return None
