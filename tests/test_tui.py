@@ -268,6 +268,28 @@ class TestFormatting:
         assert text is not None and text.startswith("resets ")
         assert tui_data.window_reset_text(None, "five_hour", time.time()) is None
 
+    def test_reset_clock(self):
+        # Same-day reset → bare HH:MM; a reset days out carries its date.
+        now = time.time()
+        entry = make_entry()  # 5h resets in 2h, 7d in 3d
+        clock5 = tui_data.reset_clock(entry.last_good["five_hour"], now)
+        assert clock5 is not None and clock5.count(":") == 1
+        clock7 = tui_data.reset_clock(entry.last_good["seven_day"], now)
+        import calendar
+
+        months = list(calendar.month_abbr)[1:]
+        assert clock7 is not None and any(m in clock7 for m in months)
+
+    def test_reset_clock_unknown_or_elapsed_is_none(self):
+        now = time.time()
+        assert tui_data.reset_clock(None, now) is None
+        assert tui_data.reset_clock({"pct": 5.0}, now) is None
+        assert tui_data.reset_clock({"resets_at": "garbage"}, now) is None
+        # elapsed reset: the row says "resets now" — no clock to show
+        elapsed = {"resets_at": _iso_in(-60)}
+        assert tui_data.reset_clock(elapsed, now) is None
+        assert tui_data.reset_text(elapsed, now) == "resets now"
+
 
 class TestSnapshotSource:
     def _source(self, tmp_path: Path, accounts=None):
@@ -302,7 +324,7 @@ class TestUsageRows:
         from claude_swap.tui.widgets import usage_rows
 
         entry = make_entry(pct5=47.0, pct7=None)  # annual plan: no 7d window
-        labels = [label for label, _pct, _sfx in usage_rows(entry.last_good, time.time())]
+        labels = [label for label, *_ in usage_rows(entry.last_good, time.time())]
         assert labels == ["5h"]
 
     def test_scoped_models_and_over_limit_marker(self):
@@ -310,10 +332,12 @@ class TestUsageRows:
 
         entry = make_entry(scoped=[("Fable", 100.0), ("Opus", 12.0)])
         rows = usage_rows(entry.last_good, time.time())
-        labels = [label for label, _pct, _sfx in rows]
+        labels = [label for label, *_ in rows]
         assert labels == ["5h", "7d", "Fable", "Opus"]
         fable = next(row for row in rows if row[0] == "Fable")
         assert "(!)" in fable[2]
+        # the marker stays terminal in the clock-extended variant too
+        assert fable[3].endswith("(!)") and " · " in fable[3]
 
     def test_spend_row_first_with_amounts(self):
         from claude_swap.tui.widgets import usage_rows
@@ -323,11 +347,66 @@ class TestUsageRows:
         assert rows[0][0] == "$$"
         assert "$12.50 / $50.00" in rows[0][2]
 
+    def test_suffix_full_extends_countdown_with_clock(self):
+        from claude_swap.tui.widgets import usage_rows
+
+        entry = make_entry(pct5=47.0)
+        row5 = usage_rows(entry.last_good, time.time())[0]
+        assert row5[2].startswith("resets ")
+        assert row5[3].startswith(row5[2] + " · ")
+
+    def test_spend_clock_sits_with_reset_not_after_amounts(self):
+        from claude_swap.tui.widgets import usage_rows
+
+        entry = make_entry(
+            spend={
+                "used": 12.5,
+                "limit": 50.0,
+                "pct": 25.0,
+                "currency": "USD",
+                "resets_at": _iso_in(7200),
+            }
+        )
+        spend = usage_rows(entry.last_good, time.time())[0]
+        assert spend[0] == "$$"
+        assert " · " in spend[3]
+        assert spend[3].index(" · ") < spend[3].index("$12.50")
+
     def test_no_data_no_rows(self):
         from claude_swap.tui.widgets import usage_rows
 
         assert usage_rows(None, time.time()) == []
         assert usage_rows({}, time.time()) == []
+
+    def test_card_shows_clock_only_where_it_fits(self):
+        # Per-row degradation: the wide card shows every clock, a mid width
+        # keeps 5h/7d clocks while the longer spend row falls back to its
+        # countdown, and a narrow card is exactly the old countdown-only look.
+        from claude_swap.tui.widgets import account_card_text
+
+        entry = make_entry(
+            spend={
+                "used": 12.5,
+                "limit": 50.0,
+                "pct": 25.0,
+                "currency": "USD",
+                "resets_at": _iso_in(7200),
+            }
+        )
+        acc = make_account(1, active=True, entry=entry)
+
+        wide = account_card_text(acc, 100).plain
+        assert wide.count(" · ") == 3
+
+        mid_lines = account_card_text(acc, 78).plain.splitlines()
+        spend_line = next(line for line in mid_lines if "$12.50" in line)
+        assert " · " not in spend_line
+        for line in mid_lines:
+            if "resets" in line and "$12.50" not in line:
+                assert " · " in line
+
+        narrow = account_card_text(acc, 40).plain
+        assert " · " not in narrow
 
 
 class TestRunAction:
