@@ -19,6 +19,16 @@ if TYPE_CHECKING:
 _WSL_PROC_PATHS = (Path("/proc/version"), Path("/proc/sys/kernel/osrelease"))
 
 
+def is_macos() -> bool:
+    """Return True on macOS.
+
+    Runtime check so mypy keeps every platform branch reachable instead of
+    narrowing on ``sys.platform`` under ``--platform`` analysis (the menubar
+    dispatch would otherwise read as unreachable when analyzed as win32).
+    """
+    return sys.platform == "darwin"
+
+
 def is_linux() -> bool:
     """Return True on Linux (including WSL).
 

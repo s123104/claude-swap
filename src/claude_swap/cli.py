@@ -12,6 +12,7 @@ from typing import Any, cast
 from claude_swap import __version__, service
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import error_envelope
+from claude_swap.models import is_macos
 from claude_swap.printer import dimmed, error, force_utf8_output, muted
 from claude_swap.switcher import ClaudeAccountSwitcher
 
@@ -986,7 +987,7 @@ def _dispatch_action(
 
         sys.exit(tui_run(switcher, start="watch"))
     elif args.menubar:
-        if sys.platform != "darwin":
+        if not is_macos():
             error("The menu bar is only available on macOS.")
             sys.exit(1)
         try:
