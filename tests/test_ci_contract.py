@@ -66,5 +66,5 @@ def test_ci_has_redirected_list_smoke() -> None:
     # variants must stay wired to the real CLI, not just unit tests.
     workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
 
-    assert "chcp 950 & cswap --list > out.txt" in workflow
+    assert "chcp 950 & uv run cswap --list > out.txt" in workflow
     assert "LC_ALL=C uv run cswap --list > out.txt" in workflow
