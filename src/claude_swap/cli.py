@@ -55,6 +55,7 @@ _SUBCOMMAND_FLAGS = {
     "upgrade": "--upgrade",
     "update": "--upgrade",
     "tui": "--tui",
+    "watch": "--watch",
 }
 
 
@@ -633,7 +634,8 @@ Commands:
   %(prog)s service install            background auto-switch engine at login
   %(prog)s export <path>              export accounts
   %(prog)s import <path>              import accounts
-  %(prog)s tui                        interactive arrow-key menu
+  %(prog)s tui                        interactive dashboard (also: bare %(prog)s)
+  %(prog)s watch                      dashboard, opened on the live watch page
   %(prog)s upgrade                    self-upgrade to latest
   %(prog)s purge                      remove all claude-swap data
 
@@ -779,7 +781,18 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     group.add_argument(
         "--tui",
         action="store_true",
-        help="Launch interactive arrow-key menu (single-level)",
+        help=(
+            "Launch the interactive dashboard (usage bars, switching, live "
+            "auto view). Bare %(prog)s in a terminal opens it too."
+        ),
+    )
+    group.add_argument(
+        "--watch",
+        action="store_true",
+        help=(
+            "Open the interactive dashboard directly on the watch page: "
+            "every account in full detail, live"
+        ),
     )
     group.add_argument(
         "--upgrade",
@@ -847,14 +860,8 @@ def _cmd_import(switcher: ClaudeAccountSwitcher, args: argparse.Namespace) -> No
 
 
 def _cmd_tui(switcher: ClaudeAccountSwitcher, args: argparse.Namespace) -> None:
-    try:
-        from claude_swap.tui import run as tui_run
-    except ImportError:
-        error(
-            "TUI mode requires the 'curses' module. "
-            "On Windows, install with: pip install windows-curses"
-        )
-        sys.exit(1)
+    from claude_swap.tui import run as tui_run
+
     sys.exit(tui_run(switcher))
 
 
@@ -900,6 +907,10 @@ def _dispatch_action(
         _cmd_import(switcher, args)
     elif args.tui:
         _cmd_tui(switcher, args)
+    elif args.watch:
+        from claude_swap.tui import run as tui_run
+
+        sys.exit(tui_run(switcher, start="watch"))
     return None
 
 
@@ -936,10 +947,17 @@ def main() -> None:
         globals()[_SUBCOMMANDS[sys.argv[1]]](sys.argv[2:])
         return
 
+    # Bare `cswap` in an interactive terminal opens the TUI dashboard (like
+    # lazygit/k9s). TTY-gated on both ends so scripts and pipes keep getting
+    # the usage error, and `cswap tui` stays the explicit spelling.
+    argv = sys.argv[1:]
+    if not argv and sys.stdout.isatty() and sys.stdin.isatty():
+        argv = ["--tui"]
+
     # Memorable subcommands (`cswap switch <email>`, `cswap list`, ...) are
     # rewritten to the equivalent flags so the original `--flag` interface
     # keeps working unchanged.
-    argv = _translate_subcommand(sys.argv[1:])
+    argv = _translate_subcommand(argv)
 
     parser = _build_parser()
     args = parser.parse_args(argv)

@@ -13,13 +13,15 @@ from typing import Any
 
 from claude_swap.usage_store import UsageEntry as StoreUsageEntry
 
+from claude_swap import oauth
+
 # Bump only on a breaking change to any payload shape. Scripts key off this.
 SCHEMA_VERSION = 1
 
 # Sentinel entries the usage collectors yield in place of a usage dict. Kept
 # here (the serialization hub) so the human renderer and the JSON projection
 # agree instead of scattering raw strings. Human-facing wording for these
-# lives in ``list_reporter._SENTINEL_NOTES``.
+# lives in ``list_reporter.SENTINEL_NOTES``.
 USAGE_NO_CREDENTIALS = "no credentials"
 USAGE_TOKEN_EXPIRED = "token expired"
 # API-key (``/login`` managed key) accounts have no subscription quota; usage is
@@ -60,14 +62,18 @@ def slot_for_identity(
 
 
 def _window_to_json(entry: dict[str, Any]) -> dict[str, Any]:
-    """Project a 5h/7d usage window to JSON, preserving raw ``resetsAt``."""
+    """Project a 5h/7d usage window to JSON, preserving raw ``resetsAt``.
+
+    ``countdown``/``clock`` are recomputed from ``resets_at`` at serialization
+    time (the store may serve a measurement hours after its fetch); entries
+    without ``resets_at`` fall back to the fetch-time strings.
+    """
     out: dict[str, Any] = {"pct": entry["pct"]}
     if "resets_at" in entry:
         out["resetsAt"] = entry["resets_at"]
-    if "countdown" in entry:
-        out["countdown"] = entry["countdown"]
-    if "clock" in entry:
-        out["clock"] = entry["clock"]
+    cell = oauth.fresh_reset_strings(entry)
+    if cell:
+        out["countdown"], out["clock"] = cell
     return out
 
 
@@ -99,10 +105,9 @@ def usage_to_json(usage: dict[str, Any]) -> dict[str, Any]:
         }
         if "resets_at" in spend:
             spend_out["resetsAt"] = spend["resets_at"]
-        if "countdown" in spend:
-            spend_out["countdown"] = spend["countdown"]
-        if "clock" in spend:
-            spend_out["clock"] = spend["clock"]
+        cell = oauth.fresh_reset_strings(spend)
+        if cell:
+            spend_out["countdown"], spend_out["clock"] = cell
         out["spend"] = spend_out
     if "scoped" in usage:
         out["scoped"] = [_scoped_window_to_json(w) for w in usage["scoped"]]

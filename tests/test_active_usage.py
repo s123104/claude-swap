@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -354,7 +355,7 @@ class TestListAccountsUsage:
     ):
         """list-JSON, list-human, and strategy paths classify accounts identically."""
         from claude_swap.json_output import usage_fields
-        from claude_swap.list_reporter import _SENTINEL_NOTES
+        from claude_swap.list_reporter import SENTINEL_NOTES
 
         API_KEY = "sk-ant-api03-abcdefghij1234567890XYZ"
         sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
@@ -418,7 +419,7 @@ class TestListAccountsUsage:
         assert json_by_num[1] == "ok"
         assert json_by_num[2] == "no_credentials"
         assert json_by_num[3] == "api_key"
-        assert _SENTINEL_NOTES[USAGE_API_KEY] in human_out
+        assert SENTINEL_NOTES[USAGE_API_KEY] in human_out
         assert "no credentials" in human_out
         assert "10%" in human_out
 
@@ -1391,3 +1392,62 @@ class TestFormatUsageLines:
         usage = {"five_hour": {"pct": 7.0, "clock": "20:39", "countdown": "1h 30m"}}
         lines = list_reporter._format_usage_lines(usage)
         assert lines == ["5h:   7%   resets 20:39         in 1h 30m"]
+
+    def test_countdown_recomputed_from_resets_at_not_cached_strings(self):
+        # A measurement served from the store hours after its fetch still
+        # carries the countdown frozen at fetch time; rendering must derive
+        # the live value from resets_at instead (issue: "resets 15:59 in 17h"
+        # printed when the reset was 15h away).
+        resets_at = (
+            datetime.now(timezone.utc) + timedelta(hours=2, minutes=30)
+        ).isoformat()
+        usage = {
+            "seven_day": {
+                "pct": 62.0,
+                "resets_at": resets_at,
+                "clock": "15:59",
+                "countdown": "17h 0m",
+            }
+        }
+        line = list_reporter._format_usage_lines(usage)[0]
+        assert "in 2h" in line
+        assert "17h" not in line
+
+    def test_reset_falls_back_to_cached_strings_without_resets_at(self):
+        # Entries persisted by older versions have no resets_at — the
+        # fetch-time strings are the best available then.
+        usage = {"seven_day": {"pct": 62.0, "clock": "15:59", "countdown": "17h 0m"}}
+        line = list_reporter._format_usage_lines(usage)[0]
+        assert "resets 15:59" in line
+        assert "in 17h 0m" in line
+
+    def test_reset_falls_back_on_unparseable_resets_at(self):
+        usage = {
+            "seven_day": {
+                "pct": 62.0,
+                "resets_at": "not-a-date",
+                "clock": "15:59",
+                "countdown": "17h 0m",
+            }
+        }
+        line = list_reporter._format_usage_lines(usage)[0]
+        assert "resets 15:59" in line
+        assert "in 17h 0m" in line
+
+    def test_spend_clock_recomputed_from_resets_at(self):
+        now = datetime.now(timezone.utc)
+        resets_at = (now + timedelta(hours=2)).isoformat()
+        expected_clock = oauth.format_reset(resets_at)[1]
+        usage = {
+            "spend": {
+                "used": 1.0,
+                "limit": 10.0,
+                "pct": 10.0,
+                "currency": "USD",
+                "resets_at": resets_at,
+                "clock": "stale-clock",
+            }
+        }
+        line = list_reporter._format_usage_lines(usage)[0]
+        assert f"resets {expected_clock}" in line
+        assert "stale-clock" not in line

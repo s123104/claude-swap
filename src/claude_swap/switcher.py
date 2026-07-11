@@ -37,6 +37,8 @@ from claude_swap.locking import FileLock
 from claude_swap.logging_config import setup_logging
 from claude_swap.models import (
     ONLY_ONE_ACCOUNT_MSG,
+    AccountSnapshot,
+    AccountsSnapshot,
     ManualSwitchIntent,
     Platform,
     SwitchIntent,
@@ -58,7 +60,11 @@ from claude_swap.paths import (
     migrate_legacy_backup_dir,
 )
 from claude_swap.credential_refresh import CredentialRefresher
+# SENTINEL_NOTES / last_seen_note are re-exported for the TUI, which reads
+# them from here (the upstream location) so both surfaces share one wording.
+from claude_swap.list_reporter import SENTINEL_NOTES as SENTINEL_NOTES
 from claude_swap.list_reporter import ListReporter, run_list, run_status
+from claude_swap.list_reporter import last_seen_note as last_seen_note
 from claude_swap.sequence_store import (
     AccountRecord,
     SequenceData,
@@ -469,6 +475,44 @@ class ClaudeAccountSwitcher:
         accounts_info = reporter.build_accounts_info()
         return reporter.collect_usage_entries(accounts_info, fetch=fetch)
 
+    def accounts_snapshot(self, fetch: set[str] | None = None) -> AccountsSnapshot:
+        """One-pass structured snapshot of every managed account, for the TUI.
+
+        Metadata, active-slot detection, and usage entries all come from a
+        single ``_build_accounts_info`` + ``_collect_usage_entries`` pass, so
+        the view is coherent — two separate calls could interleave with other
+        collectors and disagree about the active slot or freshness. ``fetch``
+        has ``_collect_usage_entries`` semantics: ``None`` makes every stale
+        account eligible; a set restricts which accounts *may* be fetched
+        this pass.
+        """
+        reporter = self._list_reporter()
+        accounts_info = reporter.build_accounts_info()
+        entries = reporter.collect_usage_entries(accounts_info, fetch=fetch)
+        active_number: str | None = None
+        accounts: list[AccountSnapshot] = []
+        for num, email, org_name, org_uuid, is_active, _creds in accounts_info:
+            n = str(num)
+            if is_active:
+                active_number = n
+            accounts.append(
+                AccountSnapshot(
+                    number=n,
+                    email=email,
+                    org_name=org_name,
+                    org_uuid=org_uuid,
+                    is_active=is_active,
+                    kind=self._account_kind(n),
+                    switchable=self._account_is_switchable(n),
+                    usage=entries[n],
+                )
+            )
+        return AccountsSnapshot(
+            active_number=active_number,
+            accounts=tuple(accounts),
+            taken_at=self._usage_store.clock(),
+        )
+
     def usage_fetch_stamps(self) -> dict[str, float | None]:
         """Per-slot ``fetchedAt`` snapshot from the usage store — a pure file
         read (no fetching, no credential access). The TUI watch view diffs
@@ -871,12 +915,18 @@ class ClaudeAccountSwitcher:
             self._write_json(self.sequence_file, data)
 
     def _resolve_target_slot(
-        self, email: str, org_uuid: str, slot: int | None
+        self,
+        email: str,
+        org_uuid: str,
+        slot: int | None,
+        assume_yes: bool = False,
     ) -> tuple[str, tuple[str, str] | None, str | None] | None:
         """Resolve where a new/moved account should land.
 
         Returns ``(account_num, displace_slot, migrate_from)`` or ``None`` when
         the user declines an overwrite prompt. No destructive work is done here.
+        ``assume_yes`` skips the occupied-slot overwrite prompt (callers with
+        their own confirmation UI, e.g. the TUI, confirm before calling).
         """
         displace_slot: tuple[str, str] | None = None
         migrate_from: str | None = None
@@ -912,16 +962,19 @@ class ClaudeAccountSwitcher:
                     existing.get("organizationName", ""),
                     existing.get("organizationUuid", ""),
                 )
-                warning(f"Slot {slot} already occupied")
-                print(f"{existing_email} {muted(f'[{existing_tag}]')}")
-                try:
-                    answer = input(f"Overwrite slot {slot}? [y/N] ").strip().lower()
-                except (EOFError, KeyboardInterrupt):
-                    print(f"\n{dimmed('Cancelled')}")
-                    return None
-                if answer not in ("y", "yes"):
-                    print(dimmed("Cancelled"))
-                    return None
+                if not assume_yes:
+                    warning(f"Slot {slot} already occupied")
+                    print(f"{existing_email} {muted(f'[{existing_tag}]')}")
+                    try:
+                        answer = input(
+                            f"Overwrite slot {slot}? [y/N] "
+                        ).strip().lower()
+                    except (EOFError, KeyboardInterrupt):
+                        print(f"\n{dimmed('Cancelled')}")
+                        return None
+                    if answer not in ("y", "yes"):
+                        print(dimmed("Cancelled"))
+                        return None
                 displace_slot = (account_num, existing_email)
 
         return account_num, displace_slot, migrate_from
@@ -957,7 +1010,7 @@ class ClaudeAccountSwitcher:
         )
         self._sequence_store.save(data)
 
-    def add_account(self, slot: int | None = None) -> None:
+    def add_account(self, slot: int | None = None, assume_yes: bool = False) -> None:
         """Add current account to managed accounts.
 
         Args:
@@ -965,6 +1018,8 @@ class ClaudeAccountSwitcher:
                   When None, auto-assigns the next available number.
                   When specified, prompts for confirmation if the slot
                   is already occupied by a different account.
+            assume_yes: Skip that overwrite prompt (callers with their own
+                  confirmation UI, e.g. the TUI, confirm before calling).
         """
         self._setup_directories()
         self._init_sequence_file()
@@ -1027,7 +1082,9 @@ class ClaudeAccountSwitcher:
 
         # Determine slot number and collect confirmation decisions
         # (no destructive operations until new account is verified readable)
-        resolved = self._resolve_target_slot(current_email, current_org_uuid, slot)
+        resolved = self._resolve_target_slot(
+            current_email, current_org_uuid, slot, assume_yes=assume_yes
+        )
         if resolved is None:
             return
         account_num, displace_slot, migrate_from = resolved
@@ -1088,7 +1145,11 @@ class ClaudeAccountSwitcher:
         print(f"{accent('Added')} Account {account_num}: {current_email} {muted(f'[{tag}]')}")
 
     def add_account_from_token(
-        self, token: str, email: str | None = None, slot: int | None = None
+        self,
+        token: str,
+        email: str | None = None,
+        slot: int | None = None,
+        assume_yes: bool = False,
     ) -> None:
         """Register a raw OAuth setup-token or managed API key as a new account.
 
@@ -1106,6 +1167,8 @@ class ClaudeAccountSwitcher:
                    ``api-key-{slot}@token.local`` for API keys) since these tokens
                    carry no real email metadata.
             slot:  Slot number to use; auto-assigned when ``None``.
+            assume_yes: Skip the occupied-slot overwrite prompt (callers with
+                   their own confirmation UI, e.g. the TUI, confirm first).
         """
         import getpass
 
@@ -1190,7 +1253,7 @@ class ClaudeAccountSwitcher:
             )
             return
 
-        resolved = self._resolve_target_slot(email, "", slot)
+        resolved = self._resolve_target_slot(email, "", slot, assume_yes=assume_yes)
         if resolved is None:
             return
         account_num, displace_slot, migrate_from = resolved

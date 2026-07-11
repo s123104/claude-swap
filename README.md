@@ -147,21 +147,11 @@ cswap run 2 --share-history     # share your chat history with this account too
 
 Sessions use your normal `~/.claude` setup (settings, CLAUDE.md, skills, etc.), but each account keeps its own chat history. Pass `--share-history` if you want your accounts to continue the same conversations — a session started under one account shows up in `--resume` under the others, and nothing already saved is lost. Not supported on Windows yet.
 
-### The interactive menu
+### Interactive dashboard (TUI)
 
-Launch the arrow-key menu with `cswap --tui`. Alongside the account actions it
-offers **Watch (live status + usage)** — a read-only dashboard that redraws in
-place, polling through the usage store like `cswap auto` (active account plus
-one alternate per pass) and flashing rows whose usage just refreshed — and
-**Auto-switch at limit**, a frontend over the same engine as `cswap auto`:
+Run `cswap` on its own (or `cswap tui`) for the full-screen dashboard: live usage for every account, switching, and the auto-switcher, all keyboard-driven. `cswap watch` opens it straight to the live monitor. Works on macOS, Linux, and Windows.
 
-```bash
-cswap --tui
-```
-
-From there you can set the switch threshold (persisted in `settings.json`),
-install or remove the background service, and run the engine in the foreground
-with a live event feed. Press `s` to check immediately, `q`/`Esc` to stop.
+<img src="assets/tui-watch.png" width="760" alt="cswap watch — live 5h/7d usage bars for every account, with reset times and the active account marked">
 
 Because switching doesn't require a Claude Code restart (see the note above),
 the new account takes effect on your next message — on macOS once the Keychain
@@ -246,7 +236,8 @@ cswap --health                  # Show account health, usage, and OAuth token st
 cswap status                    # Show current account
 cswap add --slot 3              # Add account to a specific slot (prompts before overwrite)
 cswap remove 2                  # Remove an account
-cswap tui                       # Launch the interactive arrow-key menu (incl. Watch + auto-switch)
+cswap tui                       # Interactive dashboard (also: bare `cswap`)
+cswap watch                     # Dashboard, opened on the live watch page
 cswap upgrade                   # Upgrade upstream/PyPI installs; fork builds use git pull
 cswap purge                     # Remove all claude-swap data
 ```

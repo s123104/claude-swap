@@ -84,11 +84,12 @@ def _format_usage_lines(usage: dict[str, Any]) -> list[str]:
         used = spend["used"]
         limit = spend["limit"]
         pct = spend["pct"]
-        if "clock" in spend:
+        cell = oauth.fresh_reset_strings(spend)
+        if cell:
             rows.append(
                 (
                     "$$",
-                    f"{pct:>3.0f}%   resets {spend['clock']:<12}  "
+                    f"{pct:>3.0f}%   resets {cell[1]:<12}  "
                     f"${used:,.2f} / ${limit:,.2f}",
                 )
             )
@@ -96,12 +97,14 @@ def _format_usage_lines(usage: dict[str, Any]) -> list[str]:
             rows.append(("$$", f"{pct:>3.0f}%   ${used:,.2f} / ${limit:,.2f}"))
     for label, w in (("5h", usage.get("five_hour")), ("7d", usage.get("seven_day"))):
         if w:
-            if "clock" in w:
+            cell = oauth.fresh_reset_strings(w)
+            if cell:
+                countdown, clock = cell
                 rows.append(
                     (
                         label,
-                        f"{w['pct']:>3.0f}%   resets {w['clock']:<12}  "
-                        f"in {w['countdown']}",
+                        f"{w['pct']:>3.0f}%   resets {clock:<12}  "
+                        f"in {countdown}",
                     )
                 )
             else:
@@ -110,12 +113,14 @@ def _format_usage_lines(usage: dict[str, Any]) -> list[str]:
         # Per-model weekly limits (e.g. Fable). Flag ones at/over the limit so a
         # maxed model — the usual reason to switch — stands out.
         marker = "  (!)" if w["pct"] >= 100 else ""
-        if "clock" in w:
+        cell = oauth.fresh_reset_strings(w)
+        if cell:
+            countdown, clock = cell
             rows.append(
                 (
                     w["name"],
-                    f"{w['pct']:>3.0f}%   resets {w['clock']:<12}  "
-                    f"in {w['countdown']}{marker}",
+                    f"{w['pct']:>3.0f}%   resets {clock:<12}  "
+                    f"in {countdown}{marker}",
                 )
             )
         else:
@@ -125,15 +130,22 @@ def _format_usage_lines(usage: dict[str, Any]) -> list[str]:
 
 
 # Human notes for sentinel usage states (fallback: the raw sentinel string).
-_SENTINEL_NOTES = {
+# Public: the TUI renders the same wording so both surfaces describe a state
+# identically (e.g. owned-and-expired means Claude Code will refresh, not that
+# the user must re-login).
+SENTINEL_NOTES = {
     USAGE_TOKEN_EXPIRED: "token expired — Claude Code refreshes the active account",
     USAGE_API_KEY: "API key (no quota)",
     USAGE_KEYCHAIN_UNAVAILABLE: "keychain unavailable — locked or in use; try again",
 }
 
 
-def _last_seen_note(entry: UsageEntry) -> str | None:
-    """"last seen 53% used · 12m ago" from an entry's last-good measurement."""
+def last_seen_note(entry: UsageEntry) -> str | None:
+    """"last seen 53% used · 12m ago" from an entry's last-good measurement.
+
+    Public: the TUI renders the same note under sentinel states (see
+    ``SENTINEL_NOTES``), so both surfaces stay word-for-word identical.
+    """
     if entry.last_good is None or entry.fetched_at is None:
         return None
     headroom = oauth.account_headroom(entry.last_good)
@@ -155,8 +167,8 @@ def _usage_entry_lines(entry: UsageEntry) -> list[str]:
     error, so a failing endpoint is visible instead of a silent blank.
     """
     if entry.sentinel is not None:
-        out = [dimmed(_SENTINEL_NOTES.get(entry.sentinel, entry.sentinel))]
-        last_seen = _last_seen_note(entry)
+        out = [dimmed(SENTINEL_NOTES.get(entry.sentinel, entry.sentinel))]
+        last_seen = last_seen_note(entry)
         if last_seen is not None and entry.sentinel != USAGE_API_KEY:
             out.append(f"{dimmed('└')} {muted(last_seen)}")
         return out
@@ -819,7 +831,7 @@ class ListReporter:
                 print(f"     {line}")
             if entry.sentinel is not None:
                 health_notes.setdefault(str(num), []).append(
-                    _SENTINEL_NOTES.get(entry.sentinel, entry.sentinel)
+                    SENTINEL_NOTES.get(entry.sentinel, entry.sentinel)
                 )
             elif entry.last_good is None:
                 note = "usage unavailable"

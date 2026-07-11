@@ -323,7 +323,7 @@ def _refresh_fingerprint(credentials: str) -> str | None:
     return "sha256:" + hashlib.sha256(token.encode()).hexdigest()
 
 
-def _binding_pct(usage: dict[str, Any] | None) -> float | None:
+def binding_pct(usage: dict[str, Any] | None) -> float | None:
     """Utilization of the binding (higher) 5h/7d window, or None."""
     headroom = oauth.account_headroom(usage)
     return None if headroom is None else 100.0 - headroom
@@ -922,7 +922,7 @@ class AutoSwitchEngine:
         escalation are enforced elsewhere and unaffected.
         """
         interval = float(self.settings.interval_seconds)
-        pct = _binding_pct(entry.last_good)
+        pct = binding_pct(entry.last_good)
         if pct is None:
             return interval
         distance = (self.settings.threshold - ESCALATION_MARGIN_PCT) - pct
@@ -962,8 +962,8 @@ class AutoSwitchEngine:
             if after.fetched_at is None or after.fetched_at == before.fetched_at:
                 continue  # not fetched this pass
             base = before.poll_interval_s or self.settings.interval_seconds
-            prev_pct = _binding_pct(before.last_good)
-            new_pct = _binding_pct(after.last_good)
+            prev_pct = binding_pct(before.last_good)
+            new_pct = binding_pct(after.last_good)
             if prev_pct is None or new_pct is None:
                 interval = self.settings.interval_seconds
             elif abs(new_pct - prev_pct) >= MOVEMENT_DELTA_PCT:

@@ -1,11 +1,12 @@
 [project]
 name = "claude-swap"
-version = "0.18.0+haotool.1"
+version = "0.18.1+haotool.1"
 description = "Multi-account switcher for Claude Code"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "keyring>=25.0.0",
+    "textual>=8.2.8,<9",
     "truststore>=0.10.4",
 ]
 authors = [{name = "Onur Cetinkol", email = "onurcetinkol@gmail.com"}]
@@ -45,6 +46,7 @@ packages = ["src/claude_swap"]
 [dependency-groups]
 dev = [
     "pytest>=8.0",
+    "pytest-asyncio>=0.24",
     "pytest-cov>=6.0",
     "ruff>=0.15.20",
     "mypy>=1.14",
@@ -71,6 +73,7 @@ warn_unreachable = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+asyncio_default_fixture_loop_scope = "function"
 markers = [
     "no_keychain_fake: opt out of the autouse in-memory Keychain guard (test mocks subprocess itself, or runs against a temp keychain on GitHub Actions)",
     "windows_service_integration: real Task Scheduler registration round-trip (CI windows-task-scheduler job only)",
