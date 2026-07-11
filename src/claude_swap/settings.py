@@ -41,9 +41,11 @@ class AutoSwitchSettings:
     ``threshold`` is binding-window utilization (max of the 5h/7d percentages):
     at or above it the engine looks for a better account. 90 rather than 95
     leaves margin for the macOS ~30s Keychain pickup tail and for heavy
-    subagent turns burning past the mark before a swap lands. A candidate only
-    qualifies while its own utilization sits at least ``hysteresis_pct`` below
-    the threshold, so two accounts hovering at the line never ping-pong.
+    subagent turns burning past the mark before a swap lands. A proactive
+    candidate must itself sit below the threshold (never land somewhere that
+    re-triggers next tick) and beat the active account's utilization by at
+    least ``hysteresis_pct``, so two accounts hovering at the line never
+    ping-pong while a strictly better account is always taken.
     """
 
     threshold: float = 90.0
@@ -53,6 +55,13 @@ class AutoSwitchSettings:
     strategy: str = "best"  # reserved for future strategies; only "best" in v1
     include_api_key_accounts: bool = False
     unhealthy_ticks: int = 3
+    # Comma-separated model display name(s) (e.g. "Fable" or "Fable,Opus"),
+    # or "all" for every scoped window an account reports. Each named model's
+    # per-model weekly limit is folded into the binding window, so the engine
+    # switches off an account whose model quota is exhausted even while its
+    # 5h/7d windows still have headroom. None = account-wide 5h/7d only
+    # (default).
+    model: str | None = None
 
 
 @dataclass(frozen=True)
@@ -102,7 +111,7 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         ),
         SettingSpec(
             "autoswitch", "hysteresisPct", "hysteresis_pct", "float", 0.0, 50.0,
-            help="A target must sit this many pct below the threshold",
+            help="A target must beat the active account by this many pct",
         ),
         SettingSpec(
             "autoswitch", "strategy", "strategy", "choice", choices=("best",),
@@ -116,6 +125,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             "autoswitch", "unhealthyTicks", "unhealthy_ticks", "int", 1, 100,
             help="Consecutive failed polls before an account is unhealthy",
         ),
+        SettingSpec(
+            "autoswitch", "model", "model", "string",
+            help="Also switch on these models' weekly limits (e.g. Fable, Fable,Opus, or all)",
+        ),
     )
 }
 
@@ -126,6 +139,20 @@ _AUTOSWITCH_KEYS: dict[str, str] = {
 
 def settings_path(backup_root: Path) -> Path:
     return backup_root / SETTINGS_FILENAME
+
+
+def parse_model_names(value: str | None) -> tuple[str, ...]:
+    """Split a comma-separated model list, trimmed and case-insensitively
+    deduped (first spelling wins). Shared by the auto engine and the manual
+    switch strategies so both read ``autoswitch.model`` identically."""
+    if not value:
+        return ()
+    seen: dict[str, str] = {}
+    for part in value.split(","):
+        name = part.strip()
+        if name and name.lower() not in seen:
+            seen[name.lower()] = name
+    return tuple(seen.values())
 
 
 def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
@@ -148,6 +175,10 @@ def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
             kwargs[spec.field] = int(clamped) if spec.kind == "int" else clamped
         elif spec.kind == "bool":
             kwargs[spec.field] = bool(value)
+        elif spec.kind == "string":
+            # A non-empty string keeps as-is; anything else reverts to default
+            # (None) so a null/garbage settings.json value disables the filter.
+            kwargs[spec.field] = value if isinstance(value, str) and value else spec.default
         else:  # choice
             if value not in spec.choices:
                 _logger.warning(
@@ -243,24 +274,34 @@ def parse_setting_value(spec: SettingSpec, raw_value: str) -> bool | int | float
                 f"{spec.dotted} must be one of: {', '.join(spec.choices)}"
             )
         return raw_value
+    if spec.kind == "string":
+        value = raw_value.strip()
+        if not value:
+            raise ConfigError(
+                f"{spec.dotted} expects a non-empty value; use "
+                f"'cswap config unset {spec.dotted}' to clear it"
+            )
+        return value
     try:
-        value = int(raw_value) if spec.kind == "int" else float(raw_value)
+        num = int(raw_value) if spec.kind == "int" else float(raw_value)
     except ValueError:
         noun = "an integer" if spec.kind == "int" else "a number"
         raise ConfigError(
             f"{spec.dotted} expects {noun}, got '{raw_value}'"
         ) from None
     assert spec.lo is not None and spec.hi is not None  # numeric specs carry bounds
-    if not spec.lo <= value <= spec.hi:
+    if not spec.lo <= num <= spec.hi:
         raise ConfigError(
             f"{spec.dotted} must be between {format_setting_value(spec.lo)} "
             f"and {format_setting_value(spec.hi)}"
         )
-    return value
+    return num
 
 
 def format_setting_value(value: object) -> str:
     """Render a settings value the way settings.json writes it."""
+    if value is None:
+        return "(none)"
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, float) and value.is_integer():
@@ -363,6 +404,7 @@ def merged_with_cli(
         ("interval", "interval_seconds"),
         ("cooldown", "cooldown_seconds"),
         ("include_api_key_accounts", "include_api_key_accounts"),
+        ("model", "model"),
     ):
         value = getattr(args, attr, None)
         if value is not None:

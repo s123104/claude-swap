@@ -73,7 +73,6 @@ from claude_swap.sequence_store import (
     SequenceStore,
 )
 from claude_swap.switch_cli import run_switch_cli
-from claude_swap.usage_policy import headroom, rank_headroom_best
 from claude_swap.usage_store import UsageEntry, UsageStore
 from typing import Any, cast
 
@@ -1449,8 +1448,46 @@ class ClaudeAccountSwitcher:
         entries = reporter.collect_usage_entries(accounts_info)
         return {num: entry.decision_value() for num, entry in entries.items()}
 
+    def _warn_inert_models(
+        self,
+        usage: dict[str, Any],
+        models: tuple[str, ...],
+        json_output: bool,
+        warnings: list[str],
+    ) -> None:
+        """One-shot typo guard for --model on the manual strategies.
+
+        A configured name that no account reports gates nothing while looking
+        active. Only claimed when every account's usage is readable (an
+        unreadable account could be the one carrying the window)."""
+        wanted = {m.lower(): m for m in models if m.lower() != "all"}
+        if not wanted or not usage:
+            return
+        if any(not isinstance(v, dict) for v in usage.values()):
+            return
+        seen = {
+            s["name"].lower()
+            for v in usage.values()
+            for s in (v.get("scoped") or [])
+            if isinstance(s, dict) and isinstance(s.get("name"), str)
+        }
+        missing = [name for low, name in wanted.items() if low not in seen]
+        if not missing:
+            return
+        msg = (
+            f"model(s) {', '.join(missing)} match no account's usage windows "
+            "(typo?)"
+        )
+        if json_output:
+            warnings.append(msg)
+        else:
+            warning(msg)
+
     def _select_best_switchable(
-        self, current_num: str | None
+        self,
+        current_num: str | None,
+        models: tuple[str, ...] = (),
+        usage: dict[str, dict[str, Any] | str | None] | None = None,
     ) -> tuple[str | None, str]:
         """Decide the ``best`` strategy target relative to the current account.
 
@@ -1459,7 +1496,9 @@ class ClaudeAccountSwitcher:
         lands on strictly more headroom — never onto an account worse than (or
         merely unverifiable against) where the user already is. When a switch
         can't be proven beneficial, it stays put; bare ``cswap --switch``
-        remains the way to force a plain rotation. Returns ``(target, note)``:
+        remains the way to force a plain rotation. ``models`` folds the named
+        per-model weekly windows into every headroom comparison (see
+        ``oauth.account_headroom``). Returns ``(target, note)``:
 
         - ``(num, "")`` — switch to ``num`` (strictly more headroom than current)
         - ``(None, "current-unavailable")`` — current account's usage is unknown,
@@ -1481,13 +1520,46 @@ class ClaudeAccountSwitcher:
             str(n) for n in data.get("sequence", [])
             if str(n) != str(current_num) and self._account_is_switchable(str(n))
         ]
-        usage = self._usage_by_account()
-        result = rank_headroom_best(
-            cast("dict[str, object]", usage),
-            current=str(current_num) if current_num is not None else None,
-            others=others,
+        if not others:
+            return None, "none"
+
+        if usage is None:
+            usage = self._usage_by_account()
+        current_value = usage.get(str(current_num))
+        current_headroom = oauth.account_headroom(
+            current_value if isinstance(current_value, dict) else None, models
         )
-        return result.target, result.note or ""
+        if current_headroom is None:
+            # Can't measure where the user is → can't prove any target is
+            # better. Stay rather than risk moving onto a worse account.
+            return None, "current-unavailable"
+
+        scored = [
+            (
+                oauth.account_headroom(
+                    v if isinstance(v := usage.get(num), dict) else None, models
+                ),
+                num,
+            )
+            for num in others
+        ]
+        known = [(h, num) for h, num in scored if h is not None]
+        if not known:
+            return None, "no-comparison"
+
+        # max() keeps the first maximal element; `known` preserves rotation
+        # order, so ties resolve to the earliest slot.
+        best_headroom, best_num = max(known, key=lambda t: t[0])
+        if best_headroom > current_headroom:
+            return best_num, ""
+
+        # Current is at least as good as every account we can measure. Stay —
+        # but only claim "all exhausted" when every candidate's usage is known.
+        if any(h is None for h, _ in scored):
+            return None, "incomplete-comparison"
+        if current_headroom <= 0:
+            return None, "exhausted"
+        return None, "stay"
 
     def _switch_result_from_op(
         self, op: dict[str, Any], strategy: str, extra_warnings: list[str] | None = None
@@ -1624,6 +1696,8 @@ class ClaudeAccountSwitcher:
         quiet: bool,
         skip_exhausted: bool = False,
         warnings: list[str] | None = None,
+        models: tuple[str, ...] = (),
+        usage: dict[str, dict[str, Any] | str | None] | None = None,
     ) -> tuple[str | None, bool]:
         """Return the next switchable slot in rotation order.
 
@@ -1643,7 +1717,10 @@ class ClaudeAccountSwitcher:
             except (ValueError, TypeError):
                 current_index = 0
 
-        usage = self._usage_by_account() if skip_exhausted else {}
+        # Only fetch usage when needed; an empty map means the headroom check
+        # below is always None (skipped), preserving the non-usage-aware path.
+        if usage is None:
+            usage = self._usage_by_account() if skip_exhausted else {}
 
         def skip_notice(candidate: str, short: str, long: str) -> None:
             if warnings is not None:
@@ -1665,10 +1742,27 @@ class ClaudeAccountSwitcher:
                 )
                 continue
             if skip_exhausted:
-                room = headroom(usage.get(candidate))
+                cand_value = usage.get(candidate)
+                cand_usage = cand_value if isinstance(cand_value, dict) else None
+                room = oauth.account_headroom(cand_usage, models)
                 if room is not None and room <= 0:
                     hit_limit = True
-                    skip_notice(candidate, "at 5h/7d limit", "at 5h/7d limit")
+                    label = "5h/7d"
+                    if models:
+                        # Name what actually binds ("Fable", "5h/Fable", ...)
+                        # so a config-driven skip is never mysterious.
+                        at = [
+                            name
+                            for name, pct, _ in oauth.relevant_windows(
+                                cand_usage, models
+                            )
+                            if pct >= 100.0
+                        ]
+                        if at:
+                            label = "/".join(at)
+                    skip_notice(
+                        candidate, f"at {label} limit", f"at {label} limit"
+                    )
                     continue
             return candidate, hit_limit
         return None, hit_limit
@@ -1856,11 +1950,19 @@ class ClaudeAccountSwitcher:
         *,
         strategy: str | None = None,
         json_output: bool = False,
+        models: tuple[str, ...] = (),
+        model_source: str | None = None,
     ) -> dict[str, Any] | bool | None:
         """Switch to another managed account.
 
         Returns ``True`` when credentials were activated on a different slot,
         ``False`` when no switch was needed.
+
+        ``models`` folds the named per-model weekly windows into every usage
+        comparison of the usage-aware strategies (see
+        ``oauth.relevant_windows``); ``model_source`` records where they came
+        from (``"cli"`` or ``"autoswitch.model"``) so the choice is announced,
+        never silent.
 
         Pass an explicit intent:
           * ``ManualSwitchIntent()`` — interactive round-robin (default)
@@ -1869,6 +1971,7 @@ class ClaudeAccountSwitcher:
         if strategy is not None or json_output:
             return run_switch_cli(
                 self, strategy=strategy, json_output=json_output,
+                models=models, model_source=model_source,
             )
         else:
             if intent is None:

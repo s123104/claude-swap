@@ -45,7 +45,7 @@ from claude_swap import oauth
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
 from claude_swap.locking import FileLock
-from claude_swap.settings import AutoSwitchSettings, atomic_write_json
+from claude_swap.settings import AutoSwitchSettings, atomic_write_json, parse_model_names
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.usage_store import UsageEntry, due_candidate
 
@@ -144,6 +144,11 @@ class PollEvent(AutoSwitchEvent):
     # account number → last fetch-error cause ("http-429", "timeout", ...) for
     # accounts whose usage is unknown this tick. Additive field.
     fetch_errors: dict[str, str] = field(default_factory=dict)
+    # account number → ordered window label → utilization pct ("5h", "7d",
+    # then scoped model display names). Additive field: the binding pct alone
+    # (e.g. "89%") hides which window binds — #115 was reported off that
+    # ambiguity.
+    windows: dict[str, dict[str, float]] = field(default_factory=dict)
 
     def _fields(self) -> dict[str, Any]:
         fields = {
@@ -153,9 +158,14 @@ class PollEvent(AutoSwitchEvent):
         }
         if self.fetch_errors:
             fields["fetchErrors"] = self.fetch_errors
+        if self.windows:
+            fields["windowsPct"] = self.windows
         return fields
 
     def _describe(self, num: str) -> str:
+        wins = self.windows.get(num)
+        if wins:
+            return " · ".join(f"{name} {pct:.0f}%" for name, pct in wins.items())
         h = self.headroom.get(num)
         if h is not None:
             return f"{100 - h:.0f}%"
@@ -300,6 +310,22 @@ class ErrorEvent(AutoSwitchEvent):
         return f"error: {self.message}" + (" (will retry)" if self.transient else "")
 
 
+@dataclass(frozen=True)
+class ConfigWarningEvent(AutoSwitchEvent):
+    """A configuration value is syntactically fine but provably inert (e.g.
+    an ``autoswitch.model`` name no account reports). Not an error: the
+    engine keeps running on the axes that do exist."""
+
+    kind: ClassVar[str] = "config-warning"
+    message: str
+
+    def _fields(self) -> dict[str, Any]:
+        return {"message": self.message}
+
+    def human(self) -> str:
+        return f"warning: {self.message}"
+
+
 # ---------------------------------------------------------------------------
 # Engine
 # ---------------------------------------------------------------------------
@@ -322,47 +348,58 @@ class TickOutcome(enum.Enum):
 _refresh_fingerprint = oauth.credential_fingerprint
 
 
-def binding_pct(usage: dict[str, Any] | None) -> float | None:
-    """Utilization of the binding (higher) 5h/7d window, or None."""
-    headroom = oauth.account_headroom(usage)
+def binding_pct(
+    usage: dict[str, Any] | None, models: tuple[str, ...] = ()
+) -> float | None:
+    """Utilization of the binding (worst) relevant window, or None."""
+    headroom = oauth.account_headroom(usage, models)
     return None if headroom is None else 100.0 - headroom
 
 
-def _limiting_reset_ts(usage: dict[str, Any] | None) -> float | None:
-    """Epoch when the last of the ≥100% windows resets (account usable again)."""
-    if not isinstance(usage, dict):
-        return None
+def _window_pcts(
+    usage: dict[str, Any] | None, models: tuple[str, ...] = ()
+) -> dict[str, float]:
+    """Ordered window label → pct: "5h", "7d", then configured scoped names.
+
+    Deliberately restricted to the windows the *decision* reads (same
+    ``models`` filter): showing an unconfigured scoped window at 100% next
+    to a switch onto that account would look like a bug, when the engine
+    correctly ignored it. Full per-model usage lives in ``cswap list``.
+    """
+    return {
+        name: pct for name, pct, _ in oauth.relevant_windows(usage, models)
+    }
+
+
+def _limiting_reset_ts(
+    usage: dict[str, Any] | None, models: tuple[str, ...] = ()
+) -> float | None:
+    """Epoch when the last of the ≥100% relevant windows resets (account
+    usable again)."""
     latest: float | None = None
-    for key in ("five_hour", "seven_day"):
-        window = usage.get(key)
-        if not isinstance(window, dict):
+    for _, pct, resets_at in oauth.relevant_windows(usage, models):
+        if pct < 100.0:
             continue
-        pct = window.get("pct")
-        if not isinstance(pct, (int, float)) or pct < 100.0:
-            continue
-        ts = _window_reset_ts(window)
+        ts = _parse_reset_ts(resets_at)
         if ts is not None and (latest is None or ts > latest):
             latest = ts
     return latest
 
 
-def _earliest_future_reset_ts(usage: dict[str, Any] | None, now: float) -> float | None:
-    """Epoch of the next window reset still ahead of ``now``, any utilization."""
-    if not isinstance(usage, dict):
-        return None
+def _earliest_future_reset_ts(
+    usage: dict[str, Any] | None, now: float, models: tuple[str, ...] = ()
+) -> float | None:
+    """Epoch of the next relevant-window reset ahead of ``now``, any
+    utilization."""
     earliest: float | None = None
-    for key in ("five_hour", "seven_day"):
-        window = usage.get(key)
-        if not isinstance(window, dict):
-            continue
-        ts = _window_reset_ts(window)
+    for _, _, resets_at in oauth.relevant_windows(usage, models):
+        ts = _parse_reset_ts(resets_at)
         if ts is not None and ts > now and (earliest is None or ts < earliest):
             earliest = ts
     return earliest
 
 
-def _window_reset_ts(window: dict[str, Any]) -> float | None:
-    resets_at = window.get("resets_at")
+def _parse_reset_ts(resets_at: str | None) -> float | None:
     if not resets_at:
         return None
     try:
@@ -397,6 +434,12 @@ class AutoSwitchEngine:
     ):
         self.switcher = switcher
         self.settings = settings
+        # Model(s) whose per-model weekly limit also binds the switch decision
+        # (empty = account-wide 5h/7d only). ``settings.model`` is a comma-
+        # separated list ("Fable", "Opus,Sonnet", "all"); parse once here and
+        # pass everywhere usage windows are read — decisions, cadence, and
+        # reset scheduling must all see the same axes.
+        self._models = parse_model_names(settings.model)
         self.on_event = on_event
         self.dry_run = dry_run
         self.state_path = state_path or (switcher.backup_dir / STATE_FILENAME)
@@ -414,6 +457,10 @@ class AutoSwitchEngine:
         # ``_idle_hold_slow`` is per-tick like ``_blocked_wait_long``.
         self._idle_hold_since: float | None = None
         self._idle_hold_slow = False
+        # One-shot typo guard for ``autoswitch.model``: resolved (and possibly
+        # warned) on the first tick where every relevant account has readable
+        # usage — adaptive polling legitimately leaves gaps before that.
+        self._model_check_done = not self._models
 
     # -- state file ---------------------------------------------------------
 
@@ -675,8 +722,18 @@ class AutoSwitchEngine:
                     for num, entry in entries.items()
                     if usage.get(num) is None and entry.last_error
                 },
+                windows={
+                    num: pcts
+                    for num, value in usage.items()
+                    if (pcts := _window_pcts(
+                        value if isinstance(value, dict) else None, self._models
+                    ))
+                },
             )
         )
+
+        if not self._model_check_done:
+            self._check_model_names(quarantined, usage)
 
         if (
             self.switcher.account_kind_for(current) == "api_key"
@@ -777,7 +834,6 @@ class AutoSwitchEngine:
             self._emit(NoSwitchEvent(reason="no-candidates"))
             return TickOutcome.BLOCKED
 
-        hysteresis_bar = settings.threshold - settings.hysteresis_pct
         qualifying: list[tuple[float, str]] = []
         any_known = False
         for num in oauth_candidates:
@@ -787,15 +843,19 @@ class AutoSwitchEngine:
             any_known = True
             if h <= 0:
                 continue  # itself at its limit — never a target
-            if trigger == "proactive":
+            if trigger == "proactive" and active_headroom is not None:
                 # Hysteresis guards only the proactive case: two accounts
-                # hovering at the line must not ping-pong. At-limit and
-                # failover are escapes — any account with real headroom
-                # beats a blocked or dead one (and you can't flap back onto
-                # an account at 100%).
-                if (100.0 - h) > hysteresis_bar:
+                # hovering at the line must not ping-pong. The gate is
+                # relative — the candidate must beat the active account by
+                # the full margin (a one-way move like 99%→89% qualifies;
+                # near-line pairs can't flap back) — and the landing must be
+                # healthy: an account at/over the threshold would re-trigger
+                # on the very next tick. At-limit and failover are escapes —
+                # any account with real headroom beats a blocked or dead one
+                # (and you can't flap back onto an account at 100%).
+                if (100.0 - h) >= settings.threshold:
                     continue
-                if active_headroom is not None and h <= active_headroom:
+                if h - active_headroom < settings.hysteresis_pct:
                     continue  # not provably better than where we are
             qualifying.append((h, num))
         # Best headroom first; list order (sequence order) breaks ties.
@@ -817,7 +877,7 @@ class AutoSwitchEngine:
             # "All exhausted" (and its hours-long reset sleep) only when it's
             # literally true: every candidate's usage is known and at its
             # limit. A candidate that merely failed the proactive hysteresis
-            # bar, or one whose usage is unreadable this tick, can become
+            # gate, or one whose usage is unreadable this tick, can become
             # viable at any moment — and the active account can hit 100% and
             # need the at-limit escape — so those keep the normal cadence.
             candidate_headrooms = [headroom.get(n) for n in oauth_candidates]
@@ -829,14 +889,15 @@ class AutoSwitchEngine:
                     NoSwitchEvent(
                         reason="no-qualifying-candidate",
                         detail=(
-                            "candidates are too close to the line or their "
-                            "usage is unreadable this tick"
+                            "no candidate is below the threshold and better "
+                            "than the active account by the hysteresis "
+                            "margin, or usage is unreadable this tick"
                         ),
                     )
                 )
                 return TickOutcome.BLOCKED
             self._blocked_wait_long = True
-            earliest = self._earliest_reset(usage)
+            earliest = self._earliest_recovery(usage)
             if earliest is not None:
                 self._sleep_until_ts = earliest.timestamp() + RESET_SLACK_S
             self._emit(
@@ -945,7 +1006,7 @@ class AutoSwitchEngine:
 
         active_value = usage.get(current)
         active_headroom = oauth.account_headroom(
-            active_value if isinstance(active_value, dict) else None
+            active_value if isinstance(active_value, dict) else None, self._models
         )
         escalate = bool(candidates) and (
             (active_headroom is None and active_value != USAGE_TOKEN_EXPIRED)
@@ -962,7 +1023,9 @@ class AutoSwitchEngine:
             usage = {num: entry.decision_value() for num, entry in entries.items()}
 
         headroom = {
-            num: oauth.account_headroom(value if isinstance(value, dict) else None)
+            num: oauth.account_headroom(
+                value if isinstance(value, dict) else None, self._models
+            )
             for num, value in usage.items()
         }
         if not self.dry_run:
@@ -981,7 +1044,7 @@ class AutoSwitchEngine:
         escalation are enforced elsewhere and unaffected.
         """
         interval = float(self.settings.interval_seconds)
-        pct = binding_pct(entry.last_good)
+        pct = binding_pct(entry.last_good, self._models)
         if pct is None:
             return interval
         distance = (self.settings.threshold - ESCALATION_MARGIN_PCT) - pct
@@ -1021,8 +1084,8 @@ class AutoSwitchEngine:
             if after.fetched_at is None or after.fetched_at == before.fetched_at:
                 continue  # not fetched this pass
             base = before.poll_interval_s or self.settings.interval_seconds
-            prev_pct = binding_pct(before.last_good)
-            new_pct = binding_pct(after.last_good)
+            prev_pct = binding_pct(before.last_good, self._models)
+            new_pct = binding_pct(after.last_good, self._models)
             if prev_pct is None or new_pct is None:
                 interval = self.settings.interval_seconds
             elif abs(new_pct - prev_pct) >= MOVEMENT_DELTA_PCT:
@@ -1030,13 +1093,15 @@ class AutoSwitchEngine:
             else:
                 interval = min(CANDIDATE_MAX_INTERVAL_S, base * 1.5)
             next_poll = now + interval
-            headroom = oauth.account_headroom(after.last_good)
+            headroom = oauth.account_headroom(after.last_good, self._models)
             if headroom is not None and headroom <= 0:
-                reset_ts = _limiting_reset_ts(after.last_good)
+                reset_ts = _limiting_reset_ts(after.last_good, self._models)
                 if reset_ts is not None and reset_ts > next_poll:
                     next_poll = reset_ts
             else:
-                reset_ts = _earliest_future_reset_ts(after.last_good, now)
+                reset_ts = _earliest_future_reset_ts(
+                    after.last_good, now, self._models
+                )
                 if reset_ts is not None:
                     next_poll = min(next_poll, reset_ts + RESET_SLACK_S)
             plans[num] = (next_poll, interval)
@@ -1102,26 +1167,86 @@ class AutoSwitchEngine:
             return False
         return (self.clock() - last) < self.settings.cooldown_seconds
 
-    @staticmethod
-    def _earliest_reset(
-        usage: dict[str, dict[str, Any] | str | None]
+    def _check_model_names(
+        self,
+        quarantined: frozenset[str],
+        usage: dict[str, dict[str, Any] | str | None],
+    ) -> None:
+        """One-shot ``autoswitch.model`` typo guard.
+
+        A configured name that no account reports means the filter looks
+        active while gating nothing. That's only provable once every
+        relevant oauth account has readable usage this tick — adaptive
+        polling legitimately leaves gaps before that — and never worth a
+        forced refresh of its own.
+        """
+        wanted = {m.lower(): m for m in self._models if m.lower() != "all"}
+        if not wanted:
+            self._model_check_done = True  # bare "all" needs no name match
+            return
+        relevant = [
+            n
+            for n in self.switcher.switchable_account_numbers()
+            if n not in quarantined
+            and self.switcher.account_kind_for(n) != "api_key"
+        ]
+        values = [usage.get(n) for n in relevant]
+        readable = [v for v in values if isinstance(v, dict)]
+        if not readable or len(readable) != len(values):
+            return  # not every account observed yet — re-check next tick
+        seen = {
+            s["name"].lower()
+            for v in readable
+            for s in (v.get("scoped") or [])
+            if isinstance(s, dict) and isinstance(s.get("name"), str)
+        }
+        self._model_check_done = True
+        missing = [name for low, name in wanted.items() if low not in seen]
+        if missing:
+            self._emit(
+                ConfigWarningEvent(
+                    message=(
+                        f"autoswitch.model: {', '.join(missing)} matches no "
+                        "account's usage windows — only the 5h/7d limits are "
+                        "being watched for it (typo?)"
+                    )
+                )
+            )
+
+    def _earliest_recovery(
+        self, usage: dict[str, dict[str, Any] | str | None]
     ) -> datetime | None:
-        """Earliest known window reset across all accounts (UTC)."""
-        earliest: datetime | None = None
-        for entry in usage.values():
-            if not isinstance(entry, dict):
+        """Earliest moment any account becomes usable again (UTC), or None
+        when that moment can't be proven.
+
+        Per account that's the *latest* reset among its ≥100% relevant
+        windows — an account blocked on both 5h and a scoped weekly limit
+        isn't usable when the 5h rolls over — then the minimum across
+        accounts, the active one included (its recovery also ends the
+        blocked state). A blocked account whose exhausted windows carry no
+        reset time at all could recover at any moment, so it makes the whole
+        answer unprovable: return None and let the bounded blocked-cadence
+        fallback re-check, rather than sleeping toward another account's
+        later known reset."""
+        earliest: float | None = None
+        for value in usage.values():
+            if not isinstance(value, dict):
                 continue
-            for window in ("five_hour", "seven_day"):
-                resets_at = (entry.get(window) or {}).get("resets_at")
-                if not resets_at:
-                    continue
-                try:
-                    when = datetime.fromisoformat(str(resets_at).replace("Z", "+00:00"))
-                except ValueError:
-                    continue
-                if earliest is None or when < earliest:
-                    earliest = when
-        return earliest
+            blocked = [
+                resets_at
+                for _, pct, resets_at in oauth.relevant_windows(value, self._models)
+                if pct >= 100.0
+            ]
+            if not blocked:
+                continue  # not exhausted — doesn't gate the blocked state
+            usable_at = _limiting_reset_ts(value, self._models)
+            if usable_at is None:
+                return None  # blocked with unprovable recovery — don't oversleep
+            if earliest is None or usable_at < earliest:
+                earliest = usable_at
+        if earliest is None:
+            return None
+        return datetime.fromtimestamp(earliest, tz=timezone.utc)
 
     def _emit(self, event: AutoSwitchEvent) -> None:
         self.on_event(event)

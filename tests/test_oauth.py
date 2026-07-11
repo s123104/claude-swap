@@ -63,6 +63,94 @@ class TestAccountHeadroom:
     def test_malformed_pct_is_ignored(self):
         assert oauth.account_headroom({"five_hour": {"pct": None}}) is None
 
+    def test_scoped_ignored_without_models_arg(self):
+        # Default behavior is unchanged: per-model windows never bind.
+        usage = {"five_hour": {"pct": 10.0}, "scoped": [{"name": "Fable", "pct": 100.0}]}
+        assert oauth.account_headroom(usage) == 90.0
+
+    def test_named_model_folds_into_binding_window(self):
+        usage = {"five_hour": {"pct": 10.0}, "scoped": [{"name": "Fable", "pct": 95.0}]}
+        assert oauth.account_headroom(usage, ["Fable"]) == 5.0
+
+    def test_maxed_model_is_at_limit_despite_session_headroom(self):
+        # The exact motivating case: 5h/7d fine, but the model is exhausted.
+        usage = {
+            "five_hour": {"pct": 1.0},
+            "seven_day": {"pct": 40.0},
+            "scoped": [{"name": "Fable", "pct": 100.0}],
+        }
+        assert oauth.account_headroom(usage, ["Fable"]) == 0.0
+
+    def test_model_match_is_case_insensitive(self):
+        usage = {"scoped": [{"name": "Fable", "pct": 70.0}]}
+        assert oauth.account_headroom(usage, ["fable"]) == 30.0
+
+    def test_unlisted_model_does_not_bind(self):
+        usage = {"five_hour": {"pct": 10.0}, "scoped": [{"name": "Opus", "pct": 100.0}]}
+        assert oauth.account_headroom(usage, ["Fable"]) == 90.0
+
+    def test_multiple_models_take_the_worst(self):
+        usage = {
+            "five_hour": {"pct": 10.0},
+            "scoped": [
+                {"name": "Fable", "pct": 30.0},
+                {"name": "Opus", "pct": 95.0},
+                {"name": "Haiku", "pct": 50.0},
+            ],
+        }
+        # Opus binds (95%); Sonnet is absent and simply contributes nothing.
+        assert oauth.account_headroom(usage, ["Fable", "Opus", "Sonnet"]) == 5.0
+
+    def test_works_for_any_model_name(self):
+        for name in ("Opus", "Sonnet", "Haiku"):
+            usage = {"scoped": [{"name": name, "pct": 100.0}]}
+            assert oauth.account_headroom(usage, [name]) == 0.0
+
+    def test_only_scoped_and_named_yields_headroom(self):
+        # No 5h/7d at all (the live shape when the API returns only limits).
+        assert oauth.account_headroom({"scoped": [{"name": "Fable", "pct": 100.0}]}, ["Fable"]) == 0.0
+
+    def test_scoped_without_5h7d_and_unlisted_model_is_unknown(self):
+        usage = {"scoped": [{"name": "Opus", "pct": 100.0}]}
+        assert oauth.account_headroom(usage, ["Fable"]) is None
+
+    def test_all_sentinel_matches_every_scoped_window(self):
+        usage = {
+            "five_hour": {"pct": 10.0},
+            "scoped": [
+                {"name": "Fable", "pct": 30.0},
+                {"name": "Sonnet", "pct": 97.0},
+            ],
+        }
+        assert oauth.account_headroom(usage, ["all"]) == 3.0
+        assert oauth.account_headroom(usage, ["ALL"]) == 3.0
+
+
+class TestRelevantWindows:
+    """Test relevant_windows — the canonical window source."""
+
+    def test_carries_labels_pcts_and_resets(self):
+        usage = {
+            "five_hour": {"pct": 80.0, "resets_at": "2026-07-10T12:00:00Z"},
+            "seven_day": {"pct": 20.0},
+            "scoped": [
+                {"name": "Fable", "pct": 95.0, "resets_at": "2026-07-12T09:00:00Z"},
+            ],
+        }
+        assert oauth.relevant_windows(usage, ["Fable"]) == [
+            ("5h", 80.0, "2026-07-10T12:00:00Z"),
+            ("7d", 20.0, None),
+            ("Fable", 95.0, "2026-07-12T09:00:00Z"),
+        ]
+
+    def test_scoped_excluded_without_models(self):
+        usage = {"five_hour": {"pct": 10.0}, "scoped": [{"name": "Fable", "pct": 99.0}]}
+        assert oauth.relevant_windows(usage) == [("5h", 10.0, None)]
+
+    def test_non_dict_usage_is_empty(self):
+        assert oauth.relevant_windows(None) == []
+        assert oauth.relevant_windows("no credentials") == []
+
 
 class TestFormatReset:
     """Test format_reset."""

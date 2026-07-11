@@ -30,10 +30,13 @@ def run_switch_cli(
     *,
     strategy: str | None = None,
     json_output: bool = False,
+    models: tuple[str, ...] = (),
+    model_source: str | None = None,
 ) -> dict[str, Any] | None:
     """Run a strategy-aware CLI switch via *switcher*."""
     return SwitchCliDispatcher(switcher).run(
         strategy=strategy, json_output=json_output,
+        models=models, model_source=model_source,
     )
 
 
@@ -44,7 +47,11 @@ class SwitchCliDispatcher:
         self._switcher = switcher
 
     def run(
-        self, strategy: str | None = None, json_output: bool = False,
+        self,
+        strategy: str | None = None,
+        json_output: bool = False,
+        models: tuple[str, ...] = (),
+        model_source: str | None = None,
     ) -> dict[str, Any] | None:
         """Switch to next account in sequence.
 
@@ -54,6 +61,13 @@ class SwitchCliDispatcher:
                   of advancing the rotation; ``"next-available"`` rotates to the
                   next account, skipping any currently at its 5h/7d limit. ``None``
                   (the default) performs a plain rotation.
+            models: Per-model weekly windows folded into every usage
+                  comparison of the usage-aware strategies (parsed display
+                  names, or the ``all`` sentinel — see
+                  ``oauth.relevant_windows``). Empty = 5h/7d only.
+            model_source: Where ``models`` came from (``"cli"`` or
+                  ``"autoswitch.model"``) — announced up front so a config
+                  fallback silently steering the pick is impossible.
 
         ``"best"`` only switches when it can prove another account has more
         remaining quota; if usage can't be fetched or no candidate is provably
@@ -65,6 +79,14 @@ class SwitchCliDispatcher:
         """
         strategy_label = strategy if strategy in ("best", "next-available") else "rotation"
         warnings: list[str] = []
+        if strategy_label == "rotation":
+            models = ()  # model limits only steer the usage-aware strategies
+        if models and not json_output:
+            source = "--model" if model_source == "cli" else model_source
+            print(dimmed(
+                f"Using configured model limits: {', '.join(models)}"
+                + (f" (from {source})" if source else "")
+            ))
         intent = CliSwitchIntent(
             quiet=json_output,
             force_refresh=json_output,
@@ -106,6 +128,7 @@ class SwitchCliDispatcher:
                 current_ref=current_ref,
                 json_output=json_output,
                 warnings=warnings,
+                models=models,
             )
             if handled:
                 return result
@@ -120,6 +143,7 @@ class SwitchCliDispatcher:
             current_ref=current_ref,
             json_output=json_output,
             warnings=warnings,
+            models=models,
         )
 
     def _preconditions(
@@ -193,6 +217,7 @@ class SwitchCliDispatcher:
         current_ref: dict[str, Any] | None,
         json_output: bool,
         warnings: list[str],
+        models: tuple[str, ...] = (),
     ) -> tuple[bool, dict[str, Any] | None]:
         """Usage-aware jump to the account with the most remaining quota.
 
@@ -200,7 +225,9 @@ class SwitchCliDispatcher:
         rotation (``note == "none"``).
         """
         s = self._switcher
-        target, note = s._select_best_switchable(current_num)
+        best_usage = s._usage_by_account()
+        s._warn_inert_models(best_usage, models, json_output, warnings)
+        target, note = s._select_best_switchable(current_num, models, best_usage)
         if target is not None:
             op = s._perform_switch(
                 target, intent=intent, emit_output=not json_output,
@@ -215,7 +242,7 @@ class SwitchCliDispatcher:
             if json_output:
                 return True, s._switch_noop(
                     strategy=strategy_label, reason="usage-unavailable",
-                    to_ref=current_ref,
+                    to_ref=current_ref, warnings=warnings,
                     message=(
                         f"Current account usage is unavailable — staying on "
                         f"Account-{current_num}."
@@ -230,7 +257,7 @@ class SwitchCliDispatcher:
             if json_output:
                 return True, s._switch_noop(
                     strategy=strategy_label, reason="usage-unavailable",
-                    to_ref=current_ref,
+                    to_ref=current_ref, warnings=warnings,
                     message=(
                         f"No other account has usage data to compare — staying "
                         f"on Account-{current_num}."
@@ -245,7 +272,7 @@ class SwitchCliDispatcher:
             if json_output:
                 return True, s._switch_noop(
                     strategy=strategy_label, reason="usage-unavailable",
-                    to_ref=current_ref,
+                    to_ref=current_ref, warnings=warnings,
                     message=(
                         f"No account with known usage has more remaining quota; "
                         f"some usage is unavailable — staying on Account-{current_num}."
@@ -260,7 +287,7 @@ class SwitchCliDispatcher:
             if json_output:
                 return True, s._switch_noop(
                     strategy=strategy_label, reason="already-best",
-                    to_ref=current_ref,
+                    to_ref=current_ref, warnings=warnings,
                     message=(
                         f"Already on the account with the most remaining quota "
                         f"(Account-{current_num})."
@@ -272,17 +299,20 @@ class SwitchCliDispatcher:
             )
             return True, None
         if note == "exhausted":
+            # With model limits in play the binding window may be a scoped
+            # one, so don't claim "5h/7d".
+            limits_label = "usage limits" if models else "5h/7d limit"
             if json_output:
                 return True, s._switch_noop(
                     strategy=strategy_label, reason="candidates-exhausted",
-                    to_ref=current_ref,
+                    to_ref=current_ref, warnings=warnings,
                     message=(
-                        f"All accounts are at their 5h/7d limit — staying on "
+                        f"All accounts are at their {limits_label} — staying on "
                         f"Account-{current_num}."
                     ),
                 )
             warning(
-                f"All accounts are at their 5h/7d limit — staying on "
+                f"All accounts are at their {limits_label} — staying on "
                 f"Account-{current_num}."
             )
             return True, None
@@ -300,30 +330,39 @@ class SwitchCliDispatcher:
         current_ref: dict[str, Any] | None,
         json_output: bool,
         warnings: list[str],
+        models: tuple[str, ...] = (),
     ) -> dict[str, Any] | None:
         """Find the next rotation target and perform the switch."""
         s = self._switcher
         anchor = current_num if strategy == "next-available" else active_account
+        usage = s._usage_by_account() if strategy == "next-available" else None
+        if strategy == "next-available":
+            s._warn_inert_models(usage or {}, models, json_output, warnings)
         next_account, hit_limit = s._switch_manual_rotation_target(
             sequence,
             cast("str | int | None", anchor),
             quiet=False,
             skip_exhausted=strategy == "next-available",
             warnings=warnings if json_output else None,
+            models=models,
+            usage=usage,
         )
 
         if next_account is None and hit_limit:
+            # With model limits in play the binding window may be a scoped
+            # one (the per-skip lines name it), so don't claim "5h/7d".
+            limits_label = "usage limits" if models else "5h/7d limit"
             if json_output:
                 return s._switch_noop(
                     strategy=strategy_label, reason="candidates-exhausted",
                     to_ref=current_ref, warnings=warnings,
                     message=(
-                        f"All other accounts are at their 5h/7d limit — staying on "
+                        f"All other accounts are at their {limits_label} — staying on "
                         f"Account-{current_num}."
                     ),
                 )
             warning(
-                f"All other accounts are at their 5h/7d limit — staying on "
+                f"All other accounts are at their {limits_label} — staying on "
                 f"Account-{current_num}."
             )
             return None

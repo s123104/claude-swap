@@ -213,6 +213,7 @@ Exit codes with --once:
 Examples:
   cswap auto                       # foreground loop, switch at 90%% used
   cswap auto --threshold 80        # switch earlier
+  cswap auto --model Fable         # also switch when the Fable weekly limit is hit
   cswap auto --json                # one JSON event per line (for scripts)
   cswap auto --once; echo $?       # single tick, outcome in exit code
   cswap auto --dry-run             # log decisions, never actually switch
@@ -250,6 +251,16 @@ Defaults live in settings.json in the backup root; flags override them.
         type=float,
         metavar="SECONDS",
         help="Minimum time between proactive switches (default 300)",
+    )
+    parser.add_argument(
+        "--model",
+        metavar="NAMES",
+        help=(
+            "Also switch when a per-model weekly limit is hit, not just the "
+            "account-wide 5h/7d windows. One name or a comma-separated list "
+            "(e.g. Fable, Opus, Sonnet, Haiku, or 'Fable,Opus'), or 'all' "
+            "for every per-model window an account reports"
+        ),
     )
     parser.add_argument(
         "--include-api-key-accounts",
@@ -693,6 +704,15 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         ),
     )
     parser.add_argument(
+        "--model",
+        metavar="NAMES",
+        help=(
+            "With 'switch --strategy': also count these models' per-model "
+            "weekly limits when comparing accounts (comma-separated display "
+            "names, or 'all'). Defaults to the autoswitch.model setting"
+        ),
+    )
+    parser.add_argument(
         "--slot",
         type=int,
         metavar="NUM",
@@ -855,6 +875,14 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
     if args.strategy is not None and not args.switch:
         parser.error("--strategy can only be used with bare 'switch'")
 
+    if args.model is not None and args.strategy is None:
+        # Meaningless on a direct-target switch or plain rotation — nothing
+        # usage-aware reads it there, so reject loudly rather than ignore.
+        parser.error(
+            "--model can only be used with 'switch --strategy best' or "
+            "'switch --strategy next-available'"
+        )
+
     if args.slot is not None and not (args.add_account or args.add_token is not None):
         parser.error("--slot can only be used with 'add' or 'add-token'")
 
@@ -912,9 +940,31 @@ def _dispatch_action(
     elif args.health:
         switcher.list_accounts(show_token_status=True, show_health=True)
     elif args.switch:
-        payload = switcher.switch(strategy=args.strategy, json_output=args.json)
+        from claude_swap.settings import load_settings, parse_model_names
+
+        # Only the usage-aware strategies read model limits: --model wins;
+        # otherwise the persistent autoswitch.model setting applies
+        # (announced by switch(), never silently).
+        models: tuple[str, ...]
+        if args.strategy is None:
+            models, model_source = (), None
+        elif args.model is not None:
+            models, model_source = parse_model_names(args.model), "cli"
+        else:
+            models = parse_model_names(load_settings(switcher.backup_dir).model)
+            model_source = "autoswitch.model" if models else None
+        payload = switcher.switch(
+            strategy=args.strategy,
+            json_output=args.json,
+            models=models,
+            model_source=model_source,
+        )
         if args.json:
-            return cast("dict[str, Any]", payload)
+            result = cast("dict[str, Any] | None", payload)
+            if result is not None and models:
+                result["models"] = list(models)
+                result["modelSource"] = model_source
+            return result
     elif args.switch_to:
         return switcher.switch_to(
             args.switch_to, json_output=args.json, force=args.force

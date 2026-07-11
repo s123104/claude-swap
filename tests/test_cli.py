@@ -194,16 +194,66 @@ class TestCLI:
 
     def test_switch_strategy_forwarded(self):
         """--switch --strategy best forwards the strategy to switch()."""
+        from claude_swap.settings import AutoSwitchSettings
+
         with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
              patch.object(sys, "argv", ["claude-swap", "--switch", "--strategy", "best"]), \
              patch("os.geteuid", return_value=1000, create=True), \
+             patch("claude_swap.settings.load_settings",
+                   return_value=AutoSwitchSettings()), \
              patch("claude_swap.update_check.check_for_update", return_value=None):
             cli.main()
 
         # Non-JSON path omits json_output kwarg (defaults to False in switcher).
         switcher_cls.return_value.switch.assert_called_once_with(
-            strategy="best", json_output=False
+            strategy="best", json_output=False, models=(), model_source=None
         )
+
+    def test_switch_strategy_falls_back_to_configured_model(self):
+        """Without --model, the persistent autoswitch.model steers the
+        strategy — reported as coming from the setting, not the CLI."""
+        from claude_swap.settings import AutoSwitchSettings
+
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch.object(sys, "argv", ["claude-swap", "--switch", "--strategy", "best"]), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch("claude_swap.settings.load_settings",
+                   return_value=AutoSwitchSettings(model="Fable")), \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            cli.main()
+
+        switcher_cls.return_value.switch.assert_called_once_with(
+            strategy="best", json_output=False,
+            models=("Fable",), model_source="autoswitch.model",
+        )
+
+    def test_switch_model_flag_overrides_setting(self):
+        """--model beats autoswitch.model, is deduped, and reports 'cli'."""
+        from claude_swap.settings import AutoSwitchSettings
+
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch.object(sys, "argv", [
+                 "claude-swap", "--switch", "--strategy", "next-available",
+                 "--model", "Opus, opus,Fable",
+             ]), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch("claude_swap.settings.load_settings",
+                   return_value=AutoSwitchSettings(model="Sonnet")), \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            cli.main()
+
+        switcher_cls.return_value.switch.assert_called_once_with(
+            strategy="next-available", json_output=False,
+            models=("Opus", "Fable"), model_source="cli",
+        )
+
+    def test_switch_model_without_strategy_is_rejected(self, capsys):
+        """--model is meaningless without a usage-aware strategy."""
+        with patch.object(sys, "argv", ["claude-swap", "--switch", "--model", "Fable"]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+        assert excinfo.value.code == 2
+        assert "--model can only be used with" in capsys.readouterr().err
 
     def test_plain_switch_passes_no_strategy(self):
         """Bare --switch forwards strategy=None."""
@@ -215,7 +265,7 @@ class TestCLI:
 
         # Non-JSON path omits json_output kwarg (defaults to False in switcher).
         switcher_cls.return_value.switch.assert_called_once_with(
-            strategy=None, json_output=False
+            strategy=None, json_output=False, models=(), model_source=None
         )
 
     def test_health_shows_token_status_and_health(self):
@@ -799,7 +849,7 @@ class TestSubcommandAliases:
              patch("claude_swap.update_check.check_for_update", return_value=None):
             cli.main()
         switcher_cls.return_value.switch.assert_called_once_with(
-            strategy=None, json_output=False
+            strategy=None, json_output=False, models=(), model_source=None
         )
 
     def test_list_subcommand_with_json(self):
@@ -890,9 +940,28 @@ class TestJsonOutputCli:
             cli.main()
 
         switcher_cls.return_value.switch.assert_called_once_with(
-            strategy=None, json_output=True,
+            strategy=None, json_output=True, models=(), model_source=None,
         )
         assert json.loads(capsys.readouterr().out) == payload
+
+    def test_switch_json_carries_model_fields_when_in_effect(self, capsys):
+        """Additive models/modelSource fields make a model-steered pick
+        auditable from scripts too."""
+        payload = {"schemaVersion": 1, "switched": True}
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch.object(sys, "argv", [
+                 "claude-swap", "--switch", "--strategy", "best",
+                 "--model", "Fable", "--json",
+             ]), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            switcher_cls.return_value.switch.return_value = payload
+            cli.main()
+
+        out = json.loads(capsys.readouterr().out)
+        assert out["models"] == ["Fable"]
+        assert out["modelSource"] == "cli"
+        assert out["switched"] is True
 
     def test_error_envelope_on_stdout_with_exit_1(self, capsys):
         from claude_swap.exceptions import ConfigError
