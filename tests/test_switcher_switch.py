@@ -248,7 +248,7 @@ class TestPerformSwitchPostDisplay:
         try:
             with pytest.raises(
                 CredentialReadError,
-                match="No credentials found for current account",
+                match="refusing to overwrite its backup",
             ):
                 switcher._perform_switch("2")
         finally:

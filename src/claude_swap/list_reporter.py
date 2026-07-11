@@ -30,6 +30,7 @@ from claude_swap.json_output import (
     USAGE_API_KEY,
     USAGE_KEYCHAIN_UNAVAILABLE,
     USAGE_NO_CREDENTIALS,
+    USAGE_RELOGIN_REQUIRED,
     USAGE_TOKEN_EXPIRED,
     empty_list_payload,
     list_payload,
@@ -38,6 +39,7 @@ from claude_swap.json_output import (
 )
 from claude_swap.exceptions import LockError
 from claude_swap.locking import FileLock
+from claude_swap.session import read_session_credentials
 from claude_swap.printer import (
     abbreviate_path,
     accent,
@@ -137,6 +139,10 @@ SENTINEL_NOTES = {
     USAGE_TOKEN_EXPIRED: "token expired — Claude Code refreshes the active account",
     USAGE_API_KEY: "API key (no quota)",
     USAGE_KEYCHAIN_UNAVAILABLE: "keychain unavailable — locked or in use; try again",
+    USAGE_RELOGIN_REQUIRED: (
+        "re-login needed — refresh token dead; log in with Claude Code, "
+        "then run: cswap add"
+    ),
 }
 
 
@@ -499,6 +505,12 @@ class ListReporter:
                 sentinels[num] = static
 
         entries = store.entries(identities)
+        # Dead refresh-token lineage: quarantine. Surfacing the sentinel here both
+        # drives the "re-login needed" display and (via ``num not in sentinels``
+        # below) stops the endless fetch loop that would otherwise 401/429 forever.
+        for num in info_by_num:
+            if num not in sentinels and entries[num].token_dead():
+                sentinels[num] = USAGE_RELOGIN_REQUIRED
         to_fetch = [
             num
             for num in info_by_num
@@ -519,6 +531,13 @@ class ListReporter:
                 if record.sentinel is not None:
                     sentinels[num] = record.sentinel
             entries = store.entries(identities)
+            # A fetch that just returned invalid_grant advances the strike to the
+            # dead threshold. The pre-fetch quarantine scan above couldn't see it,
+            # so surface "re-login needed" in *this* pass instead of leaving the
+            # slot looking merely refresh-failed until the next refresh notices.
+            for num in to_fetch:
+                if entries[num].token_dead():
+                    sentinels[num] = USAGE_RELOGIN_REQUIRED
 
         return {
             num: with_sentinel(entries[num], sentinels.get(num))
@@ -606,6 +625,40 @@ class ListReporter:
                 lock.release()
 
         has_live_session = bool(self._host._live_session_pids(str(num), email))
+
+        # A session profile supersedes the backup copy as this account's
+        # credential truth: claude rotates the token family inside the profile
+        # and nothing syncs it back, so once a session has run, the backup's
+        # refresh token is a consumed generation the server 401s forever —
+        # usage would silently freeze at the last pre-session measurement.
+        # Fetch with the profile's newest credential, strictly read-only
+        # (is_active=True: no refresh, no persist): rotating the profile's
+        # family here would log the next `cswap run` out the same way.
+        session_creds = read_session_credentials(
+            self._host._session_dir(str(num), email)
+        )
+        if session_creds:
+            session_oauth = oauth.extract_oauth_data(session_creds)
+            if session_oauth and session_oauth.get("accessToken"):
+                if not oauth.is_oauth_token_expired(session_oauth.get("expiresAt")):
+                    outcome = oauth.try_fetch_usage_for_account(
+                        str(num), email, session_creds, is_active=True,
+                    )
+                    return FetchRecord(
+                        usage=outcome.usage,
+                        error=outcome.error,
+                        retry_after_s=outcome.retry_after_s,
+                    )
+                if has_live_session:
+                    # The live claude refreshes lazily on its next API call;
+                    # requesting now would just 401 (same rule as the owned
+                    # active account in fetch_active_usage).
+                    return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
+                # Expired profile credential and no live session: fall through
+                # to the backup path — cswap must not rotate the profile's
+                # family, but a backup family that is still alive (e.g. the
+                # account was re-added after the profile last ran) can serve
+                # and heal via the normal refresh machinery below.
 
         outcome = oauth.try_fetch_usage_for_account(
             str(num), email, creds,

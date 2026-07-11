@@ -16,6 +16,7 @@ from claude_swap.exceptions import (
 )
 from claude_swap.paths import get_backup_root
 from claude_swap.switcher import ClaudeAccountSwitcher, SETUP_TOKEN_SCOPES
+from claude_swap.usage_store import FetchRecord
 
 
 
@@ -770,3 +771,40 @@ class TestAddAccountFromToken:
         data = switcher._get_sequence_data()
         assert data["accounts"]["2"]["email"] == "me@example.com"
 
+
+    def test_update_in_place_clears_quarantine(self, temp_home):
+        """Refreshing a token in place must lift the dead-token quarantine, so a
+        stale strike doesn't leave the account stuck at 're-login needed' and
+        never fetching the new token (mirrors add_account)."""
+        switcher = self._make_switcher(temp_home)
+        with patch.object(switcher, "_write_account_credentials"), \
+             patch.object(switcher, "_write_account_config"):
+            switcher.add_account_from_token("token-v1", "user@example.com")
+
+        identity = ("user@example.com", "")
+        switcher._usage_store.record(
+            {"1": FetchRecord(error="invalid_grant")}, {"1": identity}
+        )
+        assert switcher._usage_store.entries({"1": identity})["1"].token_dead()
+
+        with patch.object(switcher, "_write_account_credentials"), \
+             patch.object(switcher, "_write_account_config"):
+            switcher.add_account_from_token("token-v2", "user@example.com")
+
+        assert not switcher._usage_store.entries({"1": identity})["1"].token_dead()
+
+    def test_new_write_clears_stale_quarantine(self, temp_home):
+        """Writing a fresh credential into a slot whose lingering usage row still
+        carries a dead-token strike (same identity) must start it clean."""
+        switcher = self._make_switcher(temp_home)
+        identity = ("user@example.com", "")
+        switcher._usage_store.record(
+            {"5": FetchRecord(error="invalid_grant")}, {"5": identity}
+        )
+        assert switcher._usage_store.entries({"5": identity})["5"].token_dead()
+
+        with patch.object(switcher, "_write_account_credentials"), \
+             patch.object(switcher, "_write_account_config"):
+            switcher.add_account_from_token("tok", "user@example.com", slot=5)
+
+        assert not switcher._usage_store.entries({"5": identity})["5"].token_dead()

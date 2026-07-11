@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -16,6 +17,7 @@ from claude_swap.credentials import ActiveCredentials, pending_rotation_path
 from claude_swap.json_output import (
     USAGE_API_KEY,
     USAGE_KEYCHAIN_UNAVAILABLE,
+    USAGE_RELOGIN_REQUIRED,
     USAGE_TOKEN_EXPIRED,
 )
 from claude_swap import list_reporter
@@ -239,8 +241,8 @@ class TestListAccountsUsage:
         with (
             patch.object(switcher, "_read_credentials", return_value=active_creds),
             patch(
-                "claude_swap.oauth.refresh_oauth_credentials",
-                return_value=refreshed_backup,
+                "claude_swap.oauth.try_refresh_oauth_credentials",
+                return_value=oauth.RefreshOutcome(refreshed_backup, None),
             ),
             patch(
                 "claude_swap.oauth.try_fetch_usage_for_account",
@@ -684,8 +686,8 @@ class TestRotatedTokenPersistContention:
     def _fetch_inactive_row(self, switcher, creds: str):
         with (
             patch(
-                "claude_swap.oauth.refresh_oauth_credentials",
-                return_value=self._ROTATED,
+                "claude_swap.oauth.try_refresh_oauth_credentials",
+                return_value=oauth.RefreshOutcome(self._ROTATED, None),
             ),
             patch("claude_swap.oauth.request_usage_data", side_effect=OSError("no net")),
             patch.object(switcher, "_live_session_pids", return_value=[]),
@@ -811,16 +813,16 @@ class TestRotatedTokenPersistContention:
             }
         )
 
-        def refresh_and_relogin(_creds: str) -> str:
+        def refresh_and_relogin(_creds: str) -> oauth.RefreshOutcome:
             # The slot is re-added (new lineage) while our HTTP refresh runs.
             switcher._write_account_credentials(
                 "2", "account2@example.com", relogged
             )
-            return self._ROTATED
+            return oauth.RefreshOutcome(self._ROTATED, None)
 
         with (
             patch(
-                "claude_swap.oauth.refresh_oauth_credentials",
+                "claude_swap.oauth.try_refresh_oauth_credentials",
                 side_effect=refresh_and_relogin,
             ),
             patch("claude_swap.oauth.request_usage_data", side_effect=OSError("no net")),
@@ -1451,3 +1453,171 @@ class TestFormatUsageLines:
         line = list_reporter._format_usage_lines(usage)[0]
         assert f"resets {expected_clock}" in line
         assert "stale-clock" not in line
+
+
+def _session_oauth_creds(token: str, expires_in_s: float) -> str:
+    """Credential JSON with an access token expiring ``expires_in_s`` from now."""
+    return json.dumps({"claudeAiOauth": {
+        "accessToken": token,
+        "refreshToken": f"rt-{token}",
+        "expiresAt": int((time.time() + expires_in_s) * 1000),
+    }})
+
+
+class TestFetchAccountUsageSessionProfile:
+    """Inactive-account fetches source credentials from the session profile.
+
+    Claude rotates the token family inside a session profile and nothing
+    syncs it back, so the backup copy's refresh token is a consumed
+    generation once a session has run — fetching with it 401s forever and
+    usage silently freezes at the last pre-session measurement.
+    """
+
+    def _info(self, backup_creds: str) -> tuple:
+        return (2, "test@example.com", "Org", "org-uuid", False, backup_creds)
+
+    def test_fresh_session_credentials_fetch_read_only(self, temp_home: Path):
+        """Profile creds are used with is_active=True (no refresh, no persist)."""
+        switcher = ClaudeAccountSwitcher()
+        backup = _session_oauth_creds("sk-backup", -3600)
+        session = _session_oauth_creds("sk-session", 7200)
+
+        with patch.object(switcher, "_live_session_pids", return_value=[123]), \
+             patch("claude_swap.list_reporter.read_session_credentials",
+                   return_value=session), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 5}})) as mock_fetch:
+            record = ListReporter(switcher).fetch_account_usage(self._info(backup))
+
+        assert record.usage == {"five_hour": {"pct": 5}}
+        mock_fetch.assert_called_once()
+        args, kwargs = mock_fetch.call_args
+        assert args[2] == session
+        assert kwargs.get("is_active") is True
+        assert "persist_credentials" not in kwargs
+
+    def test_expired_session_credentials_with_live_session_is_sentinel(
+        self, temp_home: Path
+    ):
+        """Live claude refreshes lazily — don't burn a request that would 401."""
+        switcher = ClaudeAccountSwitcher()
+        backup = _session_oauth_creds("sk-backup", -3600)
+        session = _session_oauth_creds("sk-session", -60)
+
+        with patch.object(switcher, "_live_session_pids", return_value=[123]), \
+             patch("claude_swap.list_reporter.read_session_credentials",
+                   return_value=session), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account") as mock_fetch:
+            record = ListReporter(switcher).fetch_account_usage(self._info(backup))
+
+        assert record.sentinel == USAGE_TOKEN_EXPIRED
+        mock_fetch.assert_not_called()
+
+    def test_expired_session_credentials_without_live_session_falls_back(
+        self, temp_home: Path
+    ):
+        """No live session: the backup path (with refresh machinery) still runs."""
+        switcher = ClaudeAccountSwitcher()
+        backup = _session_oauth_creds("sk-backup", 7200)
+        session = _session_oauth_creds("sk-session", -60)
+
+        with patch.object(switcher, "_live_session_pids", return_value=[]), \
+             patch("claude_swap.list_reporter.read_session_credentials",
+                   return_value=session), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 9}})) as mock_fetch:
+            record = ListReporter(switcher).fetch_account_usage(self._info(backup))
+
+        assert record.usage == {"five_hour": {"pct": 9}}
+        args, kwargs = mock_fetch.call_args
+        assert args[2] == backup
+        assert kwargs.get("is_active") is False
+        assert kwargs.get("persist_credentials") is not None
+
+    def test_no_session_profile_uses_backup_path(self, temp_home: Path):
+        """Accounts without a session profile behave exactly as before."""
+        switcher = ClaudeAccountSwitcher()
+        backup = _session_oauth_creds("sk-backup", 7200)
+
+        with patch.object(switcher, "_live_session_pids", return_value=[]), \
+             patch("claude_swap.list_reporter.read_session_credentials",
+                   return_value=None), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 9}})) as mock_fetch:
+            record = ListReporter(switcher).fetch_account_usage(self._info(backup))
+
+        assert record.usage == {"five_hour": {"pct": 9}}
+        args, kwargs = mock_fetch.call_args
+        assert args[2] == backup
+        assert kwargs.get("is_active") is False
+        assert kwargs.get("persist_credentials") is not None
+
+
+class TestDeadTokenQuarantine:
+    """A dead refresh-token account is surfaced as re-login-needed and not fetched."""
+
+    def _dead_creds(self):
+        return json.dumps({"claudeAiOauth": {
+            "accessToken": "at", "refreshToken": "rt", "expiresAt": 1,
+        }})
+
+    def _make_dead(self, switcher, num="2", identity=("test@example.com", "")):
+        switcher._usage_store.record(
+            {num: FetchRecord(error="invalid_grant")}, {num: identity}
+        )
+
+    def test_collector_surfaces_relogin_sentinel_and_skips_fetch(self, temp_home):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        self._make_dead(switcher)
+        info = [(2, "test@example.com", "Org", "", False, self._dead_creds())]
+
+        with patch("claude_swap.oauth.try_fetch_usage_for_account") as fetch:
+            entries = ListReporter(switcher).collect_usage_entries(info)
+
+        assert entries["2"].sentinel == USAGE_RELOGIN_REQUIRED
+        fetch.assert_not_called()  # quarantined: no endless 401/429 loop
+
+    def test_relogin_surfaces_same_pass_on_invalid_grant(self, temp_home):
+        # A fetch that returns invalid_grant crosses the dead threshold this pass;
+        # the pre-fetch quarantine scan couldn't see it, so the collector must
+        # still render "re-login needed" now, not only on the next refresh.
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        info = [(2, "test@example.com", "Org", "", False, self._dead_creds())]
+
+        reporter = ListReporter(switcher)
+        with patch.object(
+            reporter, "_run_usage_fetches",
+            return_value={"2": FetchRecord(error="invalid_grant")},
+        ) as run:
+            entries = reporter.collect_usage_entries(info)
+
+        run.assert_called_once()  # it was fetch-eligible, not pre-quarantined
+        assert entries["2"].sentinel == USAGE_RELOGIN_REQUIRED
+
+    def test_readd_clears_quarantine(self, temp_home):
+        # Re-adding an account (fresh credential) must lift the quarantine, so
+        # the disabled fetches don't leave it stuck at "re-login needed" forever.
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        identity = ("user@example.com", "org-A")
+        self._make_dead(switcher, num="1", identity=identity)
+        assert switcher._usage_store.entries({"1": identity})["1"].token_dead()
+
+        fake_creds = json.dumps({"claudeAiOauth": {"accessToken": "fresh"}})
+        config_path = temp_home / ".claude.json"
+        config_path.write_text(json.dumps({"oauthAccount": {
+            "emailAddress": "user@example.com", "accountUuid": "u",
+            "organizationUuid": "org-A", "organizationName": "Acme",
+        }}))
+        with patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+             patch.object(
+                 switcher,
+                 "_write_verified_live_account_credentials",
+                 return_value=fake_creds,
+             ), \
+             patch.object(switcher, "_write_account_credentials"):
+            switcher.add_account()
+
+        assert not switcher._usage_store.entries({"1": identity})["1"].token_dead()

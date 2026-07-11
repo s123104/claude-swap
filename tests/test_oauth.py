@@ -1086,3 +1086,69 @@ class TestTryFetchUsageOutcome:
             "1", "a@b.c", json.dumps({"claudeAiOauth": {}}), is_active=False,
         )
         assert outcome.error == "no-access-token"
+
+
+class TestInvalidGrantPropagation:
+    """A dead refresh-token lineage surfaces as error='invalid_grant', distinct
+    from a transient 'refresh-failed', so the store can quarantine the account."""
+
+    @staticmethod
+    def _expired_credentials() -> str:
+        from datetime import timedelta
+        past_ms = int(
+            (datetime.now(timezone.utc) - timedelta(hours=1)).timestamp() * 1000
+        )
+        return json.dumps({"claudeAiOauth": {
+            "accessToken": "old-access", "refreshToken": "dead-refresh",
+            "expiresAt": past_ms,
+        }})
+
+    @staticmethod
+    def _valid_credentials() -> str:
+        from datetime import timedelta
+        future_ms = int(
+            (datetime.now(timezone.utc) + timedelta(hours=1)).timestamp() * 1000
+        )
+        return json.dumps({"claudeAiOauth": {
+            "accessToken": "good-access", "refreshToken": "dead-refresh",
+            "expiresAt": future_ms,
+        }})
+
+    def test_proactive_refresh_invalid_grant_short_circuits(self):
+        """Expired token + dead refresh: report invalid_grant without hitting usage."""
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   return_value=oauth.RefreshOutcome(None, "invalid_grant")), \
+             patch("claude_swap.oauth.request_usage_data") as usage:
+            outcome = oauth.try_fetch_usage_for_account(
+                "1", "a@b.c", self._expired_credentials(), is_active=False,
+            )
+        assert outcome.error == "invalid_grant"
+        usage.assert_not_called()  # no pointless 401/429 on a lost cause
+
+    def test_401_retry_invalid_grant_is_permanent(self):
+        """Valid-looking token, server 401, dead refresh → invalid_grant."""
+        err = urllib.error.HTTPError(
+            "https://api.anthropic.com/api/oauth/usage", 401, "Unauthorized",
+            hdrs=None, fp=None,
+        )
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=err), \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   return_value=oauth.RefreshOutcome(None, "invalid_grant")):
+            outcome = oauth.try_fetch_usage_for_account(
+                "1", "a@b.c", self._valid_credentials(), is_active=False,
+            )
+        assert outcome.error == "invalid_grant"
+
+    def test_transient_refresh_failure_is_not_permanent(self):
+        """A transient refresh failure stays 'refresh-failed', not invalid_grant."""
+        err = urllib.error.HTTPError(
+            "https://api.anthropic.com/api/oauth/usage", 401, "Unauthorized",
+            hdrs=None, fp=None,
+        )
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=err), \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   return_value=oauth.RefreshOutcome(None, "transient")):
+            outcome = oauth.try_fetch_usage_for_account(
+                "1", "a@b.c", self._valid_credentials(), is_active=False,
+            )
+        assert outcome.error == "refresh-failed"

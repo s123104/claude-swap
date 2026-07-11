@@ -31,6 +31,11 @@ USAGE_API_KEY = "api key"
 # with no plaintext fallback — distinct from a genuinely empty slot, so the user
 # isn't misled into an unnecessary re-login.
 USAGE_KEYCHAIN_UNAVAILABLE = "keychain unavailable"
+# The stored refresh-token lineage is dead (repeated ``invalid_grant``). The
+# account is quarantined from fetching until a re-login (``cswap login`` / ``add``)
+# replaces the credential; distinct from "token expired" (which Claude Code can
+# refresh on its own) because only the user can fix it.
+USAGE_RELOGIN_REQUIRED = "re-login needed"
 
 # The decision-grade usage value a store entry projects to: a usage dict, a
 # sentinel string, or None (unknown). See usage_store.UsageEntry.decision_value.
@@ -134,6 +139,8 @@ def usage_fields(entry: UsageValue) -> tuple[str, dict[str, Any] | None]:
         return "keychain_unavailable", None
     if entry == USAGE_NO_CREDENTIALS:
         return "no_credentials", None
+    if entry == USAGE_RELOGIN_REQUIRED:
+        return "relogin_required", None
     if isinstance(entry, str):
         return "no_credentials", None
     return "unavailable", None

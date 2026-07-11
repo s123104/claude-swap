@@ -1,6 +1,6 @@
 [project]
 name = "claude-swap"
-version = "0.18.1+haotool.1"
+version = "0.19.0+haotool.1"
 description = "Multi-account switcher for Claude Code"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -26,6 +26,9 @@ classifiers = [
     "Programming Language :: Python :: 3.14",
     "Topic :: Utilities",
 ]
+
+[project.optional-dependencies]
+menubar = ["rumps>=0.4.0"]
 
 [project.urls]
 Homepage = "https://github.com/haotool/claude-swap"
@@ -69,6 +72,16 @@ mypy_path = "src"
 files = ["src/claude_swap"]
 ignore_missing_imports = true
 warn_unreachable = true
+
+# rumps ships no type stubs and MenuBarApp subclasses the untyped rumps.App
+# (decorated handlers included), so full strict is impossible for the upstream
+# menubar glue. Everything else in the module stays strict-checked.
+[[tool.mypy.overrides]]
+module = "claude_swap.menubar"
+disallow_untyped_defs = false
+disallow_untyped_calls = false
+disallow_subclassing_any = false
+disallow_untyped_decorators = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

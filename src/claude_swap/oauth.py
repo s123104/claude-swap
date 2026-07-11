@@ -417,9 +417,9 @@ def try_fetch_usage_for_account(
         and oauth.get("refreshToken")
         and is_oauth_token_expired(oauth.get("expiresAt"))
     ):
-        refreshed = refresh_oauth_credentials(working_credentials)
-        if refreshed:
-            working_credentials = refreshed
+        refresh = try_refresh_oauth_credentials(working_credentials)
+        if refresh.credentials:
+            working_credentials = refresh.credentials
             _persist(
                 persist_credentials,
                 account_num,
@@ -429,6 +429,14 @@ def try_fetch_usage_for_account(
             )
             oauth = extract_oauth_data(working_credentials) or oauth
             access_token = oauth.get("accessToken") or access_token
+        elif refresh.error == "invalid_grant":
+            # The refresh-token lineage is server-rejected — permanently dead.
+            # Don't hit the usage endpoint with a token we know is expired
+            # (that just adds a 401/429 to a lost cause): report the permanent
+            # failure distinctly so the store can quarantine the account.
+            return UsageOutcome(None, error="invalid_grant")
+        # A transient refresh failure falls through to try the (expired) token;
+        # the 401 path below retries the refresh.
 
     try:
         data = request_usage_data(access_token)
@@ -444,13 +452,18 @@ def try_fetch_usage_for_account(
             _log_usage_failure(context, e, kind, retry_after)
             return UsageOutcome(None, error=kind, retry_after_s=retry_after)
 
-        # Retry once after refreshing on 401 (inactive accounts only).
-        refreshed = refresh_oauth_credentials(working_credentials)
-        if not refreshed:
+        # Retry once after refreshing on 401 (inactive accounts only). A
+        # server-rejected grant (invalid_grant) means this refresh-token lineage
+        # is permanently dead — surface it distinctly (not the generic
+        # "refresh-failed") so the store can quarantine instead of retrying a
+        # dead token forever.
+        refresh = try_refresh_oauth_credentials(working_credentials)
+        if not refresh.credentials:
             _log_usage_failure(context, e, kind)
-            return UsageOutcome(None, error="refresh-failed")
+            dead = refresh.error == "invalid_grant"
+            return UsageOutcome(None, error="invalid_grant" if dead else "refresh-failed")
 
-        working_credentials = refreshed
+        working_credentials = refresh.credentials
         _persist(
             persist_credentials,
             account_num,

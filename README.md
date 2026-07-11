@@ -1,6 +1,6 @@
 # claude-swap
 
-Multi-account switcher for Claude Code. Easily switch between multiple Claude accounts without logging out. Works with both the Claude Code CLI and the VS Code extension.
+Multi-account switcher for Claude Code. Easily switch between multiple Claude accounts without logging out, or let it switch for you before you hit a rate limit. Track usage for every account in a live dashboard, and run accounts in parallel. Works with both the Claude Code CLI and the VS Code extension.
 
 > **Fork.** This is the [haotool/claude-swap](https://github.com/haotool/claude-swap) fork of [realiti4/claude-swap](https://github.com/realiti4/claude-swap), adding **auto-switch at usage limit** and a **cross-platform background service** (macOS launchd, Linux/WSL systemd, Windows Task Scheduler). **Not published to PyPI** — install from source or git (see below). Upstream releases remain on PyPI as `claude-swap`.
 
@@ -268,6 +268,22 @@ The original flag spellings (`cswap --switch`, `cswap --list`, ...) keep working
 Session-mode profiles (`cswap run`) live under the backup directory in `sessions/`. Tool preferences (`settings.json`) and auto-switch state (`autoswitch_state.json` — cooldown and quarantined accounts; delete it to reset) live in the backup directory root.
 
 On Linux/WSL, set `XDG_DATA_HOME` to override the default location.
+
+## Menu bar (macOS)
+
+<details>
+<summary>Optional macOS menu bar app — usage at a glance, click to switch</summary>
+
+Needs the `menubar` extra (macOS only):
+
+```bash
+uv tool install 'claude-swap[menubar]'   # or: pipx install 'claude-swap[menubar]'
+cswap menubar
+```
+
+Shows every account's 5h / 7d / spend usage and switches with a click (specific / rotate / best / next-available), plus the TUI's add / remove / refresh actions. Enable *Settings → Auto-switch accounts* to run the same engine as [`cswap auto`](#automatic-switching) in the background; it shares the `autoswitch.*` settings, so the menu bar and CLI stay in sync. Off until you turn it on.
+
+</details>
 
 ## Advanced
 

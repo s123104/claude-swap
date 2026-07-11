@@ -69,6 +69,25 @@ BACKOFF_CAP_S = 600.0
 EDGE_BACKOFF_CAP_S = 120.0
 RETRY_AFTER_FLOOR_CAP_S = 900.0
 
+# A dead refresh-token lineage (the token endpoint answered ``invalid_grant``,
+# e.g. "Refresh token not found or invalid") can never recover on its own —
+# only a re-login helps. One such answer is already definitive: the server
+# explicitly rejected the grant, which no transient 429/timeout/network blip
+# does, so there is nothing to gain by retrying (and each retry with a dead
+# token just draws a fresh 401/429). At this many strikes the account is
+# quarantined: no more fetches, and the collector surfaces "re-login needed".
+# A single success — or a credential refresh via login/add — resets the count
+# and lifts the quarantine. Raise to 2 if a buffer against a one-off
+# misclassification is ever wanted; the trade-off is a ~10-min-slower verdict
+# (the failure backoff between the two strikes).
+AUTH_DEAD_STRIKES = 1
+
+# Fetch errors that prove the stored credential is permanently unusable (vs.
+# transient 429/timeout/network). Only these advance the dead-token strike
+# count; everything else leaves it untouched (a transient error is no evidence
+# the token is alive *or* dead).
+PERMANENT_AUTH_ERRORS = frozenset({"invalid_grant"})
+
 # (email, organizationUuid) — the identity a slot number currently maps to.
 Identity = tuple[str, str]
 
@@ -111,6 +130,9 @@ class UsageEntry:
     backoff_until: float | None = None
     next_poll_at: float | None = None
     poll_interval_s: float | None = None
+    # Consecutive permanent-auth failures (``invalid_grant``). At or above
+    # AUTH_DEAD_STRIKES the token is treated as dead: see ``token_dead``.
+    auth_dead_strikes: int = 0
     # Staleness past STALE_OK_S is still decision-trusted when it is
     # *deliberate*: the server is refusing fresher data (failure state), or the
     # scheduler itself chose the cadence (within nextPollAt). Capped at
@@ -129,6 +151,15 @@ class UsageEntry:
             self.last_attempt_at is not None
             and (now - self.last_attempt_at) < CLAIM_TTL_S
         )
+
+    def token_dead(self, threshold: int = AUTH_DEAD_STRIKES) -> bool:
+        """Whether the stored credential's refresh-token lineage is provably dead.
+
+        True once ``invalid_grant`` has recurred ``threshold`` times without an
+        intervening success. Such an account is quarantined: not fetched (see
+        ``due_candidate`` and the collector) and surfaced as "re-login needed".
+        """
+        return self.auth_dead_strikes >= threshold
 
     def decision_value(self) -> dict[str, Any] | str | None:
         """The ``dict | sentinel | None`` value switch decisions run on.
@@ -171,6 +202,8 @@ def due_candidate(
             continue
         if entry.sentinel is not None:
             continue
+        if entry.token_dead():
+            continue  # dead refresh-token: quarantined, needs a re-login
         if entry.in_backoff(now):
             continue
         if entry.next_poll_at is not None and now < entry.next_poll_at:
@@ -287,6 +320,7 @@ class UsageStore:
                 backoff_until=_num_or_none(row.get("backoffUntil")),
                 next_poll_at=next_poll_at,
                 poll_interval_s=_num_or_none(row.get("pollIntervalS")),
+                auth_dead_strikes=int(row.get("authDeadStrikes") or 0),
                 trust_extended=trust_extended,
             )
         return out
@@ -339,6 +373,7 @@ class UsageStore:
                 row["consecutiveFailures"] = 0
                 row["lastError"] = None
                 row["backoffUntil"] = None
+                row["authDeadStrikes"] = 0  # a success proves the token is alive
             else:
                 failures = int(row.get("consecutiveFailures") or 0) + 1
                 row["consecutiveFailures"] = failures
@@ -346,6 +381,11 @@ class UsageStore:
                 row["backoffUntil"] = now + _failure_backoff_s(
                     failures, rec.retry_after_s
                 )
+                # Only a permanent-auth failure advances the dead-token count; a
+                # transient error (429/timeout) leaves it as-is — it is no
+                # evidence either way and must not reset a real dead-token tally.
+                if rec.error in PERMANENT_AUTH_ERRORS:
+                    row["authDeadStrikes"] = int(row.get("authDeadStrikes") or 0) + 1
 
         self._mutate(identities, effective.keys(), apply)
 
@@ -364,6 +404,28 @@ class UsageStore:
             row["pollIntervalS"] = interval
 
         self._mutate(identities, plans.keys(), apply)
+
+    def clear_dead_token(
+        self, nums: Iterable[str], identities: dict[str, Identity]
+    ) -> None:
+        """Lift the dead-token quarantine for slots whose credential was refreshed.
+
+        Called after a re-login/add rewrites a slot's stored credential: the
+        strike count (and the failure/backoff state riding with it) no longer
+        reflects reality, and the account must become fetch-eligible again so the
+        next pass can prove the new token good. A no-op for rows with no strikes.
+        """
+        nums = list(nums)
+        if not nums:
+            return
+
+        def apply(_num: str, row: dict[str, Any]) -> None:
+            row["authDeadStrikes"] = 0
+            row["consecutiveFailures"] = 0
+            row["lastError"] = None
+            row["backoffUntil"] = None
+
+        self._mutate(identities, nums, apply)
 
 
 def _num_or_none(value: object) -> float | None:

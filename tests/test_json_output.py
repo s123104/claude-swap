@@ -16,6 +16,7 @@ from claude_swap.json_output import (
     USAGE_API_KEY,
     USAGE_KEYCHAIN_UNAVAILABLE,
     USAGE_NO_CREDENTIALS,
+    USAGE_RELOGIN_REQUIRED,
     USAGE_TOKEN_EXPIRED,
     empty_list_payload,
     error_envelope,
@@ -113,6 +114,7 @@ class TestJsonHelpers:
             "keychain_unavailable",
             None,
         )
+        assert usage_fields(USAGE_RELOGIN_REQUIRED) == ("relogin_required", None)
         assert usage_fields(None) == ("unavailable", None)
 
     def test_empty_list_payload_shape(self):

@@ -1071,6 +1071,12 @@ class ClaudeAccountSwitcher:
                 )
                 self._write_account_config(account_num, current_email, current_config)
                 self._sequence_store.save(data.set_active(int(account_num)))
+            # A refreshed credential invalidates any dead-token quarantine on
+            # this slot; otherwise the stale strike row keeps the account stuck
+            # at "re-login needed" and it never fetches the new token.
+            self._usage_store.clear_dead_token(
+                [account_num], {account_num: (current_email, current_org_uuid)}
+            )
 
             tag = self._get_display_tag(current_email, matched_org_name, current_org_uuid)
             self._logger.info(f"Updated credentials for account {account_num}: {current_email}")
@@ -1140,6 +1146,11 @@ class ClaudeAccountSwitcher:
                 ),
                 set_active=True,
             )
+        # Registering a slot with a fresh credential lifts any dead-token
+        # quarantine carried by that slot's prior lineage.
+        self._usage_store.clear_dead_token(
+            [account_num], {account_num: (current_email, organization_uuid)}
+        )
         tag = self._get_display_tag(current_email, organization_name, organization_uuid)
         self._logger.info(f"Added account {account_num}: {current_email} (org: {organization_uuid or 'personal'})")
         print(f"{accent('Added')} Account {account_num}: {current_email} {muted(f'[{tag}]')}")
@@ -1246,6 +1257,13 @@ class ClaudeAccountSwitcher:
                 self._write_account_credentials(account_num, email, credentials)
                 self._write_account_config(account_num, email, config)
                 self._sequence_store.save(data)
+            # A refreshed credential invalidates any dead-token quarantine on this
+            # slot (mirrors ``add_account``); otherwise the stale strike row keeps
+            # the account stuck at "re-login needed" and it never fetches the new
+            # token. Token accounts are always personal, so org is "".
+            self._usage_store.clear_dead_token(
+                [account_num], {account_num: (email, "")}
+            )
             self._logger.info(f"Updated {kind_label} for account {account_num}: {email}")
             print(
                 f"{accent(f'Updated {kind_label}')} for Account {account_num} "
@@ -1270,6 +1288,11 @@ class ClaudeAccountSwitcher:
             self._write_account_credentials(account_num, email, credentials)
             self._write_account_config(account_num, email, config)
             self._register_account_slot(account_num, record, set_active=False)
+        # Reusing/overwriting a slot with a fresh credential lifts any dead-token
+        # quarantine carried by that slot's prior lineage (mirrors ``add_account``).
+        self._usage_store.clear_dead_token(
+            [account_num], {account_num: (email, "")}
+        )
         self._logger.info(f"Added account {account_num} from {source_label}: {email}")
         print(
             f"{accent('Added')} Account {account_num}: {email} "
@@ -2081,10 +2104,14 @@ class ClaudeAccountSwitcher:
             if original_creds is None:
                 raise CredentialReadError("Failed to read current credentials")
             if not original_creds:
-                # An empty live read must not be backed up over the current
-                # slot; mirrors add_account's guard.
+                # An empty read (e.g. a macOS Keychain `security` timeout,
+                # which returns "" rather than raising) must NOT be written
+                # over the departing account's backup — that would destroy
+                # its stored credential. Fail the switch; the backup stays
+                # intact and the caller can retry once the Keychain settles.
                 raise CredentialReadError(
-                    "No credentials found for current account"
+                    "Current account credential is empty (Keychain unreadable?); "
+                    "refusing to overwrite its backup"
                 )
             original_config = config_path.read_text(encoding="utf-8")
         except FileNotFoundError:

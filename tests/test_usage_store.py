@@ -350,3 +350,56 @@ class TestDueCandidate:
 
     def test_none_when_no_candidates(self):
         assert due_candidate([], {}, self.NOW) is None
+
+
+class TestDeadTokenQuarantine:
+    """invalid_grant strikes → token_dead → quarantined from fetching."""
+
+    def test_invalid_grant_advances_strikes(self, store):
+        store.record({"1": FetchRecord(error="invalid_grant")}, IDENT)
+        assert store.entries(IDENT)["1"].auth_dead_strikes == 1
+        store.record({"1": FetchRecord(error="invalid_grant")}, IDENT)
+        assert store.entries(IDENT)["1"].auth_dead_strikes == 2
+
+    def test_transient_error_does_not_advance_or_reset(self, store):
+        store.record({"1": FetchRecord(error="invalid_grant")}, IDENT)
+        store.record({"1": FetchRecord(error="http-429")}, IDENT)  # transient
+        # 429 must neither bump nor clear the dead-token tally.
+        assert store.entries(IDENT)["1"].auth_dead_strikes == 1
+
+    def test_success_resets_strikes(self, store):
+        store.record({"1": FetchRecord(error="invalid_grant")}, IDENT)
+        store.record({"1": FetchRecord(error="invalid_grant")}, IDENT)
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        assert store.entries(IDENT)["1"].auth_dead_strikes == 0
+
+    def test_token_dead_at_threshold(self, store):
+        assert not store.entries(IDENT)["1"].token_dead()  # no strikes yet
+        store.record({"1": FetchRecord(error="invalid_grant")}, IDENT)
+        # A single server-confirmed invalid_grant is definitive.
+        assert store.entries(IDENT)["1"].token_dead()
+
+    def test_transient_error_alone_never_marks_dead(self, store):
+        for _ in range(5):
+            store.record({"1": FetchRecord(error="http-429")}, IDENT)
+        assert not store.entries(IDENT)["1"].token_dead()
+
+    def test_due_candidate_skips_dead_token(self, store, clock):
+        store.record({"1": FetchRecord(error="invalid_grant")}, IDENT)
+        store.record({"1": FetchRecord(error="invalid_grant")}, IDENT)
+        clock.advance(10_000)  # past any backoff
+        entries = store.entries(IDENT)
+        assert entries["1"].token_dead()
+        # A dead token is never nominated as the alternate to poll.
+        assert due_candidate(["1"], entries, clock.now) is None
+
+    def test_clear_dead_token_lifts_quarantine(self, store):
+        store.record({"1": FetchRecord(error="invalid_grant")}, IDENT)
+        store.record({"1": FetchRecord(error="invalid_grant")}, IDENT)
+        assert store.entries(IDENT)["1"].token_dead()
+        store.clear_dead_token(["1"], IDENT)
+        entry = store.entries(IDENT)["1"]
+        assert entry.auth_dead_strikes == 0
+        assert not entry.token_dead()
+        assert entry.last_error is None
+        assert entry.backoff_until is None

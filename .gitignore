@@ -24,3 +24,6 @@ package-lock.json
 # Stray tooling state — an orchestration tool drops its runtime state here.
 # Not a project artifact; keep it out of the tree.
 .omc/
+
+# superpowers session planning artifacts (not part of the project)
+docs/superpowers/

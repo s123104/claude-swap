@@ -26,6 +26,7 @@ from unittest.mock import patch
 
 import pytest
 
+from claude_swap import oauth
 from claude_swap.credential_refresh import (
     park_rotated_credential,
     recover_pending_rotation,
@@ -94,8 +95,8 @@ def _park_via_contended_fetch(
     try:
         with (
             patch(
-                "claude_swap.oauth.refresh_oauth_credentials",
-                return_value=rotated,
+                "claude_swap.oauth.try_refresh_oauth_credentials",
+                return_value=oauth.RefreshOutcome(rotated, None),
             ),
             patch(
                 "claude_swap.oauth.request_usage_data",
@@ -342,8 +343,8 @@ class TestVerifyMismatchParking:
         # Keychain ACL hiccup).
         with (
             patch(
-                "claude_swap.oauth.refresh_oauth_credentials",
-                return_value=rotated,
+                "claude_swap.oauth.try_refresh_oauth_credentials",
+                return_value=oauth.RefreshOutcome(rotated, None),
             ),
             patch.object(sw, "_read_account_credentials", return_value=old),
             patch.object(sw, "_write_account_credentials"),
@@ -367,8 +368,8 @@ class TestVerifyMismatchParking:
 
         with (
             patch(
-                "claude_swap.oauth.refresh_oauth_credentials",
-                return_value=rotated,
+                "claude_swap.oauth.try_refresh_oauth_credentials",
+                return_value=oauth.RefreshOutcome(rotated, None),
             ),
             patch.object(sw, "_read_account_credentials", return_value=old),
             patch.object(sw, "_write_account_credentials"),
