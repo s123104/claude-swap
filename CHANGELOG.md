@@ -2,11 +2,20 @@
 
 All notable user-facing changes to claude-swap are documented here.
 
-Release version is defined in `pyproject.toml` (currently `0.19.0+haotool.1`).
+Release version is defined in `pyproject.toml` (currently `0.20.0+haotool.1`).
 
 ## [Unreleased]
 
 ### Added
+
+- **Upstream v0.20.0 merged** (adaptive per-token `/usage` polling — upstream
+  `245f5ba`/`9be9cba`): poll cadence, reset math, and the serve TTL move to
+  the new `poll_policy` module; fetch eligibility is decided atomically by
+  `UsageStore.reserve` (store-shared poll plans, no double-fetch across
+  surfaces); every collector persists the adapted cadence and a just-activated
+  account's plan is pulled to the active floor (`_replan_new_active`). Models
+  the `/usage` limit as a rolling ~60-minute window and keeps every surface
+  under the endpoint's per-token budget — fixes the sustained 429 episodes.
 
 - **Upstream v0.19.0 merged** (Textual TUI, macOS menu bar app, per-model
   weekly limits, and the #117 provenance guard — upstream #91–#121):

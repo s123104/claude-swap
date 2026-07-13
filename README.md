@@ -8,7 +8,7 @@ Multi-account switcher for Claude Code. Easily switch between multiple Claude ac
 
 | Item | Value |
 |------|-------|
-| **Release version (SSOT)** | `pyproject.toml` → `[project].version` (currently `0.19.0+haotool.1`) |
+| **Release version (SSOT)** | `pyproject.toml` → `[project].version` (currently `0.20.0+haotool.1`) |
 | **Scheme** | [PEP 440](https://peps.python.org/pep-0440/) with a **local version label** (`+haotool.1`) to distinguish this fork from upstream |
 | **PyPI** | **Not publishable** — PyPI rejects local version segments (`+…`); this fork is installed from git/source only |
 | **Upstream PyPI** | Publishes plain semver (e.g. `0.15.1`) without the `+haotool.*` suffix |
@@ -259,6 +259,7 @@ The original flag spellings (`cswap --switch`, `cswap --list`, ...) keep working
 - Account credentials stored securely using platform-appropriate methods
 - Switches (manual and automatic) hold Claude Code's own credential locks while writing, so a swap never interleaves with a token refresh
 - Auto-switch freshens a target's token before activating it, and quarantines accounts whose refresh token has died (recover with `cswap add --slot N`)
+- Usage numbers refresh every few minutes — faster for an account being used or close to switching, slower for idle ones — keeping cswap comfortably inside Anthropic's rate limits however many dashboards you keep open on a machine. An age note like `· 6m ago` just means the next scheduled check hasn't come yet, not that something is stuck.
 
 ## Data locations
 

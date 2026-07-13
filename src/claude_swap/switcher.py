@@ -61,19 +61,21 @@ from claude_swap.paths import (
     get_legacy_backup_root,
     migrate_legacy_backup_dir,
 )
+from claude_swap import poll_policy
 from claude_swap.credential_refresh import CredentialRefresher
 # SENTINEL_NOTES / last_seen_note are re-exported for the TUI, which reads
 # them from here (the upstream location) so both surfaces share one wording.
 from claude_swap.list_reporter import SENTINEL_NOTES as SENTINEL_NOTES
 from claude_swap.list_reporter import ListReporter, run_list, run_status
 from claude_swap.list_reporter import last_seen_note as last_seen_note
+from claude_swap.settings import load_settings, parse_model_names, settings_path
 from claude_swap.sequence_store import (
     AccountRecord,
     SequenceData,
     SequenceStore,
 )
 from claude_swap.switch_cli import run_switch_cli
-from claude_swap.usage_store import UsageEntry, UsageStore
+from claude_swap.usage_store import FetchRecord, UsageEntry, UsageStore
 from typing import Any, cast
 
 # Service name under which the legacy ``keyring`` backend stored per-account
@@ -132,6 +134,9 @@ class ClaudeAccountSwitcher:
         self.lock_file = self.backup_dir / ".lock"
         self._logger = setup_logging(self.backup_dir, debug=debug)
         self._usage_store = UsageStore(self.backup_dir / "cache")
+        # (settings mtime, (threshold, models)) — see _poll_policy_inputs.
+        self._poll_inputs_cache: tuple[float | None, tuple[float, tuple[str, ...]]] | None = None
+        self._poll_inputs_override: tuple[float, tuple[str, ...]] | None = None
 
         # The credential storage layer (active + per-account backup stores, macOS
         # Keychain-vs-file routing, the per-process capability cache). Reads its
@@ -529,20 +534,31 @@ class ClaudeAccountSwitcher:
             for num, entry in self._usage_store.entries(identities).items()
         }
 
-    def set_usage_poll_plan(
-        self, plans: dict[str, tuple[float | None, float | None]]
+    def set_poll_policy_inputs(
+        self, threshold: float, models: tuple[str, ...]
     ) -> None:
-        """Persist the auto engine's per-slot ``(nextPollAt, pollIntervalS)``."""
-        data = self._get_sequence_data() or {}
-        accounts = data.get("accounts", {})
-        identities = {
-            num: (
-                accounts.get(num, {}).get("email", ""),
-                accounts.get(num, {}).get("organizationUuid", "") or "",
-            )
-            for num in plans
-        }
-        self._usage_store.set_poll_plan(plans, identities)
+        """Pin the threshold/models poll planning keys on (set by a hosted
+        auto engine so cadence follows its effective, CLI-merged settings
+        instead of the settings file)."""
+        self._poll_inputs_override = (threshold, models)
+
+    def _poll_policy_inputs(self) -> tuple[float, tuple[str, ...]]:
+        """Threshold + configured model names for poll planning: the hosting
+        engine's pinned values when present, else the settings file (reloaded
+        only when it changes — one stat per pass)."""
+        if self._poll_inputs_override is not None:
+            return self._poll_inputs_override
+        path = settings_path(self.backup_dir)
+        try:
+            mtime: float | None = path.stat().st_mtime
+        except OSError:
+            mtime = None
+        if self._poll_inputs_cache is not None and self._poll_inputs_cache[0] == mtime:
+            return self._poll_inputs_cache[1]
+        loaded = load_settings(self.backup_dir)
+        inputs = (loaded.threshold, parse_model_names(loaded.model))
+        self._poll_inputs_cache = (mtime, inputs)
+        return inputs
 
     def switchable_account_numbers(self) -> list[str]:
         """Account numbers in rotation order that have usable stored backups."""
@@ -1440,6 +1456,73 @@ class ClaudeAccountSwitcher:
         if self._reporter is None:
             self._reporter = ListReporter(self)
         return self._reporter
+
+    def _persist_poll_plans(
+        self,
+        records: dict[str, FetchRecord],
+        pre: dict[str, UsageEntry],
+        post: dict[str, UsageEntry],
+        info_by_num: dict[str, tuple[int, str, str, str, bool, str]],
+        identities: dict[str, tuple[str, str]],
+    ) -> None:
+        """Adapt and persist the cadence of every slot just fetched
+        successfully, so the next collector — whichever surface it runs in —
+        inherits the plan. Failures are paced by the store's backoff instead
+        and keep their (now past-due) plan for when the backoff lifts."""
+        now = self._usage_store.clock()
+        threshold, models = self._poll_policy_inputs()
+        plans: dict[str, tuple[float | None, float | None]] = {}
+        for num, rec in records.items():
+            if rec.sentinel is not None or rec.error is not None:
+                continue
+            before, after = pre.get(num), post.get(num)
+            if after is None or after.fetched_at is None:
+                continue
+            recent_429 = (
+                before is not None
+                and before.last_429_at is not None
+                and (now - before.last_429_at) < poll_policy.RECENT_429_WINDOW_S
+            )
+            plans[num] = poll_policy.plan_after_fetch(
+                prev_interval_s=before.poll_interval_s if before else None,
+                prev_usage=before.last_good if before else None,
+                new_usage=after.last_good,
+                is_active=bool(info_by_num[num][4]),
+                threshold=threshold,
+                models=models,
+                recent_429=recent_429,
+                now=now,
+            )
+        if plans:
+            self._usage_store.set_poll_plan(plans, identities)
+
+    def _replan_new_active(self, number: str, email: str, org_uuid: str) -> None:
+        """Pull the just-activated account's poll plan to the active floor.
+
+        Its stored plan was computed while it was an idle candidate and may
+        wait up to CANDIDATE_MAX_INTERVAL_S — too slow for the account whose
+        usage is about to move. The deadline anchors on the last measurement
+        (an already-old one comes due immediately, a never-measured account
+        is left plan-less so nothing blocks its first fetch), and the next
+        poll is only ever pulled earlier, never pushed later. Best-effort by
+        contract: the switch this rides on has already committed, so a cache
+        hiccup here must not surface as a switch failure."""
+        try:
+            identities = {number: (email, org_uuid or "")}
+            now = self._usage_store.clock()
+            entry = self._usage_store.entries(identities).get(number)
+            if entry is None or entry.fetched_at is None:
+                return
+            next_poll = max(now, entry.fetched_at + poll_policy.MIN_INTERVAL_S)
+            if entry.next_poll_at is not None and entry.next_poll_at <= next_poll:
+                return
+            self._usage_store.set_poll_plan(
+                {number: (next_poll, poll_policy.MIN_INTERVAL_S)}, identities
+            )
+        except Exception as e:
+            self._logger.warning(
+                f"Post-switch poll re-plan failed (switch itself succeeded): {e}"
+            )
 
     def _usage_by_account(self) -> dict[str, dict[str, Any] | str | None]:
         """Map account number → decision-grade usage value for managed accounts."""
@@ -2919,9 +3002,27 @@ class ClaudeAccountSwitcher:
         # Lock released. Safe to do network I/O and let persist callbacks
         # re-acquire the lock from inside list_accounts().
         if direct_activation:
+            # The just-activated account's candidate-era poll plan may be too
+            # slow for the account whose usage is about to move.
+            self._replan_new_active(
+                target_account,
+                target_email,
+                (self._get_sequence_data() or {})
+                .get("accounts", {})
+                .get(target_account, {})
+                .get("organizationUuid", ""),
+            )
             if not quiet:
                 self._print_switch_result(target_account, target_email)
             return None
+        self._replan_new_active(
+            target_account,
+            target_email,
+            (self._get_sequence_data() or {})
+            .get("accounts", {})
+            .get(target_account, {})
+            .get("organizationUuid", ""),
+        )
         if not emit_output:
             data = self._get_sequence_data() or {}
             to_email = data.get("accounts", {}).get(target_account, {}).get("email", target_email)

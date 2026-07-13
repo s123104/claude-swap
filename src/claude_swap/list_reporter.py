@@ -19,7 +19,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from claude_swap import oauth
+from claude_swap import oauth, poll_policy
 from claude_swap.claude_locks import claude_config_lock, claude_credentials_lock
 from claude_swap.credential_refresh import (
     park_rotated_credential,
@@ -66,9 +66,10 @@ if TYPE_CHECKING:
 # instant (request hygiene; see upstream issue #85).
 _FETCH_STAGGER_S = 0.25
 
-# Show an age note on displayed usage older than this. Below it the data is
-# essentially current (auto refreshes every tick; --list on demand).
-_USAGE_AGE_NOTE_S = 90.0
+# Show an age note on displayed usage older than this. Inside the serve TTL
+# the data is current by design (that is the polling cadence), so an age note
+# there would be permanent noise.
+_USAGE_AGE_NOTE_S = poll_policy.SERVE_TTL_S
 
 # How long a persist of a just-rotated OAuth credential may wait for the file
 # lock. Anthropic refresh tokens are single-use (claude-code#24317): by the
@@ -499,16 +500,19 @@ class ListReporter:
         """Store-backed usage collection: one :class:`UsageEntry` per account.
 
         ``fetch=None`` (on-demand callers: ``--list``/``--status``/switch
-        strategies) makes every account eligible; the auto engine passes an
-        explicit set to restrict which accounts *may* be fetched this pass.
-        Either way an account is skipped — its stored entry served instead —
-        when a sentinel state applies, its entry is fresh (≤ ``SERVE_TTL_S``),
-        it is inside failure backoff, or another collector claimed it moments
-        ago. A failed fetch only updates the entry's error/backoff fields, so
-        the last-good measurement keeps being served (stale-on-error).
+        strategies, dashboards) makes every account a candidate but respects
+        the persisted poll plans; the auto engine passes an explicit set whose
+        members may beat the serve TTL when their plan says so (urgent
+        cadence) or when escalation needs them fresh. Final eligibility —
+        freshness, backoff, claims, plans — is decided atomically by
+        ``UsageStore.reserve``, so concurrent collectors can never
+        double-fetch a slot. After each successful fetch the adapted cadence
+        is persisted (``_persist_poll_plans``), making every surface inherit
+        the same plan. A failed fetch only updates the entry's error/backoff
+        fields, so the last-good measurement keeps being served
+        (stale-on-error).
         """
         store = self._host._usage_store
-        now = store.clock()
         identities = {
             str(num): (email, org_uuid or "")
             for num, email, _org_name, org_uuid, _active, _creds in accounts_info
@@ -527,18 +531,17 @@ class ListReporter:
         for num in info_by_num:
             if num not in sentinels and entries[num].token_dead():
                 sentinels[num] = USAGE_RELOGIN_REQUIRED
-        to_fetch = [
+        requested = [
             num
             for num in info_by_num
-            if num not in sentinels
-            and (fetch is None or num in fetch)
-            and not entries[num].fresh(now)
-            and not entries[num].in_backoff(now)
-            and not entries[num].claimed(now)
+            if num not in sentinels and (fetch is None or num in fetch)
         ]
+        to_fetch = store.reserve(
+            requested, identities, respect_plans=fetch is None
+        )
 
         if to_fetch:
-            store.claim(to_fetch, identities)
+            pre = entries
             records = self._run_usage_fetches(
                 [info_by_num[num] for num in to_fetch]
             )
@@ -547,6 +550,9 @@ class ListReporter:
                 if record.sentinel is not None:
                     sentinels[num] = record.sentinel
             entries = store.entries(identities)
+            self._host._persist_poll_plans(
+                records, pre, entries, info_by_num, identities
+            )
             # A fetch that just returned invalid_grant advances the strike to the
             # dead threshold. The pre-fetch quarantine scan above couldn't see it,
             # so surface "re-login needed" in *this* pass instead of leaving the
